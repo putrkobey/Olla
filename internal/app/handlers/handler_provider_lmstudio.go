@@ -1,0 +1,29 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/putrkobey/Olla/internal/core/constants"
+)
+
+// lmstudioOpenAIModelsHandler provides models in openai format.
+// lm studio supports multiple api formats for broader client compatibility
+// endpoints: GET /olla/lmstudio/v1/models or /olla/lmstudio/api/v1/models
+func (a *Application) lmstudioOpenAIModelsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	models, err := a.getProviderModels(ctx, "lmstudio")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response, err := a.convertModelsToProviderFormat(models, "openai")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.WriteHeader(http.StatusOK)
