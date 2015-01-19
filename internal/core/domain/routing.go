@@ -1,0 +1,79 @@
+package domain
+
+import "github.com/puzpuzpuz/xsync/v4"
+
+const (
+	InspectionMetaPathSupport = "path_support"
+)
+
+// RequestType identifies what kind of LLM request this is
+type RequestType int
+
+const (
+	RequestTypeUnknown RequestType = iota
+	RequestTypeChat
+	RequestTypeCompletion
+	RequestTypeEmbedding
+	RequestTypeImage
+)
+
+type RequestProfile struct {
+	InspectionMeta *xsync.Map[string, interface{}]
+
+	// Rich request metadata for intelligent routing
+	ModelCapabilities    *ModelCapabilities    // What the request needs
+	ResourceRequirements *ResourceRequirements // Resources needed
+	RoutingDecision      *ModelRoutingDecision // Routing strategy decision
+	Path                 string
+	ModelName            string
+	SupportedBy          []string
+	// ProviderScope is the endpoint types a provider route (/olla/<provider>/) is confined to,
+	// empty on /olla/proxy/. SupportedBy alone can't express it: a path shared with another
+	// provider (/v1/embeddings) lists both, but provider filtering has already dropped one.
+	ProviderScope []string
+
+	RequestType     RequestType // Chat, completion, embedding, etc.
+	EstimatedTokens int         // For capacity planning
+
+	RequiresFunctionCall bool
+	RequiresVision       bool
+
+	// FailClosedOnNoMatch marks a profile whose SupportedBy represents a hard
+	// provider-type boundary rather than a soft compatibility hint. Set only by
+	// createProviderProfile for a non-OpenAI provider-scoped route (e.g.
+	// /olla/vllm/), never for the OpenAI-inclusive profile or the unscoped
+	// /olla/proxy/ route's inspector-derived profile. When true,
+	// filterEndpointsByProfile must return the empty set rather than widen to
+	// all endpoints if nothing matches - crossing provider types during a
+	// same-type outage (e.g. a vllm request silently served by an
+	// openai-compatible backend) is a correctness bug, not graceful
+	// degradation, and must produce the normal no-routable-endpoints 404/503.
+	FailClosedOnNoMatch bool
+
+	// QuietNoMatchFallback logs the widen-to-all fallback at Debug rather than Warn. Set for
+	// translator routes, where a fleet with no chat-capable backend widens and is then refused
+	// with a sampled 404: a Warn per request would flood the log ahead of it.
+	QuietNoMatchFallback bool
+}
+
+func NewRequestProfile(path string) *RequestProfile {
+	return &RequestProfile{
+		Path:           path,
+		SupportedBy:    make([]string, 0, 4),
+		InspectionMeta: xsync.NewMap[string, interface{}](),
+	}
+}
+
+func (rp *RequestProfile) IsCompatibleWith(endpointType string) bool {
+	if endpointType == ProfileAuto {
+		return true
+	}
+
+	if len(rp.SupportedBy) == 0 {
+		return true
+	}
+
+	for _, supported := range rp.SupportedBy {
+		if supported == endpointType {
+			return true
+		}
