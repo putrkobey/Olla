@@ -1,0 +1,420 @@
+/* Shared component styles ported from design/mockups/v2-terminal-dense.html.
+   Kept global (not scoped per component) because the same class names are used
+   across panels, sortable tables, and the status strip; scoping would mean
+   duplicating this block in every component. */
+
+/* HEADER / STATUS STRIP */
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border-strong);
+}
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-1);
+  flex-wrap: wrap;
+}
+.brand {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  margin-right: auto;
+}
+/* Logo + wordmark lockup: the link carries the brand identity through to the
+   product page. Bottom-aligned so a taller logo reaches the header's lower
+   border instead of floating mid-line; height-only sizing keeps the aspect
+   ratio whatever the source asset. */
+.brand-link {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  text-decoration: none;
+  color: inherit;
+}
+.brand-link:hover .brand-logo {
+  opacity: 0.85;
+}
+.brand-logo {
+  display: block;
+  height: 54px;
+  width: auto;
+  flex-shrink: 0;
+}
+/* Wordmark column: OLLA stacked over the subtitle, bottom-aligned against
+   the logo so the lockup stays compact. */
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1;
+}
+.brand h1 {
+  font-size: 2.1rem;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+.brand .tag {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  margin-top: 2px;
+}
+.clock {
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+.theme-toggle:hover {
+  border-color: var(--accent);
+}
+/* Icon-only variant for the header's theme button: the "theme:" label was
+   dropped (it ate horizontal space at narrow widths and the icon already
+   carries the meaning), so this button is square rather than label-width.
+   The shared .theme-toggle chrome still applies to text buttons like the
+   status banner's "retry now", which is why this is a modifier, not a
+   rewrite of the base rule. */
+.theme-toggle.icon-only {
+  justify-content: center;
+  font-size: 0.85rem;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+}
+
+.status-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));
+  gap: 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-strong);
+  background: var(--bg);
+  font-size: 0.72rem;
+}
+.status-strip dl {
+  margin: 0;
+}
+.status-cell {
+  padding: 6px var(--space-3);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.status-cell dt {
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.62rem;
+}
+.status-cell dd {
+  margin: 0;
+  font-weight: 700;
+  font-size: 0.85rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.status-cell.system-status dd {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.status-reason {
+  font-size: 0.62rem;
+  font-weight: 400;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Surface a frozen-data signal distinct from the neutral degraded reason. */
+.status-reason.stale {
+  color: var(--amber, #d97706);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* NAV / TABS */
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 var(--space-4);
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border-strong);
+  overflow-x: auto;
+}
+.tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 9px 14px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+.tab:hover {
+  color: var(--text);
+}
+.tab[aria-selected='true'] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* MAIN */
+main {
+  padding: var(--space-4);
+  max-width: 1680px;
+  margin: 0 auto;
+}
+.panel {
+  display: none;
+}
+.panel.is-active {
+  display: block;
+}
+.panel > h2 {
+  font-size: 0.95rem;
+  margin-bottom: var(--space-3);
+}
+.panel-intro {
+  margin: 0 0 var(--space-4);
+  max-width: 68ch;
+  font-size: 0.85rem;
+}
+
+.section {
+  margin-bottom: var(--space-6);
+}
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+  flex-wrap: wrap;
+}
+.section-head h3 {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.section-note {
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  font-family: var(--font-sans);
+}
+
+/* STAT TILES */
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+.tile {
+  background: var(--bg-elevated);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.tile .label {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-faint);
+}
+.tile .value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.tile .value .unit {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-dim);
+}
+.tile .sub {
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+.tile .sub strong {
+  color: var(--text-dim);
+  font-weight: 700;
+}
+@media (max-width: 900px) {
+  .tile-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+@media (max-width: 480px) {
+  .tile-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+/* GLYPHS / STATUS PILLS */
+.glyph {
+  font-size: 0.95em;
+  line-height: 1;
+  display: inline-block;
+}
+.glyph.g-green {
+  color: var(--green);
+}
+.glyph.g-amber {
+  color: var(--amber);
+}
+.glyph.g-red {
+  color: var(--red);
+}
+.glyph.g-neutral {
+  color: var(--neutral);
+}
+
+.status-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 1px 7px 1px 5px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.status-tag.st-green {
+  color: var(--green);
+  background: var(--green-bg);
+  border-color: color-mix(in srgb, var(--green) 35%, transparent);
+}
+.status-tag.st-amber {
+  color: var(--amber);
+  background: var(--amber-bg);
+  border-color: color-mix(in srgb, var(--amber) 35%, transparent);
+}
+.status-tag.st-red {
+  color: var(--red);
+  background: var(--red-bg);
+  border-color: color-mix(in srgb, var(--red) 35%, transparent);
+}
+.status-tag.st-neutral {
+  color: var(--neutral);
+  background: transparent;
+  border-color: var(--border);
+}
+
+/* BACKEND TYPE CHIPS (Overview "Backend types" tile). The tile's default
+   .value typography is a 1.5rem/700 heading built for a single number - a
+   fleet with several backend types rendered as one long joined string there
+   and wrapped to three loud lines. Chips borrow the endpoint-pill look
+   (.pill, below) instead of inventing a new visual language; the count is
+   the only thing bold enough to compete with a stat-tile figure. */
+.backend-type-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.pill.backend-type-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: var(--text-faint);
+}
+.backend-type-chip .count {
+  font-weight: 700;
+  color: var(--text);
+}
+
+/* TABLES */
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+.scroll-hint {
+  display: none;
+  font-size: 0.68rem;
+  color: var(--text-faint);
+  padding: 3px var(--space-3);
+  border-bottom: 1px dashed var(--border);
+}
+@media (max-width: 860px) {
+  .scroll-hint {
+    display: block;
+  }
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 860px;
+  font-size: 0.78rem;
+}
+thead th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-inset);
+  text-align: left;
+  border-bottom: 1px solid var(--border-strong);
+  padding: 0;
+  white-space: nowrap;
+  z-index: 2;
+}
+/* `align-right` is the ONLY thing that right-aligns a column, on both the
+   header and the cell - driven by `column.align` in SortableTable, never by
+   `num` (which is sort semantics only). `text-align: right` moves inline
+   text (Priority, Requests, Size, ...); composite cells whose children are
+   block/flex (PctBar, RangeBar, endpoint chips) additionally need the child
+   pushed right via auto margin, since text-align does nothing for them. */
+thead th.align-right,
+td.align-right {
+  text-align: right;
+}
+td.align-right > .pct-cell,
+td.align-right > .range-wrap,
+td.align-right > .endpoint-pills {
+  margin-left: auto;
+}
+.sort-btn {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 7px 10px;
