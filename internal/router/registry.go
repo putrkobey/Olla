@@ -37,3 +37,122 @@ func NewRouteRegistry(logger logger.StyledLogger) *RouteRegistry {
 	return &RouteRegistry{
 		routes:   make(map[string]RouteInfo),
 		logger:   logger,
+		orderSeq: 0,
+	}
+}
+
+func (r *RouteRegistry) Register(route string, handler http.HandlerFunc, description string) {
+	r.RegisterWithMethod(route, handler, description, "GET")
+}
+
+func (r *RouteRegistry) RegisterWithMethod(route string, handler http.HandlerFunc, description, method string) {
+	r.registerWithMethod(route, handler, description, method, false)
+}
+
+func (r *RouteRegistry) RegisterProxyRoute(route string, handler http.HandlerFunc, description string, method string) {
+	wrappedHandler := func(w http.ResponseWriter, req *http.Request) {
+		ctx := context.WithValue(req.Context(), constants.ContextRoutePrefixKey, route)
+		handler(w, req.WithContext(ctx))
+	}
+	r.registerWithMethod(route, wrappedHandler, description, method, true)
+}
+
+// RegisterTranslatorRoute registers a route served by an API translator (for example
+// /olla/anthropic/v1/messages). These are inference entry points, so they sit behind
+// the same rate and size limits as proxy routes. reject lets the translator answer a
+// rejection in its own error schema; nil falls back to plain text. bodyLimit is the
+// translator's request cap (0 for none).
+func (r *RouteRegistry) RegisterTranslatorRoute(route string, handler http.HandlerFunc, description, method string, reject security.RejectFunc, bodyLimit int64) {
+	r.registerWithMethod(route, handler, description, method, false)
+	info := r.routes[route]
+	info.IsTranslator = true
+	info.Reject = reject
+	info.BodyLimit = bodyLimit
+	r.routes[route] = info
+}
+
+func (r *RouteRegistry) registerWithMethod(route string, handler http.HandlerFunc, description, method string, isProxy bool) {
+	r.routes[route] = RouteInfo{
+		Handler:     handler,
+		Description: description,
+		Method:      method,
+		Order:       r.orderSeq,
+		IsProxy:     isProxy,
+	}
+	r.orderSeq++
+}
+
+func (r *RouteRegistry) WireUp(mux *http.ServeMux) {
+	for route, info := range r.routes {
+		mux.HandleFunc(route, info.Handler)
+	}
+	r.logRoutesTable()
+}
+
+func (r *RouteRegistry) logRoutesTable() {
+	if len(r.routes) == 0 {
+		return
+	}
+
+	type routeEntry struct {
+		path   string
+		method string
+		desc   string
+		order  int
+	}
+
+	var entries []routeEntry
+	for route, info := range r.routes {
+		entries = append(entries, routeEntry{
+			path:   route,
+			method: info.Method,
+			desc:   info.Description,
+			order:  info.Order,
+		})
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].order < entries[j].order
+	})
+
+	tableData := [][]string{
+		{"ROUTE", "METHOD", "DESCRIPTION"},
+	}
+
+	for _, entry := range entries {
+		tableData = append(tableData, []string{
+			entry.path,
+			entry.method,
+			entry.desc,
+		})
+	}
+
+	r.logger.InfoWithCount("Registered web routes", len(entries))
+	tableString, _ := pterm.DefaultTable.WithHasHeader().WithData(tableData).Srender()
+	fmt.Print(tableString)
+}
+
+func (r *RouteRegistry) GetRoutes() map[string]RouteInfo {
+	return r.routes
+}
+
+func (r *RouteRegistry) WireUpWithSecurityChain(mux *http.ServeMux, securityAdapters interface{}) {
+	type securityAdapterProvider interface {
+		CreateChainMiddleware(reject security.RejectFunc) func(http.Handler) http.Handler
+		CreateRateLimitMiddleware() func(http.Handler) http.Handler
+	}
+
+	// Optional: the chain for translator routes (buffering size variant), with rejections
+	// written in the translator's own error format.
+	type translatorChainProvider interface {
+		CreateTranslatorChainMiddleware(reject security.RejectFunc, bodyLimit int64) func(http.Handler) http.Handler
+	}
+
+	// Optional: size validation for non-proxy routes. The full security chain
+	// (proxy routes) already includes size enforcement; this ensures non-proxy
+	// routes (status, health, stats) are also protected against oversized bodies.
+	// Rate limiting on non-proxy routes is intentionally omitted: these endpoints
+	// are internal/observability-only and applying a per-IP token bucket would
+	// complicate operations without meaningful security benefit. Translator routes
+	// are inference entry points, not observability, so they take the proxy chain.
+	type sizeMiddlewareProvider interface {
