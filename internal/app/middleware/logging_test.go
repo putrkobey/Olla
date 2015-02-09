@@ -1,0 +1,277 @@
+package middleware
+
+import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/putrkobey/Olla/internal/core/domain"
+	"github.com/putrkobey/Olla/internal/logger"
+)
+
+func TestCombinedLoggingMiddleware_RequestIDAndContext(t *testing.T) {
+	// Create a mock styled logger
+	mockLogger := &mockStyledLogger{}
+
+	// Create a test handler that uses the context logger
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Test that we can get the logger from context
+		ctxLogger := GetLogger(r.Context())
+		if ctxLogger == nil {
+			t.Error("Expected context logger to be available")
+			return
+		}
+
+		// Test that we can get the request ID from context
+		requestID := GetRequestID(r.Context())
+		if requestID == "" {
+			t.Error("Expected request ID to be available")
+			return
+		}
+
+		// Log something with the context logger
+		ctxLogger.Info("Test handler executed", "request_id", requestID)
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("test response"))
+	})
+
+	// Create the middleware
+	middleware := CombinedLoggingMiddleware(mockLogger)
+	handler := middleware(testHandler)
+
+	// Create a test request
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("X-Request-ID", "test-request-123")
+
+	// Create a response recorder
+	rr := httptest.NewRecorder()
+
+	// Execute the request
+	handler.ServeHTTP(rr, req)
+
+	// Verify response
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", rr.Code)
+	}
+
+	// Verify that the request ID header was set
+	responseRequestID := rr.Header().Get("X-Olla-Request-ID")
+	if responseRequestID != "test-request-123" {
+		t.Errorf("Expected X-Olla-Request-ID header to be 'test-request-123', got '%s'", responseRequestID)
+	}
+
+	// Verify response body
+	expectedBody := "test response"
+	if rr.Body.String() != expectedBody {
+		t.Errorf("Expected body %q, got %q", expectedBody, rr.Body.String())
+	}
+}
+
+func TestCombinedLoggingMiddleware_BasicPassthrough(t *testing.T) {
+	// Create a mock styled logger
+	mockLogger := &mockStyledLogger{}
+
+	// Create a simple test handler
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("access log test"))
+	})
+
+	// Create the middleware
+	middleware := CombinedLoggingMiddleware(mockLogger)
+	handler := middleware(testHandler)
+
+	// Create a test request
+	req := httptest.NewRequest("POST", "/api/test?param=value", strings.NewReader("test body"))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "test-agent")
+	req.ContentLength = 9 // length of "test body"
+
+	// Create a response recorder
+	rr := httptest.NewRecorder()
+
+	// Execute the request
+	handler.ServeHTTP(rr, req)
+
+	// Verify response
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", rr.Code)
+	}
+
+	expectedBody := "access log test"
+	if rr.Body.String() != expectedBody {
+		t.Errorf("Expected body %q, got %q", expectedBody, rr.Body.String())
+	}
+}
+
+// TestCombinedLoggingMiddleware_UsesInjectedLogger is the regression test for
+// the console and access records silently going through slog.Default()
+// instead of the styledLogger passed in - a configured logger (level, theme,
+// output target) would have no effect on request logging.
+func TestCombinedLoggingMiddleware_UsesInjectedLogger(t *testing.T) {
+	var buf strings.Builder
+	injected := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	mockLogger := &mockStyledLogger{underlying: injected}
+
+	handler := CombinedLoggingMiddleware(mockLogger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// A plain path outside /api/, /olla/ and /internal/ so neither quiet gate
+	// fires and both records use their loud (non-abbreviated) message.
+	req := httptest.NewRequest("GET", "/hello", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	out := buf.String()
+	if !strings.Contains(out, "Request started") || !strings.Contains(out, "Request completed") {
+		t.Errorf("expected both console lifecycle records on the injected logger, got: %q", out)
+	}
+	if !strings.Contains(out, "Access log") {
+		t.Errorf("expected the access log record on the injected logger, got: %q", out)
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		input    int64
+		expected string
+	}{
+		{0, "0B"},
+		{500, "500B"},
+		{1024, "1.0KB"},
+		{1536, "1.5KB"},
+		{1048576, "1.0MB"},
+		{1073741824, "1.0GB"},
+		{1099511627776, "1.0TB"},
+	}
+
+	for _, test := range tests {
+		result := FormatBytes(test.input)
+		if result != test.expected {
+			t.Errorf("FormatBytes(%d) = %s, want %s", test.input, result, test.expected)
+		}
+	}
+}
+
+func TestGetLoggerWithoutContext(t *testing.T) {
+	ctx := context.Background()
+	logger := GetLogger(ctx)
+
+	// Should return the default logger when no logger is in context
+	if logger == nil {
+		t.Error("Expected default logger when no logger in context")
+	}
+}
+
+func TestGetRequestIDWithoutContext(t *testing.T) {
+	ctx := context.Background()
+	requestID := GetRequestID(ctx)
+
+	// Should return empty string when no request ID in context
+	if requestID != "" {
+		t.Errorf("Expected empty request ID when not in context, got %s", requestID)
+	}
+}
+
+func TestRedactQuery(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		wantHide []string // substrings that must NOT appear in output
+		wantKeep []string // substrings that MUST appear in output
+	}{
+		{
+			name:     "empty query",
+			input:    "",
+			wantKeep: []string{},
+		},
+		{
+			name:     "api_key redacted",
+			input:    "api_key=sk-1234",
+			wantHide: []string{"sk-1234"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			name:     "safe param unchanged",
+			input:    "safe_param=value",
+			wantKeep: []string{"safe_param", "value"},
+		},
+		{
+			name:     "mixed: token redacted, safe param kept",
+			input:    "safe_param=value&token=secret",
+			wantHide: []string{"secret"},
+			wantKeep: []string{"[REDACTED]", "safe_param", "value"},
+		},
+		{
+			name:     "case-insensitive TOKEN",
+			input:    "TOKEN=foo",
+			wantHide: []string{"foo"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			name:     "password redacted",
+			input:    "user=alice&password=hunter2",
+			wantHide: []string{"hunter2"},
+			wantKeep: []string{"[REDACTED]", "alice"},
+		},
+		{
+			name:     "access_token redacted",
+			input:    "access_token=tok-xyz",
+			wantHide: []string{"tok-xyz"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			name:     "secret redacted",
+			input:    "secret=my-secret&page=2",
+			wantHide: []string{"my-secret"},
+			wantKeep: []string{"[REDACTED]", "page"},
+		},
+		{
+			name:     "auth redacted",
+			input:    "auth=bearer-token",
+			wantHide: []string{"bearer-token"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			name:     "multiple sensitive keys all redacted",
+			input:    "api_key=k1&token=t2&key=k3",
+			wantHide: []string{"k1", "t2", "k3"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			// %70assword decodes to "password" and must still be redacted.
+			name:     "percent-encoded key redacted",
+			input:    "%70assword=secret",
+			wantHide: []string{"secret"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			// api%5Fkey decodes to "api_key" (underscore encoded as %5F).
+			name:     "encoded underscore in key redacted",
+			input:    "api%5Fkey=foo",
+			wantHide: []string{"foo"},
+			wantKeep: []string{"[REDACTED]"},
+		},
+		{
+			// %ZZ is not a valid percent-escape; must fall back to raw key comparison
+			// without panicking. "zzz" is not sensitive so the value passes through.
+			name:     "malformed escape falls back to raw key",
+			input:    "%ZZname=value",
+			wantKeep: []string{"value"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			result := redactQuery(tt.input)
+			for _, hide := range tt.wantHide {
+				if strings.Contains(result, hide) {
+					t.Errorf("redactQuery(%q) = %q; should not contain %q", tt.input, result, hide)
