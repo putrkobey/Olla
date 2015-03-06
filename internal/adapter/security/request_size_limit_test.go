@@ -254,3 +254,132 @@ func TestSizeValidator_Validate_NegativeLimitsDisabled(t *testing.T) {
 		ClientID:   "192.168.1.100",
 		Endpoint:   "/api/test",
 		Method:     "POST",
+		BodySize:   5000,
+		HeaderSize: 2000,
+		Headers: map[string][]string{
+			"X-Large-Header": {strings.Repeat("z", 2000)},
+		},
+	}
+
+	result, err := validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if !result.Allowed {
+		t.Errorf("Request should be allowed when limits are negative (disabled), got: %s", result.Reason)
+	}
+}
+
+func TestSizeValidator_Validate_ExactLimit(t *testing.T) {
+	limits := config.ServerRequestLimits{
+		MaxBodySize:   100,
+		MaxHeaderSize: 200,
+	}
+
+	validator := createTestSizeLimitValidator(limits)
+	ctx := context.Background()
+
+	req := ports.SecurityRequest{
+		ClientID:   "192.168.1.100",
+		Endpoint:   "/api/test",
+		Method:     "POST",
+		BodySize:   100,
+		HeaderSize: 150,
+		Headers: map[string][]string{
+			"Content-Type": {"application/json"},
+		},
+	}
+
+	result, err := validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if !result.Allowed {
+		t.Errorf("Request at exact limit should be allowed, got: %s", result.Reason)
+	}
+}
+
+func TestSizeValidator_Validate_OneByteTooLarge(t *testing.T) {
+	limits := config.ServerRequestLimits{
+		MaxBodySize:   100,
+		MaxHeaderSize: 200,
+	}
+
+	validator := createTestSizeLimitValidator(limits)
+	ctx := context.Background()
+
+	req := ports.SecurityRequest{
+		ClientID:   "192.168.1.100",
+		Endpoint:   "/api/test",
+		Method:     "POST",
+		BodySize:   101,
+		HeaderSize: 150,
+		Headers:    map[string][]string{},
+	}
+
+	result, err := validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if result.Allowed {
+		t.Error("Request one byte over limit should be rejected")
+	}
+}
+
+func TestSizeValidator_Validate_EmptyBody(t *testing.T) {
+	limits := config.ServerRequestLimits{
+		MaxBodySize:   100,
+		MaxHeaderSize: 200,
+	}
+
+	validator := createTestSizeLimitValidator(limits)
+	ctx := context.Background()
+
+	req := ports.SecurityRequest{
+		ClientID:   "192.168.1.100",
+		Endpoint:   "/api/test",
+		Method:     "GET",
+		BodySize:   0,
+		HeaderSize: 50,
+		Headers: map[string][]string{
+			"Content-Type": {"application/json"},
+		},
+	}
+
+	result, err := validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if !result.Allowed {
+		t.Errorf("Empty body should be allowed, got: %s", result.Reason)
+	}
+}
+
+func TestSizeValidator_Validate_MultipleHeaders(t *testing.T) {
+	limits := config.ServerRequestLimits{
+		MaxBodySize:   1024,
+		MaxHeaderSize: minHeaderSize,
+	}
+
+	validator := createTestSizeLimitValidator(limits)
+	ctx := context.Background()
+
+	req := ports.SecurityRequest{
+		ClientID:   "192.168.1.100",
+		Endpoint:   "/api/test",
+		Method:     "POST",
+		BodySize:   100,
+		HeaderSize: minHeaderSize + 300,
+		Headers: map[string][]string{
+			"Content-Type":    {"application/json"},
+			"Authorization":   {"Bearer " + strings.Repeat("x", minHeaderSize)},
+			"X-Custom-Header": {strings.Repeat("y", 50)},
+			"User-Agent":      {"TestAgent/1.0"},
+		},
+	}
+
+	result, err := validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if result.Allowed {
