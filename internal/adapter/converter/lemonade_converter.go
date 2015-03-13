@@ -56,23 +56,3 @@ func (c *LemonadeConverter) convertModel(model *domain.UnifiedModel) *profile.Le
 			modelID = model.Aliases[0].Name
 		} else {
 			modelID = model.ID
-		}
-	}
-
-	lemonadeModel := &profile.LemonadeModel{
-		ID:      modelID,
-		Object:  "model",
-		Created: now,
-		OwnedBy: c.determineOwner(modelID),
-	}
-
-	// Extract Lemonade-specific metadata features
-	c.applyMetadataFeatures(model, lemonadeModel)
-
-	return lemonadeModel
-}
-
-// determineOwner extracts the organisation from the model ID or defaults to "lemonade"
-func (c *LemonadeConverter) determineOwner(modelID string) string {
-	// Use shared owner extraction logic from BaseConverter
-	// Handles slash-separated (org/model) and hyphenated (org-model) formats
