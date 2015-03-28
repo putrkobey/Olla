@@ -18,3 +18,13 @@ func (e *InspectionError) Unwrap() error {
 
 func NewInspectionError(inspectorName, path string, err error) *InspectionError {
 	return &InspectionError{
+		InspectorName: inspectorName,
+		Path:          path,
+		Err:           err,
+	}
+}
+
+type UnsupportedPathError struct {
+	Path              string
+	AvailableProfiles []string
+}
