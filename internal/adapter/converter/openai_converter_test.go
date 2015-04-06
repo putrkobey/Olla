@@ -45,3 +45,26 @@ func TestOpenAIConverter_ConvertToFormat(t *testing.T) {
 				{Name: "phi4:latest", Source: "ollama"},
 			},
 			SourceEndpoints: []domain.SourceEndpoint{
+				{
+					EndpointURL: "http://localhost:11434",
+					NativeName:  "phi4:latest",
+					State:       "not-loaded",
+				},
+			},
+			Capabilities: []string{"chat", "code"},
+		},
+	}
+
+	t.Run("OpenAI format strips Olla extensions", func(t *testing.T) {
+		filters := ports.ModelFilters{}
+
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(OpenAIModelResponse)
+		require.True(t, ok)
+		assert.Equal(t, "list", response.Object)
+		assert.Len(t, response.Data, 2)
+
+		// Check that only OpenAI-compatible fields are present
+		for _, model := range response.Data {
