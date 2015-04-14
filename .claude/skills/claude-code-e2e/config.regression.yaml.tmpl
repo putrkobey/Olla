@@ -1,0 +1,20 @@
+# Olla config template for the /claude-code-e2e skill.
+#
+# Rendered at runtime into test/regression/tmp/ with these placeholders
+# substituted (the skill does the substitution, never edit the rendered copy):
+#   __OLLA_PORT__    - loopback port Olla listens on
+#   __OLLAMA_URL__   - the real Ollama endpoint (--ollama-endpoint)
+#   __PASSTHROUGH__  - true (native Anthropic passthrough) | false (forced translation)
+#
+# One real Ollama endpoint, one Olla instance. The skill renders this twice -
+# once with __PASSTHROUGH__=true, once =false - and restarts Olla between the
+# two legs so both the passthrough and the OpenAI<->Anthropic translation paths
+# are exercised against the same backend and model.
+
+server:
+  host: "127.0.0.1"
+  port: __OLLA_PORT__
+  read_timeout: 300s          # gemma-class models on CPU can be slow to first token
+  read_header_timeout: 10s
+  write_timeout: 0s           # 0 = no write deadline, required for SSE streaming
+  shutdown_timeout: 5s

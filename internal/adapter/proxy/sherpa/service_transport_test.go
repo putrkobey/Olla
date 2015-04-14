@@ -18,24 +18,3 @@ func funcName(f interface{}) string {
 // newSherpaServiceForTransportTest builds a real Sherpa service via NewService so
 // the transport tests exercise the production construction path.
 func newSherpaServiceForTransportTest(t *testing.T) *Service {
-	t.Helper()
-
-	cfg := &Configuration{}
-	cfg.ConnectionTimeout = 2 * time.Second
-	cfg.ConnectionKeepAlive = 30 * time.Second
-	cfg.StreamBufferSize = 8192
-
-	svc, err := NewService(
-		nil, // discovery service, not needed for transport tests
-		&mockEndpointSelector{},
-		cfg,
-		nil, // stats collector
-		nil, // metrics extractor
-		createTestLogger(),
-	)
-	if err != nil {
-		t.Fatalf("NewService: %v", err)
-	}
-	t.Cleanup(svc.Cleanup)
-	return svc
-}
