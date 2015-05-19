@@ -23,29 +23,3 @@ import (
 // /olla/proxy/... path which they cannot route.
 func TestProxyPathStripping(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name         string
-		requestPath  string
-		routePrefix  string
-		expectedPath string
-	}{
-		{
-			name:         "strips_olla_proxy_prefix_from_openai_path",
-			requestPath:  "/olla/proxy/v1/chat/completions",
-			routePrefix:  "/olla/proxy/",
-			expectedPath: "/v1/chat/completions",
-		},
-		{
-			name:         "strips_olla_proxy_prefix_from_ollama_path",
-			requestPath:  "/olla/proxy/api/generate",
-			routePrefix:  "/olla/proxy/",
-			expectedPath: "/api/generate",
-		},
-		{
-			name:         "no_route_prefix_leaves_path_unchanged",
-			requestPath:  "/v1/chat/completions",
-			routePrefix:  "", // no prefix injected
-			expectedPath: "/v1/chat/completions",
-		},
-	}
