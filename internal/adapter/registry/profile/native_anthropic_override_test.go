@@ -15,3 +15,21 @@ import (
 // The SGLang and LMDeploy integration pages tell operators to copy the shipped
 // profile to zz-<name>.yaml next to the original and set anthropic_support.enabled
 // to false. The loader reads files in name order and the last profile with a given
+// name wins, so the copy has to sort after the original. Olla ignores unknown YAML
+// keys, so a typo'd override would silently do nothing; these tests load the exact
+// override the docs describe.
+
+func TestShippedProfiles_NativeAnthropicDefaults(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		file        string
+		minVersion  string
+		limitations []string
+	}{
+		{domain.ProfileSGLang, "sglang.yaml", "0.5.9", nil},
+		{domain.ProfileLMDeploy, "lmdeploy.yaml", "0.13.0", []string{domain.AnthropicLimitationNoToolUse}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {

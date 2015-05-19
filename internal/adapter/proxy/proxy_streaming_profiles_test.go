@@ -1,0 +1,280 @@
+package proxy
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/putrkobey/Olla/internal/adapter/proxy/olla"
+	"github.com/putrkobey/Olla/internal/adapter/proxy/sherpa"
+	"github.com/putrkobey/Olla/internal/core/constants"
+	"github.com/putrkobey/Olla/internal/core/domain"
+	"github.com/putrkobey/Olla/internal/core/ports"
+)
+
+// mockResponseWriter tracks flush calls for testing
+type mockResponseWriter struct {
+	httptest.ResponseRecorder
+	flushCount int
+	mu         sync.Mutex
+}
+
+func (m *mockResponseWriter) Flush() {
+	m.mu.Lock()
+	m.flushCount++
+	m.mu.Unlock()
+}
+
+func (m *mockResponseWriter) getFlushCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.flushCount
+}
+
+// TestStreamingProfiles tests that proxy profiles correctly control flushing behavior
+func TestStreamingProfiles(t *testing.T) {
+	suites := []ProxyTestSuite{
+		SherpaTestSuite{},
+		OllaTestSuite{},
+	}
+
+	for _, suite := range suites {
+		t.Run(suite.Name(), func(t *testing.T) {
+			testStreamingProfilesForSuite(t, suite)
+		})
+	}
+}
+
+func testStreamingProfilesForSuite(t *testing.T, suite ProxyTestSuite) {
+	tests := []struct {
+		name           string
+		profile        string
+		contentType    string
+		responseChunks int
+		expectFlushes  bool
+		description    string
+	}{
+		// standard profile - should NEVER flush
+		{
+			name:           "standard_profile_sse_content",
+			profile:        constants.ConfigurationProxyProfileStandard,
+			contentType:    constants.ContentTypeEventStream,
+			responseChunks: 5,
+			expectFlushes:  false,
+			description:    "standard profile should not flush even for SSE content",
+		},
+		{
+			name:           "standard_profile_json_streaming",
+			profile:        constants.ConfigurationProxyProfileStandard,
+			contentType:    constants.ContentTypeStreamJSON,
+			responseChunks: 5,
+			expectFlushes:  false,
+			description:    "standard profile should not flush streaming JSON",
+		},
+		{
+			name:           "standard_profile_plain_text",
+			profile:        constants.ConfigurationProxyProfileStandard,
+			contentType:    constants.ContentTypeText,
+			responseChunks: 5,
+			expectFlushes:  false,
+			description:    "standard profile should not flush plain text",
+		},
+
+		// Streaming profile - should ALWAYS flush
+		{
+			name:           "streaming_profile_binary_content",
+			profile:        constants.ConfigurationProxyProfileStreaming,
+			contentType:    constants.ContentTypeImagePNG,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Streaming profile should flush even for binary content",
+		},
+		{
+			name:           "streaming_profile_json",
+			profile:        constants.ConfigurationProxyProfileStreaming,
+			contentType:    constants.ContentTypeJSON,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Streaming profile should flush JSON responses",
+		},
+		{
+			name:           "streaming_profile_pdf",
+			profile:        constants.ConfigurationProxyProfileStreaming,
+			contentType:    constants.ContentTypePDF,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Streaming profile should flush even PDFs",
+		},
+
+		// Auto profile - flush based on content type detection
+		{
+			name:           "auto_profile_sse_content",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    constants.ContentTypeEventStream,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Auto profile should flush SSE content",
+		},
+		{
+			name:           "auto_profile_ndjson",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    constants.ContentTypeNDJSON,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Auto profile should flush NDJSON",
+		},
+		{
+			name:           "auto_profile_binary_image",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    constants.ContentTypeImageJPEG,
+			responseChunks: 5,
+			expectFlushes:  false,
+			description:    "Auto profile should NOT flush binary images",
+		},
+		{
+			name:           "auto_profile_pdf",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    constants.ContentTypePDF,
+			responseChunks: 5,
+			expectFlushes:  false,
+			description:    "Auto profile should NOT flush PDFs",
+		},
+		{
+			name:           "auto_profile_plain_text",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    constants.ContentTypeTextUTF8,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Auto profile should flush plain text (common for LLMs)",
+		},
+		{
+			name:           "auto_profile_json",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    constants.ContentTypeJSON,
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Auto profile should flush JSON by default",
+		},
+
+		// Edge cases and mixed scenarios
+		{
+			name:           "standard_profile_with_chunked_encoding",
+			profile:        constants.ConfigurationProxyProfileStandard,
+			contentType:    constants.ContentTypeEventStream,
+			responseChunks: 10,
+			expectFlushes:  false,
+			description:    "standard profile should not flush even with many chunks",
+		},
+		{
+			name:           "streaming_profile_empty_content_type",
+			profile:        constants.ConfigurationProxyProfileStreaming,
+			contentType:    "",
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Streaming profile should flush even with no content type",
+		},
+		{
+			name:           "auto_profile_unknown_content_type",
+			profile:        constants.ConfigurationProxyProfileAuto,
+			contentType:    "application/x-custom-type",
+			responseChunks: 5,
+			expectFlushes:  true,
+			description:    "Auto profile should default to streaming for unknown types",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create upstream server that sends chunked responses
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(constants.HeaderContentType, tt.contentType)
+				w.WriteHeader(http.StatusOK)
+
+				// Send response in chunks
+				for i := range tt.responseChunks {
+					chunk := fmt.Sprintf("chunk %d\n", i)
+					w.Write([]byte(chunk))
+					// Upstream flushes to simulate streaming
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					// Small delay to simulate streaming
+					time.Sleep(5 * time.Millisecond)
+				}
+			}))
+			defer upstream.Close()
+
+			// Setup proxy with the test profile
+			endpoint := createTestEndpoint("test", upstream.URL, domain.StatusHealthy)
+			discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+			selector := &mockEndpointSelector{endpoint: endpoint}
+			collector := createTestStatsCollector()
+
+			// Create config with the test profile
+			var proxy ports.ProxyService
+			if suite.Name() == "Sherpa" {
+				config := &sherpa.Configuration{}
+				config.Profile = tt.profile
+				config.ResponseTimeout = 5 * time.Second
+				config.ReadTimeout = 5 * time.Second
+				config.StreamBufferSize = 8192
+				proxy = suite.CreateProxy(discovery, selector, config, collector)
+			} else {
+				config := &olla.Configuration{}
+				config.Profile = tt.profile
+				config.ResponseTimeout = 5 * time.Second
+				config.ReadTimeout = 5 * time.Second
+				config.StreamBufferSize = 8192
+				config.MaxIdleConns = 10
+				config.IdleConnTimeout = 90 * time.Second
+				config.MaxConnsPerHost = 5
+				proxy = suite.CreateProxy(discovery, selector, config, collector)
+			}
+
+			// Create request
+			req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+
+			// Use our mock response writer to track flushes
+			w := &mockResponseWriter{
+				ResponseRecorder: *httptest.NewRecorder(),
+			}
+
+			// Execute proxy request
+			err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+			if err != nil {
+				t.Fatalf("Proxy request failed: %v", err)
+			}
+
+			// Verify response was received
+			result := w.Result()
+			body, _ := io.ReadAll(result.Body)
+			if !strings.Contains(string(body), "chunk") {
+				t.Errorf("Response body doesn't contain expected chunks: %s", body)
+			}
+
+			// Check flush behavior
+			flushCount := w.getFlushCount()
+			if tt.expectFlushes && flushCount == 0 {
+				t.Errorf("%s - Expected flushes but got none. Profile: %s, Content-Type: %s",
+					tt.description, tt.profile, tt.contentType)
+			} else if !tt.expectFlushes && flushCount > 0 {
+				t.Errorf("%s - Expected no flushes but got %d. Profile: %s, Content-Type: %s",
+					tt.description, flushCount, tt.profile, tt.contentType)
+			}
+
+			// Log results for debugging
+			t.Logf("Test: %s, Profile: %s, Content-Type: %s, Flushes: %d, Expected flushes: %v",
+				tt.name, tt.profile, tt.contentType, flushCount, tt.expectFlushes)
+		})
+	}
+}
+
+// TestStreamingProfilesWithContextOverride tests that context stream value works with profiles
+func TestStreamingProfilesWithContextOverride(t *testing.T) {
+	suites := []ProxyTestSuite{
