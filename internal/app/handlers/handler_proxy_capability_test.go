@@ -332,3 +332,114 @@ func TestFilterEndpointsByProfile_WithCapabilities(t *testing.T) {
 	}
 
 	app := &Application{
+		modelRegistry: modelRegistry,
+		logger:        styledLog,
+	}
+
+	t.Run("named model is never narrowed by capability tags", func(t *testing.T) {
+		profile := &domain.RequestProfile{
+			Path:      "/v1/chat/completions",
+			ModelName: "llama3.1:8b",
+			ModelCapabilities: &domain.ModelCapabilities{
+				VisionUnderstanding: true,
+				ChatCompletion:      true,
+			},
+			SupportedBy: []string{domain.ProfileOllama, domain.ProfileOpenAICompatible},
+		}
+
+		filtered := app.filterEndpointsByProfile(endpoints, profile, styledLog)
+
+		// llama3.1:8b carries no vision tag and lives on the non-vision endpoint;
+		// the request names it, so the vision tag on other models must not evict it
+		assert.Len(t, filtered, 1)
+		assert.Equal(t, "ollama-basic", filtered[0].Name)
+	})
+
+	t.Run("falls back to profile filtering when no capability match", func(t *testing.T) {
+		profile := &domain.RequestProfile{
+			Path: "/v1/chat/completions",
+			ModelCapabilities: &domain.ModelCapabilities{
+				Embeddings: true, // No endpoints have embedding models
+			},
+			SupportedBy: []string{domain.ProfileOllama, domain.ProfileOpenAICompatible},
+		}
+
+		filtered := app.filterEndpointsByProfile(endpoints, profile, styledLog)
+
+		// Should return all compatible endpoints since no capability match
+		assert.Len(t, filtered, 3)
+	})
+}
+
+// Mock implementations for capability testing
+type mockCapabilityModelRegistry struct {
+	mockSimpleModelRegistry
+	modelsByCapability map[string][]*domain.UnifiedModel
+}
+
+func (m *mockCapabilityModelRegistry) GetModelsByCapability(ctx context.Context, capability string) ([]*domain.UnifiedModel, error) {
+	if models, ok := m.modelsByCapability[capability]; ok {
+		return models, nil
+	}
+	return []*domain.UnifiedModel{}, nil
+}
+
+// Full mock with both model and capability support
+type mockFullModelRegistry struct {
+	baseMockRegistry
+	endpointsForModel  map[string][]string
+	modelsByCapability map[string][]*domain.UnifiedModel
+}
+
+func (m *mockFullModelRegistry) GetEndpointsForModel(ctx context.Context, modelName string) ([]string, error) {
+	if endpoints, ok := m.endpointsForModel[modelName]; ok {
+		return endpoints, nil
+	}
+	return []string{}, nil
+}
+
+func (m *mockFullModelRegistry) IsModelAvailable(ctx context.Context, modelName string) bool {
+	_, ok := m.endpointsForModel[modelName]
+	return ok
+}
+
+func (m *mockFullModelRegistry) GetModelsByCapability(ctx context.Context, capability string) ([]*domain.UnifiedModel, error) {
+	if models, ok := m.modelsByCapability[capability]; ok {
+		return models, nil
+	}
+	return []*domain.UnifiedModel{}, nil
+}
+
+func (m *mockFullModelRegistry) GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
+	// implement strict routing for tests
+	modelEndpoints, _ := m.GetEndpointsForModel(ctx, modelName)
+
+	if len(modelEndpoints) == 0 {
+		// model not found - return all healthy as fallback
+		return healthyEndpoints, &domain.ModelRoutingDecision{
+			Strategy: "test",
+			Action:   "fallback",
+			Reason:   "model not found",
+		}, nil
+	}
+
+	// filter to only endpoints with the model
+	modelEndpointMap := make(map[string]bool)
+	for _, url := range modelEndpoints {
+		modelEndpointMap[url] = true
+	}
+
+	var routable []*domain.Endpoint
+	for _, endpoint := range healthyEndpoints {
+		if modelEndpointMap[endpoint.URLString] {
+			routable = append(routable, endpoint)
+		}
+	}
+
+	if len(routable) == 0 {
+		// model only on unhealthy endpoints
+		return healthyEndpoints, &domain.ModelRoutingDecision{
+			Strategy: "test",
+			Action:   "fallback",
+			Reason:   "model unavailable",
+		}, nil
