@@ -69,3 +69,75 @@ func NewHTTPModelDiscoveryClientWithDefaults(profileFactory *profile.Factory, lo
 		},
 	}
 }
+
+func (c *HTTPModelDiscoveryClient) DiscoverModels(ctx context.Context, endpoint *domain.Endpoint) (models []*domain.ModelInfo, err error) {
+	defer func() {
+		if err != nil {
+			c.recordError(endpoint.URLString)
+		}
+	}()
+	startTime := time.Now()
+
+	c.updateMetrics(func(m *DiscoveryMetrics) {
+		atomic.AddInt64(&m.TotalDiscoveries, 1)
+	})
+
+	profileType := endpoint.Type
+	if profileType == "" || profileType == domain.ProfileAuto {
+		return c.discoverWithAutoDetection(ctx, endpoint, startTime)
+	}
+
+	platformProfile, err := c.profileFactory.GetProfile(profileType)
+	if err != nil {
+		return nil, NewDiscoveryError(endpoint.URLString, profileType, "get_profile", 0, time.Since(startTime), err)
+	}
+
+	return c.discoverWithProfile(ctx, endpoint, platformProfile, startTime)
+}
+
+// discoverWithAutoDetection tries profiles in order until one succeeds
+func (c *HTTPModelDiscoveryClient) discoverWithAutoDetection(ctx context.Context, endpoint *domain.Endpoint, startTime time.Time) ([]*domain.ModelInfo, error) {
+	// We're going to try profiles in order:
+	//	Ollama → llama.cpp → LM Studio → vLLM → OpenAI Compatible (as a last resort)
+	// Resolution for this may change in the future as more front-ends appear or are added.
+	profileTypes := []string{
+		domain.ProfileOllama,
+		domain.ProfileLlamaCpp,
+		domain.ProfileLmStudio,
+		domain.ProfileVLLM,
+		domain.ProfileOMLX,             // Apple Silicon only; tried after other common servers
+		domain.ProfileOpenAICompatible, /* last ditch effort */
+	}
+
+	var lastErr error
+	for _, profileType := range profileTypes {
+		platformProfile, err := c.profileFactory.GetProfile(profileType)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		models, err := c.discoverWithProfile(ctx, endpoint, platformProfile, startTime)
+		if err == nil {
+			c.logger.InfoWithEndpoint(" Setting up", endpoint.Name, "profile", platformProfile.GetName())
+			return models, nil
+		}
+
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		lastErr = err
+	}
+
+	return nil, NewDiscoveryError(endpoint.URLString, domain.ProfileAuto, "auto_detect", 0, time.Since(startTime), lastErr)
+}
+
+// discoverWithProfile performs discovery using a specific platform profile
+func (c *HTTPModelDiscoveryClient) discoverWithProfile(ctx context.Context, endpoint *domain.Endpoint, platformProfile domain.PlatformProfile, startTime time.Time) ([]*domain.ModelInfo, error) {
+	// For specific profiles like OpenAI-compatible, skip model_url override by default
+	// to avoid breaking existing configurations that rely on profile defaults
+	// Issue #86 fix applies mainly to LlamaCpp, Ollama, etc. where users need custom paths
+	var discoveryURL string
+
+	// Skip model_url override for OpenAI-compatible unless it's a custom path
