@@ -70,27 +70,3 @@ test_request "Request with unknown model" "unknown-model:latest" "strict"
 echo "=== Test 3: No Model Specified ==="
 response=$(curl -s -i -X POST "$OLLA_URL/olla/api/chat" \
     -H "Content-Type: application/json" \
-    -d "{\"messages\": [{\"role\": \"user\", \"content\": \"test\"}]}" \
-    2>&1 || true)
-
-strategy_header=$(echo "$response" | grep -i "X-Olla-Routing-Strategy:" | head -n 1 || echo "")
-if [[ -z "$strategy_header" ]]; then
-    echo "✓ No routing strategy header (as expected for no model)"
-else
-    echo "✗ Unexpected routing strategy header: $strategy_header"
-fi
-
-echo ""
-
-# test 4: alias pointing at a model that exists on no endpoint (#191)
-# requires the running Olla's config to have routing_strategy.type: strict and a
-# model_aliases entry:
-#   model_aliases:
-#     nonexistent-alias-target:
-#       - some-model-that-is-not-served-anywhere
-# under strict routing this must reject fast (404, model_not_found) rather than
-# silently proxying to a compatible-but-wrong backend and returning 200.
-echo "=== Test 4: Alias With No Routable Target (strict routing must reject, not proxy) ==="
-response=$(curl -s -i -X POST "$OLLA_URL/olla/proxy/api/generate" \
-    -H "Content-Type: application/json" \
-    -d "{\"model\": \"$ALIAS_MODEL\", \"prompt\": \"test\", \"stream\": false}" \

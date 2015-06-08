@@ -207,3 +207,107 @@ func TestGlobFilter_ApplyToMap(t *testing.T) {
 			},
 		},
 		{
+			name: "include only specific profiles",
+			config: &domain.FilterConfig{
+				Include: []string{"ollama", "lmstudio"},
+			},
+			items: map[string]interface{}{
+				"ollama":   "profile1",
+				"lmstudio": "profile2",
+				"vllm":     "profile3",
+				"openai":   "profile4",
+			},
+			expected: map[string]interface{}{
+				"ollama":   "profile1",
+				"lmstudio": "profile2",
+			},
+		},
+		{
+			name: "pattern matching on keys",
+			config: &domain.FilterConfig{
+				Include: []string{"*studio*", "ollama"},
+			},
+			items: map[string]interface{}{
+				"ollama":    "profile1",
+				"lmstudio":  "profile2",
+				"vllm":      "profile3",
+				"anystudio": "profile4",
+			},
+			expected: map[string]interface{}{
+				"ollama":    "profile1",
+				"lmstudio":  "profile2",
+				"anystudio": "profile4",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filter := NewGlobFilter()
+			ctx := context.Background()
+
+			result, err := filter.ApplyToMap(ctx, tt.config, tt.items)
+
+			if tt.expectError {
+				assert.Error(t, err)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestGlobFilter_Matches(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   *domain.FilterConfig
+		itemName string
+		expected bool
+	}{
+		{
+			name:     "nil config matches everything",
+			config:   nil,
+			itemName: "anything",
+			expected: true,
+		},
+		{
+			name:     "empty config matches everything",
+			config:   &domain.FilterConfig{},
+			itemName: "anything",
+			expected: true,
+		},
+		{
+			name: "include pattern matches",
+			config: &domain.FilterConfig{
+				Include: []string{"llama*"},
+			},
+			itemName: "llama3",
+			expected: true,
+		},
+		{
+			name: "include pattern does not match",
+			config: &domain.FilterConfig{
+				Include: []string{"llama*"},
+			},
+			itemName: "phi",
+			expected: false,
+		},
+		{
+			name: "exclude pattern blocks match",
+			config: &domain.FilterConfig{
+				Include: []string{"*"},
+				Exclude: []string{"*experimental*"},
+			},
+			itemName: "model-experimental",
+			expected: false,
+		},
+		{
+			name: "multiple include patterns",
+			config: &domain.FilterConfig{
+				Include: []string{"llama*", "phi*"},
+			},
+			itemName: "phi-2",
+			expected: true,
+		},
