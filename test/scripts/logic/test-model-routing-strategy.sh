@@ -46,27 +46,3 @@ test_request() {
     echo "Routing Strategy: $strategy_header"
     echo "Routing Decision: $decision_header"
     echo "Routing Reason: $reason_header"
-    
-    # check if strategy matches expected
-    if [[ "$strategy_header" == *"$expected_strategy"* ]]; then
-        echo "✓ Strategy matches expected: $expected_strategy"
-    else
-        echo "✗ Strategy mismatch. Expected: $expected_strategy"
-    fi
-    
-    echo "---"
-    echo ""
-}
-
-# test 1: request with a known model
-echo "=== Test 1: Known Model (should use configured strategy) ==="
-test_request "Request with known model" "$MODEL" "strict"
-
-# test 2: request with unknown model
-echo "=== Test 2: Unknown Model (should reject with strict strategy) ==="
-test_request "Request with unknown model" "unknown-model:latest" "strict"
-
-# test 3: request without model (should not trigger routing strategy)
-echo "=== Test 3: No Model Specified ==="
-response=$(curl -s -i -X POST "$OLLA_URL/olla/api/chat" \
-    -H "Content-Type: application/json" \
