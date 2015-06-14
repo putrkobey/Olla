@@ -37,22 +37,3 @@ func (c *LemonadeConverter) ConvertToFormat(models []*domain.UnifiedModel, filte
 		lemonadeModel := c.convertModel(model)
 		if lemonadeModel != nil {
 			data = append(data, *lemonadeModel)
-		}
-	}
-
-	return profile.LemonadeResponse{
-		Object: "list",
-		Data:   data,
-	}, nil
-}
-
-func (c *LemonadeConverter) convertModel(model *domain.UnifiedModel) *profile.LemonadeModel {
-	// For Lemonade, prefer the native Lemonade name if available from source endpoints
-	now := time.Now().Unix()
-	modelID := c.FindNativeName(model)
-	if modelID == "" {
-		// Fallback to first alias or unified ID
-		if len(model.Aliases) > 0 {
-			modelID = model.Aliases[0].Name
-		} else {
-			modelID = model.ID
