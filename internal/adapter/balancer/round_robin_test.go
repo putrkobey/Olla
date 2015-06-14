@@ -315,3 +315,109 @@ func TestRoundRobinSelector_ConcurrentAccess(t *testing.T) {
 				valid = true
 				break
 			}
+		}
+		if !valid {
+			t.Errorf("Invalid endpoint selected: %s", selection)
+		}
+	}
+
+	if totalSelections != 200 {
+		t.Errorf("Expected 200 total selections, got %d", totalSelections)
+	}
+
+	// All endpoints should have been selected at least once
+	for _, endpoint := range endpoints {
+		if selectionCounts[endpoint.Name] == 0 {
+			t.Errorf("Endpoint %s was never selected", endpoint.Name)
+		}
+	}
+}
+
+func TestRoundRobinSelector_DynamicEndpointChanges(t *testing.T) {
+	selector := NewRoundRobinSelector(NewTestStatsCollector())
+	ctx := context.Background()
+
+	// Start with 2 endpoints
+	endpoints := []*domain.Endpoint{
+		createRoundRobinEndpoint("endpoint-1", 11434, domain.StatusHealthy),
+		createRoundRobinEndpoint("endpoint-2", 11435, domain.StatusHealthy),
+	}
+
+	// Select a few times
+	for range 4 {
+		selector.Select(ctx, endpoints)
+	}
+
+	// Add a third endpoint (simulates dynamic discovery)
+	endpoints = append(endpoints, createRoundRobinEndpoint("endpoint-3", 11436, domain.StatusHealthy))
+
+	// Continue selecting - should include new endpoint
+	selections := make(map[string]int)
+	for range 12 {
+		endpoint, err := selector.Select(ctx, endpoints)
+		if err != nil {
+			t.Fatalf("Select failed: %v", err)
+		}
+		selections[endpoint.Name]++
+	}
+
+	// All endpoints should be selected
+	if selections["endpoint-1"] == 0 {
+		t.Error("endpoint-1 not selected after adding endpoint-3")
+	}
+	if selections["endpoint-2"] == 0 {
+		t.Error("endpoint-2 not selected after adding endpoint-3")
+	}
+	if selections["endpoint-3"] == 0 {
+		t.Error("endpoint-3 not selected after being added")
+	}
+
+	// Each should be selected 4 times (12 selections / 3 endpoints)
+	for name, count := range selections {
+		if count != 4 {
+			t.Errorf("Expected 4 selections for %s, got %d", name, count)
+		}
+	}
+}
+
+func TestRoundRobinSelector_StatusChanges(t *testing.T) {
+	selector := NewRoundRobinSelector(NewTestStatsCollector())
+	ctx := context.Background()
+
+	endpoints := []*domain.Endpoint{
+		createRoundRobinEndpoint("endpoint-1", 11434, domain.StatusHealthy),
+		createRoundRobinEndpoint("endpoint-2", 11435, domain.StatusHealthy),
+		createRoundRobinEndpoint("endpoint-3", 11436, domain.StatusHealthy),
+	}
+
+	// Make endpoint-2 offline
+	endpoints[1].Status = domain.StatusOffline
+
+	// Should only select endpoint-1 and endpoint-3
+	selections := make(map[string]int)
+	for range 10 {
+		endpoint, err := selector.Select(ctx, endpoints)
+		if err != nil {
+			t.Fatalf("Select failed: %v", err)
+		}
+		selections[endpoint.Name]++
+	}
+
+	// endpoint-2 should never be selected
+	if selections["endpoint-2"] > 0 {
+		t.Error("Offline endpoint-2 was selected")
+	}
+
+	// endpoint-1 and endpoint-3 should be selected equally
+	if selections["endpoint-1"] != 5 || selections["endpoint-3"] != 5 {
+		t.Errorf("Expected equal distribution: endpoint-1=%d, endpoint-3=%d",
+			selections["endpoint-1"], selections["endpoint-3"])
+	}
+}
+
+func TestRoundRobinSelector_DistributionFairness(t *testing.T) {
+	selector := NewRoundRobinSelector(NewTestStatsCollector())
+	ctx := context.Background()
+
+	endpoints := []*domain.Endpoint{
+		createRoundRobinEndpoint("endpoint-1", 11434, domain.StatusHealthy),

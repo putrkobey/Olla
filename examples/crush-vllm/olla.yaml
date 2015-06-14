@@ -1,0 +1,46 @@
+# Olla Configuration for Crush CLI + vLLM Integration
+# This configuration enables both OpenAI and Anthropic API formats
+# for use with Crush CLI and high-performance vLLM backends.
+
+server:
+  host: "0.0.0.0"
+  port: 40114
+  read_timeout: 30s
+  write_timeout: 0s  # For LLM streaming, leave this as 0s
+  shutdown_timeout: 10s
+  request_logging: true
+  request_limits:
+    max_body_size: 52428800  # 50MB
+    max_header_size: 524288  # 512KB
+  rate_limits:
+    global_requests_per_minute: 1000
+    per_ip_requests_per_minute: 200  # Higher for local development
+    health_requests_per_minute: 1000
+    burst_size: 100
+    cleanup_interval: 5m
+    trust_proxy_headers: false
+    trusted_proxy_cidrs: [
+      "127.0.0.0/8",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ]
+
+proxy:
+  engine: "olla"  # High-performance engine for vLLM
+  profile: "streaming"  # No buffering, tokens stream immediately
+  load_balancer: "priority"  # Priority-based balancing
+  stream_buffer_size: 16384  # Larger buffer for high-performance streaming
+  connection_timeout: 60s
+  response_timeout: 20m  # Long generations
+  read_timeout: 10m
+  # Retry is automatic on connection failure; no extra configuration needed.
+
+# Enable Anthropic API translation for Crush CLI dual-provider support
+translators:
+  anthropic:
+    enabled: true
+    passthrough_enabled: true        # native passthrough where the backend supports it
+    max_message_size: 10485760       # 10MB max request size
+
+discovery:
