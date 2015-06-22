@@ -1,0 +1,174 @@
+package unifier
+
+import (
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/putrkobey/Olla/internal/core/domain"
+)
+
+// CatalogStore provides thread-safe storage with fast lookups
+// by ID, name, and digest. Uses atomic pointers for zero-copy reads.
+type CatalogStore struct {
+	lastCleanup     time.Time
+	catalog         map[string]*atomic.Pointer[domain.UnifiedModel]
+	digestIndex     map[string][]string
+	nameIndex       map[string][]string
+	endpointModels  map[string][]string
+	cleanupInterval time.Duration
+	mu              sync.RWMutex
+}
+
+func NewCatalogStore(cleanupInterval time.Duration) *CatalogStore {
+	return &CatalogStore{
+		catalog:         make(map[string]*atomic.Pointer[domain.UnifiedModel]),
+		digestIndex:     make(map[string][]string),
+		nameIndex:       make(map[string][]string),
+		endpointModels:  make(map[string][]string),
+		cleanupInterval: cleanupInterval,
+		lastCleanup:     time.Now(),
+	}
+}
+
+// Reset empties the store in place under its lock. Callers hold the store pointer without
+// synchronisation, so replacing the store would race with every concurrent reader.
+func (c *CatalogStore) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.catalog = make(map[string]*atomic.Pointer[domain.UnifiedModel])
+	c.digestIndex = make(map[string][]string)
+	c.nameIndex = make(map[string][]string)
+	c.endpointModels = make(map[string][]string)
+	c.lastCleanup = time.Now()
+}
+
+func (c *CatalogStore) GetModel(id string) (*domain.UnifiedModel, bool) {
+	c.mu.RLock()
+	ptr := c.catalog[id]
+	c.mu.RUnlock()
+
+	if ptr == nil {
+		return nil, false
+	}
+	// Zero-copy read via atomic load. The stored model is immutable: it is
+	// shared with lock-free readers, so callers must never write to it (or to
+	// its slices and maps). Writers call Clone, mutate the clone and PutModel it.
+	return ptr.Load(), true
+}
+
+func (c *CatalogStore) PutModel(model *domain.UnifiedModel) {
+	if model == nil {
+		return
+	}
+
+	// Copy-on-write: deep copy before storing
+	// this allows callers to modify their reference while we store immutable version
+	c.putOwned(model.Clone())
+}
+
+// putOwned stores a model the caller has already cloned and will not touch again,
+// saving the second copy PutModel makes for writers that cloned to mutate.
+func (c *CatalogStore) putOwned(modelCopy *domain.UnifiedModel) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ptr, exists := c.catalog[modelCopy.ID]
+	if !exists {
+		ptr = &atomic.Pointer[domain.UnifiedModel]{}
+		c.catalog[modelCopy.ID] = ptr
+	}
+	ptr.Store(modelCopy)
+
+	if modelCopy.Metadata != nil {
+		if digest, ok := modelCopy.Metadata["digest"].(string); ok && digest != "" {
+			c.addToIndex(c.digestIndex, digest, modelCopy.ID)
+		}
+	}
+
+	for _, alias := range modelCopy.Aliases {
+		c.addToIndex(c.nameIndex, strings.ToLower(alias.Name), modelCopy.ID)
+	}
+}
+
+func (c *CatalogStore) GetAllModels() []*domain.UnifiedModel {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	models := make([]*domain.UnifiedModel, 0, len(c.catalog))
+	for _, ptr := range c.catalog {
+		if ptr != nil {
+			if model := ptr.Load(); model != nil {
+				models = append(models, model)
+			}
+		}
+	}
+	return models
+}
+
+// ResolveByName finds a model by ID or alias. An exact match always wins; only a
+// miss on a name without a tag tries "<name>:latest", and that only matches a model
+// an Ollama endpoint serves under that native name (see domain.OllamaDefaultTagName).
+func (c *CatalogStore) ResolveByName(name string) (*domain.UnifiedModel, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if model, ok := c.lookupLocked(name, true); ok {
+		return model, true
+	}
+
+	tagged, ok := domain.OllamaDefaultTagName(name)
+	if !ok {
+		return nil, false
+	}
+	// The alias index already holds every alias, so the full scan adds nothing here.
+	model, ok := c.lookupLocked(tagged, false)
+	if !ok || !servedByOllamaAs(model, tagged) {
+		return nil, false
+	}
+	return model, true
+}
+
+// ResolveExactName is ResolveByName without the Ollama default-tag fallback. Ingest
+// uses it to decide whether a discovered model is one already in the catalogue: a
+// vLLM model called "foo" is not the Ollama model "foo:latest" and must not merge
+// into it.
+func (c *CatalogStore) ResolveExactName(name string) (*domain.UnifiedModel, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lookupLocked(name, true)
+}
+
+// servedByOllamaAs reports whether an Ollama endpoint serves model under nativeName.
+// A merged model can also be served by other platforms under the same name, and
+// those must not make a bare name resolve.
+func servedByOllamaAs(model *domain.UnifiedModel, nativeName string) bool {
+	for i := range model.SourceEndpoints {
+		src := &model.SourceEndpoints[i]
+		if src.Platform == domain.ProfileOllama && strings.EqualFold(src.NativeName, nativeName) {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupLocked resolves name by ID, then the lower-cased alias index, then (when scan
+// is set) an alias scan. Callers hold c.mu.
+func (c *CatalogStore) lookupLocked(name string, scan bool) (*domain.UnifiedModel, bool) {
+	// Direct ID lookup is fastest
+	if ptr, exists := c.catalog[name]; exists && ptr != nil {
+		if model := ptr.Load(); model != nil {
+			return model, true
+		}
+	}
+
+	lowercaseName := strings.ToLower(name)
+	if modelIDs, exists := c.nameIndex[lowercaseName]; exists && len(modelIDs) > 0 {
+		if ptr, exists := c.catalog[modelIDs[0]]; exists && ptr != nil {
+			if model := ptr.Load(); model != nil {
+				return model, true
+			}
+		}
+	}
