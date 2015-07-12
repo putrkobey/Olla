@@ -24,3 +24,12 @@ func ResolveURLPath(baseURL, pathOrURL string) string {
 	if pathOrURL == "" {
 		return baseURL
 	}
+
+	// Check if pathOrURL is already an absolute URL
+	if parsed, err := url.Parse(pathOrURL); err == nil && parsed.IsAbs() {
+		return pathOrURL
+	}
+
+	// Parse base URL
+	base, err := url.Parse(baseURL)
+	if err != nil {
