@@ -51,3 +51,30 @@ func createTestProfileFactory() ProfileFactory {
 								"ttft_ms":           "prompt_duration_ns / 1000000",
 							},
 						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func BenchmarkExtractor(b *testing.B) {
+	// Create a discard logger for benchmarking
+	slogger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	log := logger.NewPlainStyledLogger(slogger)
+	factory := createTestProfileFactory()
+
+	extractor, err := NewExtractor(factory, log)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	// Validate profile
+	profile, err := factory.GetProfile("ollama")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := extractor.ValidateProfile(profile); err != nil {
+		b.Fatal(err)
+	}
+

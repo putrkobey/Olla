@@ -1,0 +1,31 @@
+{
+  "$schema": "https://charm.land/crush.json",
+  "providers": {
+    "olla-openai": {
+      "name": "Olla vLLM (OpenAI)",
+      "type": "openai-compat",
+      "base_url": "http://localhost:40114/olla/openai/v1",
+      "api_key": "olla-local",
+      "models": [
+        {
+          "id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+          "name": "Llama 3.1 8B Instruct",
+          "context_window": 131072,
+          "default_max_tokens": 8192,
+          "cost_per_1m_in": 0,
+          "cost_per_1m_out": 0
+        },
+        {
+          "id": "meta-llama/Meta-Llama-3.2-3B-Instruct",
+          "name": "Llama 3.2 3B Instruct",
+          "context_window": 131072,
+          "default_max_tokens": 4096,
+          "cost_per_1m_in": 0,
+          "cost_per_1m_out": 0
+        }
+      ]
+    },
+    "olla-anthropic": {
+      "name": "Olla vLLM (Anthropic)",
+      "type": "anthropic",
+      "base_url": "http://localhost:40114/olla/anthropic/v1",

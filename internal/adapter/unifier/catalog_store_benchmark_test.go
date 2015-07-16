@@ -1,0 +1,202 @@
+package unifier
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/putrkobey/Olla/internal/core/domain"
+)
+
+// BenchmarkCatalogStore_GetModel measures read performance
+func BenchmarkCatalogStore_GetModel(b *testing.B) {
+	store := NewCatalogStore(5 * time.Minute)
+
+	// Pre-populate store with test models
+	for i := range 100 {
+		model := &domain.UnifiedModel{
+			ID:     fmt.Sprintf("model-%d", i),
+			Family: fmt.Sprintf("family-%d", i%10),
+			Aliases: []domain.AliasEntry{
+				{Name: fmt.Sprintf("alias-%d", i), Source: "ollama"},
+			},
+			SourceEndpoints: []domain.SourceEndpoint{
+				{
+					EndpointURL:  fmt.Sprintf("http://localhost:%d", 11434+i),
+					EndpointName: fmt.Sprintf("endpoint-%d", i),
+					NativeName:   fmt.Sprintf("model-%d", i),
+					DiskSize:     int64(i * 1024 * 1024),
+					LastSeen:     time.Now(),
+				},
+			},
+			Capabilities: []string{"chat", "streaming", "function_calling"},
+			Metadata:     map[string]interface{}{"digest": fmt.Sprintf("sha256:%d", i)},
+			LastSeen:     time.Now(),
+		}
+		store.PutModel(model)
+	}
+
+	b.Run("Sequential", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := range b.N {
+			_, _ = store.GetModel(fmt.Sprintf("model-%d", i%100))
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				_, _ = store.GetModel(fmt.Sprintf("model-%d", i%100))
+				i++
+			}
+		})
+	})
+}
+
+// BenchmarkCatalogStore_PutModel measures write performance
+func BenchmarkCatalogStore_PutModel(b *testing.B) {
+	store := NewCatalogStore(5 * time.Minute)
+
+	createModel := func(i int) *domain.UnifiedModel {
+		return &domain.UnifiedModel{
+			ID:     fmt.Sprintf("model-%d", i),
+			Family: fmt.Sprintf("family-%d", i%10),
+			Aliases: []domain.AliasEntry{
+				{Name: fmt.Sprintf("alias-%d", i), Source: "ollama"},
+			},
+			SourceEndpoints: []domain.SourceEndpoint{
+				{
+					EndpointURL:  fmt.Sprintf("http://localhost:%d", 11434+i),
+					EndpointName: fmt.Sprintf("endpoint-%d", i),
+					NativeName:   fmt.Sprintf("model-%d", i),
+					DiskSize:     int64(i * 1024 * 1024),
+					LastSeen:     time.Now(),
+				},
+			},
+			Capabilities: []string{"chat", "streaming", "function_calling"},
+			Metadata:     map[string]interface{}{"digest": fmt.Sprintf("sha256:%d", i)},
+			LastSeen:     time.Now(),
+		}
+	}
+
+	b.Run("Sequential", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := range b.N {
+			model := createModel(i)
+			store.PutModel(model)
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				model := createModel(i)
+				store.PutModel(model)
+				i++
+			}
+		})
+	})
+}
+
+// BenchmarkCatalogStore_GetAllModels measures GetAllModels performance
+func BenchmarkCatalogStore_GetAllModels(b *testing.B) {
+	sizes := []int{10, 100, 1000}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("Size_%d", size), func(b *testing.B) {
+			store := NewCatalogStore(5 * time.Minute)
+
+			// Pre-populate
+			for i := range size {
+				model := &domain.UnifiedModel{
+					ID:     fmt.Sprintf("model-%d", i),
+					Family: fmt.Sprintf("family-%d", i%10),
+					Aliases: []domain.AliasEntry{
+						{Name: fmt.Sprintf("alias-%d", i), Source: "ollama"},
+					},
+					SourceEndpoints: []domain.SourceEndpoint{
+						{
+							EndpointURL:  fmt.Sprintf("http://localhost:%d", 11434+i),
+							EndpointName: fmt.Sprintf("endpoint-%d", i),
+							NativeName:   fmt.Sprintf("model-%d", i),
+							DiskSize:     int64(i * 1024 * 1024),
+							LastSeen:     time.Now(),
+						},
+					},
+					Capabilities: []string{"chat", "streaming"},
+					Metadata:     map[string]interface{}{"digest": fmt.Sprintf("sha256:%d", i)},
+					LastSeen:     time.Now(),
+				}
+				store.PutModel(model)
+			}
+
+			b.ResetTimer()
+			b.ReportAllocs()
+			for range b.N {
+				models := store.GetAllModels()
+				_ = models
+			}
+		})
+	}
+}
+
+// BenchmarkCatalogStore_ResolveByName measures name resolution performance
+func BenchmarkCatalogStore_ResolveByName(b *testing.B) {
+	store := NewCatalogStore(5 * time.Minute)
+
+	// Pre-populate with models
+	for i := range 100 {
+		model := &domain.UnifiedModel{
+			ID:     fmt.Sprintf("model-%d", i),
+			Family: fmt.Sprintf("family-%d", i%10),
+			Aliases: []domain.AliasEntry{
+				{Name: fmt.Sprintf("alias-%d", i), Source: "ollama"},
+				{Name: fmt.Sprintf("alt-%d", i), Source: "lmstudio"},
+			},
+			SourceEndpoints: []domain.SourceEndpoint{
+				{
+					EndpointURL:  fmt.Sprintf("http://localhost:%d", 11434+i),
+					EndpointName: fmt.Sprintf("endpoint-%d", i),
+					NativeName:   fmt.Sprintf("model-%d", i),
+					DiskSize:     int64(i * 1024 * 1024),
+					LastSeen:     time.Now(),
+				},
+			},
+			Capabilities: []string{"chat", "streaming"},
+			Metadata:     map[string]interface{}{"digest": fmt.Sprintf("sha256:%d", i)},
+			LastSeen:     time.Now(),
+		}
+		store.PutModel(model)
+	}
+
+	b.Run("DirectID", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := range b.N {
+			_, _ = store.ResolveByName(fmt.Sprintf("model-%d", i%100))
+		}
+	})
+
+	b.Run("ByAlias", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		for i := range b.N {
+			_, _ = store.ResolveByName(fmt.Sprintf("alias-%d", i%100))
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
