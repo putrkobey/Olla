@@ -1,0 +1,135 @@
+# vLLM inference platform profile
+name: vllm
+home: "https://github.com/vllm-project/vllm"
+version: "1.0"
+display_name: "vLLM"
+description: "vLLM high-performance inference server with PagedAttention"
+
+# Routing configuration
+routing:
+  prefixes:
+    - vllm
+
+# API compatibility
+api:
+  openai_compatible: true
+
+  # Anthropic Messages API support (v0.11.1+)
+  # vLLM v0.11.1+ natively supports the Anthropic Messages API, allowing direct forwarding
+  # of Anthropic-format requests without translation overhead
+  anthropic_support:
+    enabled: true
+    messages_path: /v1/messages
+    token_count: false
+    min_version: "0.11.1"
+    limitations:
+      - no_token_counting
+
+  paths:
+    # Health and system endpoints
+    - /health              # 0: health check (vLLM-specific endpoint)
+    - /metrics             # 1: Prometheus metrics endpoint
+    - /version             # 2: vLLM version information
+    
+    # Model management
+    - /v1/models           # 3: list models (OpenAI-compatible)
+    
+    # Text generation endpoints (OpenAI-compatible)
+    - /v1/chat/completions # 4: chat completions
+    - /v1/completions      # 5: text completions
+    
+    # Embeddings and pooling
+    - /v1/embeddings       # 6: embeddings/pooling API
+    
+    # Tokenization endpoints (vLLM-specific)
+    - /tokenize            # 7: encode text to tokens
+    - /detokenize          # 8: decode tokens to text
+    - /v1/tokenize         # 9: versioned tokenize endpoint
+    - /v1/detokenize       # 10: versioned detokenize endpoint
+    
+    # Reranking endpoints (compatible with Jina AI and Cohere)
+    - /rerank              # 11: reranking API
+    - /v1/rerank           # 12: versioned reranking API
+    - /v2/rerank           # 13: v2 reranking API
+    
+    # Optional/debug endpoints
+    - /get_tokenizer_info  # 14: tokenizer configuration info
+    # Newer paths: /v1/responses needs vLLM 0.10.0+, /v1/messages 0.11.1+; older releases 404.
+    - /v1/responses # 15: OpenAI Responses API
+    - /v1/messages # 16: Anthropic Messages API
+    # Declared although anthropic_support.token_count is false: that flag describes Olla's
+    # translator, whereas this entry says vLLM serves the path (0.17.0+; older releases 404),
+    # which keeps it a candidate when another profile in the fleet declares count_tokens.
+    - /v1/messages/count_tokens # 17: Anthropic token count
+    
+  model_discovery_path: /v1/models
+  health_check_path: /health
+  metrics_path: /metrics
+
+# Platform characteristics
+characteristics:
+  timeout: 2m
+  max_concurrent_requests: 100
+  default_priority: 80
+  streaming_support: true
+  auth:
+    required: false
+    types:
+      - bearer   # enabled via --api-key flag
+
+# Detection hints for auto-discovery
+detection:
+  path_indicators:
+    - "/v1/models"
+    - "/health"
+    - "/metrics"        # Prometheus metrics endpoint is vLLM-specific
+    - "/tokenize"       # vLLM-specific tokenization endpoint
+  default_ports:
+    - 8000
+  response_headers:
+    - "X-vLLM-Version"  # vLLM may add this in future versions
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "vllm"
+  parsing_rules:
+    chat_completions_path: "/v1/chat/completions"
+    completions_path: "/v1/completions"
+    model_field_name: "model"
+    supports_streaming: true
+
+# Path indices for specific functions
+path_indices:
+  health: 0
+  metrics: 1
+  version: 2
+  models: 3
+  chat_completions: 4
+  completions: 5
+  embeddings: 6
+  tokenize: 7
+  detokenize: 8
+  v1_tokenize: 9
+  v1_detokenize: 10
+  rerank: 11
+  v1_rerank: 12
+  v2_rerank: 13
+  tokenizer_info: 14
+
+# Model handling
+models:
+  name_format: "{{.Name}}"  # vLLM uses full model names like "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  capability_patterns:
+    chat:
+      - "*-Chat-*"
+      - "*-Instruct*"
+      - "*-chat-*"
+    embeddings:
+      - "*embedding*"
+      - "*-embed-*"
+    vision:
+      - "*vision*"
+      - "*llava*"
+    code:

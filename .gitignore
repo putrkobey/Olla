@@ -1,0 +1,11 @@
+.idea/
+.kaizen/
+out/
+bin/
+report/
+debug/
+logs/
+tmp/
+*.exe
+/olla
+# Local config files (never ship these)
