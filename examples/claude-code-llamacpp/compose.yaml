@@ -1,0 +1,29 @@
+services:
+  llama-cpp:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-cpp
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models:ro          # Mount models directory (read-only)
+    command:
+      - "--model"
+      - "/models/Llama-3.4-3B-Instruct-Q5_K_M.gguf"  # UPDATE THIS with your model filename
+      - "--ctx-size"
+      - "8192"                       # Context window
+      - "--n-gpu-layers"
+      - "0"                          # CPU-only (set > 0 for GPU)
+      - "--threads"
+      - "8"                          # CPU threads (adjust for your CPU)
+      - "--batch-size"
+      - "512"
+      - "--port"
+      - "8080"
+      - "--host"
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
