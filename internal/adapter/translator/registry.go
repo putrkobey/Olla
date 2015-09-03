@@ -40,3 +40,24 @@ func (r *Registry) Register(name string, translator RequestTranslator) {
 		if name == "" {
 			r.logger.Error("Translator has empty name, cannot register")
 			return
+		}
+	}
+
+	// Log if we're overwriting an existing translator - might indicate a config issue
+	if existing, exists := r.translators[name]; exists {
+		r.logger.Warn("Overwriting existing translator",
+			"name", name,
+			"old", fmt.Sprintf("%T", existing),
+			"new", fmt.Sprintf("%T", translator))
+	}
+
+	r.translators[name] = translator
+	r.logger.Debug("Registered translator", "name", name, "type", fmt.Sprintf("%T", translator))
+}
+
+// Get retrieves a translator by name
+// returns error if not found (go convention)
+func (r *Registry) Get(name string) (RequestTranslator, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
