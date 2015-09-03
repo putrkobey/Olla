@@ -1,0 +1,51 @@
+# Olla configuration for OpenCode + LM Studio
+#
+# OpenCode talks to Olla's OpenAI-compatible endpoint
+# (http://localhost:40114/olla/openai/v1) and Olla proxies to LM Studio
+# running on the host machine. The Anthropic translator is left enabled so
+# the /olla/anthropic/v1 endpoint is available too (LM Studio has native
+# Anthropic support, so those requests are passed through, not translated).
+
+server:
+  host: "0.0.0.0"
+  port: 40114
+  read_timeout: 30s
+  write_timeout: 0s # for LLM streaming, leave this as 0s
+  shutdown_timeout: 10s
+  request_logging: true
+  request_limits:
+    max_body_size: 52428800  # 50MB
+    max_header_size: 524288  # 512KB
+  rate_limits:
+    global_requests_per_minute: 1000
+    per_ip_requests_per_minute: 100
+    health_requests_per_minute: 1000
+    burst_size: 50
+    cleanup_interval: 5m
+    trust_proxy_headers: false
+    trusted_proxy_cidrs: [
+      "127.0.0.0/8",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ]
+
+proxy:
+  engine: "olla" # Available: sherpa, olla (olla is the default, high-performance engine)
+  connection_timeout: 40s
+  response_timeout: 900s  # 15 minutes for longer generations
+  read_timeout: 300s
+  load_balancer: "priority" # Available: round-robin, least-connections, priority
+  # stream_buffer_size: 8192 # Unset: the engine default applies (Olla 64KiB, Sherpa 8KiB)
+  # Note: failover on connection errors is automatic; tune it with the
+  # proxy.retry block (enabled, max_attempts, non_idempotent). max_retries /
+  # retry_backoff do nothing.
+
+discovery:
+  type: "static"
+  refresh_interval: 30s
+  static:
+    endpoints:
+      # LM Studio endpoint - adjust URL based on your platform
+      #
+      # Windows/Mac: use host.docker.internal to reach the host
