@@ -17,3 +17,22 @@ let component: ReturnType<typeof mount> | undefined;
 afterEach(() => {
   if (component) unmount(component);
   document.body.innerHTML = '';
+});
+
+// Partial Response shape the mock returns; only the fields the stores read.
+type MockResponse = {
+  status: number;
+  ok: boolean;
+  headers: { get: () => string | null };
+  json: () => Promise<unknown>;
+};
+
+describe('StatTile has no {@html} sink', () => {
+  // Fail-first: the current StatTile source carries {@html} and the
+  // valueHtml/subHtml props, so this assertion fails until the component is
+  // migrated to snippets.
+  it('source contains no {@html} tags and no valueHtml/subHtml props', () => {
+    expect(statTileSrc).not.toMatch(/\{@html/);
+    expect(statTileSrc).not.toMatch(/valueHtml/);
+    expect(statTileSrc).not.toMatch(/subHtml/);
+  });
