@@ -1,0 +1,105 @@
+package integration
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/putrkobey/Olla/internal/adapter/discovery"
+	"github.com/putrkobey/Olla/internal/adapter/filter"
+	"github.com/putrkobey/Olla/internal/adapter/registry/profile"
+	"github.com/putrkobey/Olla/internal/config"
+	"github.com/putrkobey/Olla/internal/core/domain"
+)
+
+func TestFilteringOutOllamaProfile(t *testing.T) {
+	t.Run("filtering ollama profile with no endpoints using it", func(t *testing.T) {
+		// Create profile factory with filter that excludes ollama
+		profileFilter := &domain.FilterConfig{
+			Exclude: []string{"ollama"},
+		}
+
+		factory, err := profile.NewFactory("../../config/profiles")
+		require.NoError(t, err)
+
+		// Create filter adapter
+		filterAdapter := filter.NewGlobFilter()
+
+		// Apply filter to profile loader
+		loader := factory.GetLoader()
+		if loader != nil {
+			loader.SetFilterAdapter(filterAdapter)
+			loader.SetFilter(profileFilter)
+			err = loader.LoadProfiles()
+			require.NoError(t, err)
+		}
+
+		// Verify ollama profile is not available
+		availableProfiles := factory.GetAvailableProfiles()
+		assert.NotContains(t, availableProfiles, "ollama")
+
+		// Verify ValidateProfileType returns false for ollama
+		assert.False(t, factory.ValidateProfileType("ollama"))
+
+		// Create repository with no endpoints
+		repo := discovery.NewStaticEndpointRepository()
+
+		// Load empty config - should work fine
+		err = repo.LoadFromConfig(context.Background(), []config.EndpointConfig{})
+		assert.NoError(t, err, "Loading empty config should work even with ollama filtered")
+
+		// Try to get endpoints - should work fine
+		endpoints, err := repo.GetAll(context.Background())
+		assert.NoError(t, err)
+		assert.Empty(t, endpoints)
+	})
+
+	t.Run("filtering ollama profile breaks endpoints that use it", func(t *testing.T) {
+		// Create profile factory with filter that excludes ollama
+		profileFilter := &domain.FilterConfig{
+			Exclude: []string{"ollama"},
+		}
+
+		factory, err := profile.NewFactory("../../config/profiles")
+		require.NoError(t, err)
+
+		// Create filter adapter
+		filterAdapter := filter.NewGlobFilter()
+
+		// Apply filter to profile loader
+		loader := factory.GetLoader()
+		if loader != nil {
+			loader.SetFilterAdapter(filterAdapter)
+			loader.SetFilter(profileFilter)
+			err = loader.LoadProfiles()
+			require.NoError(t, err)
+		}
+
+		// Create repository with the filtered factory
+		repo := discovery.NewStaticEndpointRepositoryWithFactory(factory)
+
+		// Try to load config with ollama endpoint
+		configs := []config.EndpointConfig{
+			{
+				Name:           "test-ollama",
+				URL:            "http://localhost:11434",
+				Type:           "ollama",
+				HealthCheckURL: "/",
+				ModelURL:       "/api/tags",
+				CheckInterval:  5 * time.Second,
+				CheckTimeout:   2 * time.Second,
+			},
+		}
+
+		// This should fail because ollama profile is filtered out
+		err = repo.LoadFromConfig(context.Background(), configs)
+		assert.Error(t, err, "Should fail to load endpoint with filtered profile type")
+		assert.Contains(t, err.Error(), "unsupported endpoint type: ollama")
+	})
+
+	// Removed test for "auto" type - auto is for discovery detection, not a real profile type
+
+	t.Run("endpoint with empty type works even with ollama filtered", func(t *testing.T) {
+		// Create profile factory with filter that excludes ollama
