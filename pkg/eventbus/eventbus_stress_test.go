@@ -70,3 +70,148 @@ func TestWorkerPool_ConcurrentPublishingStress(t *testing.T) {
 			}
 		}
 	}()
+
+	// Publish events rapidly (no delays - maximum stress)
+	var wg sync.WaitGroup
+	for p := range numPublishers {
+		wg.Add(1)
+		go func(publisherID int) {
+			defer wg.Done()
+			for i := range eventsPerPublisher {
+				event := string(rune('A'+publisherID)) + string(rune('0'+i))
+				eb.PublishAsync(event)
+				published.Add(1)
+			}
+		}(p)
+	}
+
+	// Publish then Drain, guarded by hangGuard rather than polling for the
+	// receive count to "stabilise". Drain blocks until every event that made
+	// it into the worker queue has been run through bus.Publish, so once it
+	// returns the subscriber-delivery decision for every published event is
+	// final - a deterministic synchronisation point instead of a wall-clock
+	// guess at when the storm has settled.
+	stormDone := make(chan struct{})
+	go func() {
+		defer close(stormDone)
+		wg.Wait()
+		eb.Drain()
+	}()
+
+	select {
+	case <-stormDone:
+	case <-time.After(hangGuard):
+		t.Fatal("test hung / suspected deadlock: storm publish+drain did not complete")
+	}
+
+	// Stop the receiver, then flush anything it hadn't yet pulled off the
+	// channel: Drain has already returned, so nothing writes to ch anymore -
+	// this sweep is a safe, deterministic drain rather than a race against
+	// the receiver goroutine's own scheduling.
+	close(done)
+	<-stopped
+flush:
+	for {
+		select {
+		case event := <-ch:
+			receivedCount.Add(1)
+			mu.Lock()
+			received[event] = true
+			mu.Unlock()
+		default:
+			break flush
+		}
+	}
+
+	publishedTotal := published.Load()
+	receivedTotal := receivedCount.Load()
+
+	mu.Lock()
+	uniqueEvents := len(received)
+	mu.Unlock()
+
+	t.Logf("STRESS TEST - Published: %d", publishedTotal)
+	t.Logf("STRESS TEST - Received: %d events", receivedTotal)
+	t.Logf("STRESS TEST - Unique events: %d", uniqueEvents)
+
+	// Prove the bus survived the storm rather than silently wedging: publish
+	// one more event synchronously and confirm the still-live subscriber gets it.
+	delivered := eb.Publish("post-storm")
+	require.Equal(t, 1, delivered, "bus should still deliver to the live subscriber after the storm")
+
+	// With every event drained and accounted for, delivered + tracked drops
+	// (subscriber-stage and queue-stage) must reconcile EXACTLY against what
+	// was published - there is no longer any event that could still be
+	// mid-flight and uncounted.
+	stats := eb.Stats()
+	require.Equal(t, publishedTotal, receivedTotal+int64(stats.TotalDropped)+int64(stats.QueueDropped),
+		"delivered + tracked drops must exactly reconcile against what was published")
+}
+
+// TestEventBus_HighVolumePublishing floods the bus with far more events than
+// its worker queue (1000) and subscriber buffer (bus.bufferSize, default 100)
+// can hold. PublishAsync is deliberately non-blocking - see EventBus.PublishAsync
+// and WorkerPool.PublishAsync - so under an unthrottled storm the bus WILL drop
+// events rather than block the publisher or the workers. There is no delivery
+// floor this bus promises during a storm that outruns its buffers.
+//
+// This test proves the storm doesn't block the publisher, doesn't wedge the
+// bus (hangGuard), that the bus is still delivering normally once Drain
+// confirms the storm has fully drained, and that the drop/delivery
+// accounting reconciles exactly at that point.
+func TestEventBus_HighVolumePublishing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping high volume test in short mode")
+	}
+	bus := New[int]()
+	defer bus.Shutdown()
+
+	ctx := context.Background()
+	ch, cleanup := bus.Subscribe(ctx)
+	defer cleanup()
+
+	// Drain events in background
+	var received atomic.Int64
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-ch:
+				received.Add(1)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Publish 100,000 events as fast as possible
+	const totalEvents = 100000
+	start := time.Now()
+
+	for i := range totalEvents {
+		bus.PublishAsync(i)
+	}
+
+	publishDuration := time.Since(start)
+
+	// The whole point of PublishAsync is that the publisher never blocks on a
+	// backed-up bus - prove that held under real load.
+	require.Less(t, publishDuration, 5*time.Second, "PublishAsync must not block the publisher under load")
+
+	// Drain blocks until every event that made it into the worker queue has
+	// been run through bus.Publish, guarded by hangGuard rather than polling
+	// for the receive count to stop climbing.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		bus.Drain()
+	}()
+
+	select {
+	case <-drainDone:
+	case <-time.After(hangGuard):
+		t.Fatal("test hung / suspected deadlock: drain did not complete after the storm")
+	}
+

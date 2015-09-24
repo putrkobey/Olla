@@ -30,35 +30,3 @@ func NewOptimisticStrategy(fallbackBehavior string, logger logger.StyledLogger) 
 func (s *OptimisticStrategy) Name() string {
 	return StrategyOptimistic
 }
-
-// GetRoutableEndpoints returns healthy endpoints that have the model, or falls back to all healthy endpoints
-func (s *OptimisticStrategy) GetRoutableEndpoints(
-	ctx context.Context,
-	modelName string,
-	healthyEndpoints []*domain.Endpoint,
-	modelEndpoints []string,
-) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
-	// no endpoints have the model - fall back to all healthy
-	if len(modelEndpoints) == 0 {
-		s.logger.Debug("Model not found, using all healthy endpoints",
-			"model", modelName,
-			"healthy_endpoints", len(healthyEndpoints),
-			"fallback", s.fallbackBehavior)
-
-		switch s.fallbackBehavior {
-		case constants.FallbackBehaviorNone:
-			return []*domain.Endpoint{}, ports.NewRoutingDecision(
-				s.Name(),
-				ports.RoutingActionRejected,
-				constants.RoutingReasonModelNotFound,
-			), nil
-		case constants.FallbackBehaviorCompatibleOnly:
-			// For compatible_only, reject when model not found
-			return []*domain.Endpoint{}, ports.NewRoutingDecision(
-				s.Name(),
-				ports.RoutingActionRejected,
-				constants.RoutingReasonModelNotFound,
-			), nil
-		default:
-			// "all" or any other value - return all healthy with fallback
-			return healthyEndpoints, ports.NewRoutingDecision(
