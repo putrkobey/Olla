@@ -8,23 +8,3 @@ type InspectionError struct {
 	Path          string
 }
 
-func (e *InspectionError) Error() string {
-	return fmt.Sprintf("inspection failed for inspector '%s' on path '%s': %v", e.InspectorName, e.Path, e.Err)
-}
-
-func (e *InspectionError) Unwrap() error {
-	return e.Err
-}
-
-func NewInspectionError(inspectorName, path string, err error) *InspectionError {
-	return &InspectionError{
-		InspectorName: inspectorName,
-		Path:          path,
-		Err:           err,
-	}
-}
-
-type UnsupportedPathError struct {
-	Path              string
-	AvailableProfiles []string
-}
