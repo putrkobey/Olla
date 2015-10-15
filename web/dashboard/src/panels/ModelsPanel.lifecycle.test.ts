@@ -10,3 +10,27 @@ import ModelsPanel from './ModelsPanel.svelte';
 
 global.fetch = vi.fn(async () => ({
   status: 200,
+  ok: true,
+  headers: { get: () => null },
+  json: async () => ({}),
+}));
+
+let component: ReturnType<typeof mount> | undefined;
+afterEach(() => {
+  if (component) unmount(component);
+  component = undefined;
+  document.body.innerHTML = '';
+});
+
+describe('ModelsPanel polling lifecycle', () => {
+  it('activates the models job on mount and deactivates on unmount', () => {
+    expect(pollScheduler.isActive('models')).toBe(false);
+
+    component = mount(ModelsPanel, { target: document.body });
+    flushSync();
+
+    expect(pollScheduler.isActive('models')).toBe(true);
+
+    unmount(component);
+    component = undefined;
+    flushSync();
