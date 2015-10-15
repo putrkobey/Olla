@@ -100,3 +100,37 @@ func RetryWithResult[T any](ctx context.Context, policy RetryPolicy, fn func(ctx
 
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return result, err
+		}
+
+		if attempt < policy.MaxAttempts-1 {
+			backoff := calculateBackoff(attempt, policy)
+
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return result, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+
+	return result, fmt.Errorf("max retry attempts (%d) exceeded: %w", policy.MaxAttempts, lastErr)
+}
+
+func calculateBackoff(attempt int, policy RetryPolicy) time.Duration {
+	backoff := float64(policy.InitialBackoff) * math.Pow(policy.BackoffMultiplier, float64(attempt))
+
+	// Jitter prevents thundering herd when multiple clients retry simultaneously
+	jitter := backoff * 0.1 * (2*randFloat() - 1)
+	backoff += jitter
+
+	if backoff > float64(policy.MaxBackoff) {
+		backoff = float64(policy.MaxBackoff)
+	}
+
+	return time.Duration(backoff)
+}
+
+func randFloat() float64 {
+	randMu.Lock()
