@@ -48,3 +48,20 @@ func TestDashboardURL(t *testing.T) {
 
 	tests := []struct {
 		bindAddr string
+		want     string
+	}{
+		{bindAddr: "0.0.0.0:40114", want: "http://localhost:40114/internal/ui/"},
+		{bindAddr: "[::]:40114", want: "http://localhost:40114/internal/ui/"},
+		{bindAddr: "127.0.0.1:8080", want: "http://127.0.0.1:8080/internal/ui/"},
+		{bindAddr: "192.168.1.5:40114", want: "http://192.168.1.5:40114/internal/ui/"},
+		{bindAddr: "[fd00::1]:40114", want: "http://[fd00::1]:40114/internal/ui/"},
+		{bindAddr: ":40114", want: "http://localhost:40114/internal/ui/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.bindAddr, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := dashboardURL(tt.bindAddr)
+			if !ok {
+				t.Fatalf("dashboardURL(%q) reported unparseable, want %q", tt.bindAddr, tt.want)
