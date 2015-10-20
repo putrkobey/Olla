@@ -45,3 +45,50 @@ func NewServiceManager(logger logger.StyledLogger) *ServiceManager {
 		logger:   logger,
 	}
 }
+
+func (sm *ServiceManager) Register(service ManagedService) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	name := service.Name()
+	if _, exists := sm.services[name]; exists {
+		return fmt.Errorf("service %s already registered", name)
+	}
+
+	sm.services[name] = service
+	sm.registry.Register(name, service)
+	sm.logger.Debug("Service registered", "name", name)
+	return nil
+}
+
+// resolveDependencies implements Kahn's algorithm for topological sorting to determine
+// the correct service startup order. Returns an error if circular dependencies are
+// detected or if a service declares a dependency on a non-existent service.
+func (sm *ServiceManager) resolveDependencies() ([]string, error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	dependencies := make(map[string][]string)
+	inDegree := make(map[string]int)
+
+	for name, service := range sm.services {
+		dependencies[name] = service.Dependencies()
+		inDegree[name] = 0
+	}
+
+	for _, deps := range dependencies {
+		for _, dep := range deps {
+			if _, exists := sm.services[dep]; !exists {
+				return nil, fmt.Errorf("dependency %s not registered", dep)
+			}
+			inDegree[dep]++
+		}
+	}
+
+	var order []string
+	queue := make([]string, 0)
+
+	for name, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, name)
+		}
