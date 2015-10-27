@@ -18,3 +18,23 @@ if [ -d "../.venv" ]; then
         source ../.venv/bin/activate
     fi
 fi
+
+# Install dependencies if needed
+if ! python -c "import requests" 2>/dev/null; then
+    echo "Installing dependencies..."
+    pip install -r ../requirements.txt
+    echo
+fi
+
+# Default URL
+TARGET_URL="${TARGET_URL:-http://localhost:40114}"
+
+echo "Testing against: $TARGET_URL"
+echo
+
+# Test 1: Streaming Detection (quick mode)
+echo "1. Running streaming detection test (quick mode)..."
+python test-streaming-detection.py --url "$TARGET_URL" || {
+    echo "❌ Streaming detection test failed"
+    exit 1
+}
