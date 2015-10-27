@@ -17,3 +17,13 @@ func TestCreateProxyConfiguration_RetryPolicy(t *testing.T) {
 		name string
 		in   appconfig.RetryConfig
 		want proxyconfig.RetryPolicy
+	}{
+		{name: "defaults", in: appconfig.DefaultConfig().Proxy.Retry, want: proxyconfig.RetryPolicy{}},
+		{name: "disabled", in: appconfig.RetryConfig{Enabled: false, NonIdempotent: true}, want: proxyconfig.RetryPolicy{Disabled: true}},
+		{name: "capped", in: appconfig.RetryConfig{Enabled: true, MaxAttempts: 2, NonIdempotent: true}, want: proxyconfig.RetryPolicy{MaxAttempts: 2}},
+		{name: "no non-idempotent", in: appconfig.RetryConfig{Enabled: true}, want: proxyconfig.RetryPolicy{NoNonIdempotent: true}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
