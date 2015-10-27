@@ -103,3 +103,108 @@ func (sv *SizeValidator) Validate(ctx context.Context, req ports.SecurityRequest
 		Allowed: true,
 	}, nil
 }
+
+// validateHeaderSize estimates total header size, including field names and values.
+// Returns an error if the combined size exceeds the configured max.
+func (sv *SizeValidator) validateHeaderSize(req ports.SecurityRequest) error {
+	totalSize := estimateHeaderSize(req.Headers, req.Method, req.Endpoint, DefaultProtocol) // assume HTTP/1.1
+	if totalSize > sv.maxHeaderSize {
+		return fmt.Errorf("header size %d exceeds limit %d", totalSize, sv.maxHeaderSize)
+	}
+	return nil
+}
+
+// validateBodySize checks the request body size against the configured limit.
+func (sv *SizeValidator) validateBodySize(req ports.SecurityRequest) error {
+	if sv.maxBodySize <= 0 {
+		return nil
+	}
+
+	if req.BodySize > sv.maxBodySize {
+		return fmt.Errorf("content-length %d exceeds limit %d", req.BodySize, sv.maxBodySize)
+	}
+
+	return nil
+}
+
+// CreateMiddleware enforces the size limits on streaming (proxy) routes, capping the body
+// with MaxBytesReader rather than buffering it. reject writes the rejection for routes whose
+// clients expect a specific error format (see RejectFunc); nil keeps the plain-text default.
+func (sv *SizeValidator) CreateMiddleware(reject RejectFunc) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			req := ports.SecurityRequest{
+				Endpoint:   r.URL.Path,
+				Method:     r.Method,
+				BodySize:   r.ContentLength,
+				HeaderSize: estimateHeaderSize(r.Header, r.Method, r.URL.RequestURI(), r.Proto),
+				Headers:    r.Header,
+			}
+
+			result, err := sv.Validate(r.Context(), req)
+			if err != nil {
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			if !result.Allowed {
+				sv.recordViolation(r, req, result)
+
+				if r.ContentLength > sv.maxBodySize {
+					writeReject(w, reject, http.StatusRequestEntityTooLarge, "Request body too large")
+				} else {
+					writeReject(w, reject, http.StatusRequestHeaderFieldsTooLarge, "Request headers too large")
+				}
+				return
+			}
+
+			if sv.maxBodySize > 0 {
+				r.Body = http.MaxBytesReader(w, r.Body, sv.maxBodySize)
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// CreateNonProxyMiddleware is like CreateMiddleware but also rejects chunked
+// (Content-Length == -1) requests whose bodies exceed the configured limit.
+// It is intended for non-proxy routes (status, health, stats) that never read
+// the body themselves, so MaxBytesReader alone would never fire for them.
+//
+// The approach: drain up to maxBodySize+1 bytes through MaxBytesReader before
+// calling next. If the read hits the limit the reader returns an error and we
+// return 413. Otherwise we restore the buffered bytes as the request body so
+// a handler that does read the body still receives the full content.
+//
+// Proxy routes must NOT use this middleware — they stream large bodies
+// legitimately and must not be buffered. Use CreateMiddleware for those paths.
+// Translator routes do use it: their handler buffers the whole body anyway, and this
+// keeps an oversized chunked body a counted 413 instead of a failed read later on.
+func (sv *SizeValidator) CreateNonProxyMiddleware(reject RejectFunc) func(http.Handler) http.Handler {
+	return sv.nonProxyMiddleware(reject, 0)
+}
+
+// CreateCappedNonProxyMiddleware is CreateNonProxyMiddleware with a tighter drain cap for
+// chunked bodies: min(max_body_size, drainCap). A route whose handler enforces a smaller limit
+// of its own (translators) would otherwise buffer up to max_body_size per chunked request
+// before that limit rejects it. Content-Length requests are still checked against
+// max_body_size only, as before; drainCap <= 0 means no extra cap.
+func (sv *SizeValidator) CreateCappedNonProxyMiddleware(reject RejectFunc, drainCap int64) func(http.Handler) http.Handler {
+	return sv.nonProxyMiddleware(reject, drainCap)
+}
+
+func (sv *SizeValidator) nonProxyMiddleware(reject RejectFunc, drainCap int64) func(http.Handler) http.Handler {
+	chunkedLimit := sv.maxBodySize
+	if drainCap > 0 && (chunkedLimit <= 0 || drainCap < chunkedLimit) {
+		chunkedLimit = drainCap
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			req := ports.SecurityRequest{
+				Endpoint:   r.URL.Path,
+				Method:     r.Method,
+				BodySize:   r.ContentLength,
+				HeaderSize: estimateHeaderSize(r.Header, r.Method, r.URL.RequestURI(), r.Proto),
+				Headers:    r.Header,
+			}
