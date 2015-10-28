@@ -1,0 +1,72 @@
+version: "2"
+
+run:
+  go: "1.24"
+  concurrency: 8
+
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bodyclose
+    - copyloopvar
+    - durationcheck
+    - errname
+    - errorlint
+    - exhaustive
+    - exptostd
+    - fatcontext
+    - forcetypeassert
+    - gocognit
+    - goconst
+    - gocritic
+    - gomodguard
+    - goprintffuncname
+    - gosec
+    - govet
+    - intrange
+    - makezero
+    - misspell
+    - nakedret
+    - nilerr
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    - perfsprint
+    - predeclared
+    - reassign
+    - revive
+    # - tagliatelle
+    - testifylint
+    - unconvert
+    - unparam
+    - usetesting
+    - wastedassign
+
+  settings:
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    gosec:
+      excludes:
+        - G104  # unhandled errors — acceptable in fire-and-forget cleanup paths
+        - G115  # integer overflow conversions — false positives on small bounded values
+        - G118  # context.Background in goroutines — intentional for long-lived background workers
+        - G301  # directory permissions 0755 — standard for log directories
+        - G304  # file inclusion via variable — expected for config/profile loaders
+        - G703  # path traversal via taint — expected for config/profile loaders
+        - G704  # SSRF via taint — expected for a proxy that forwards requests by design
+    govet:
+      enable:
+        - shadow
+    gocognit:
+      min-complexity: 30
+    misspell:
+      ignore-rules:
+        - thushan
+    perfsprint:
+      strconcat: false
+    testifylint:
