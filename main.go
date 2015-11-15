@@ -66,3 +66,209 @@ func init() {
 	flag.StringVar(&configFile, "config", "", "Config file path")
 	flag.BoolVar(&validateConfigFlag, "validate-config", false, "Validate config.yaml, models.yaml and profiles, then exit without starting the server")
 }
+func main() {
+	// flag.Parse must run here, not in init(): init() runs under `go test` too,
+	// and parsing the test binary's own flags (-test.*) against our flag set
+	// fails the build. main() only runs for the real binary.
+	flag.Parse()
+
+	if os.Getenv("OLLA_ENABLE_PROFILER") == "true" {
+		enableProfiling = true
+	}
+
+	if os.Getenv("OLLA_SHOW_VERSION") == "true" {
+		showVersion = true
+	}
+
+	startTime := time.Now()
+	vlog := log.New(log.Writer(), "", 0)
+	profileAddress := "localhost:19841"
+
+	if showVersion {
+		version.PrintVersionInfo(true, vlog)
+		os.Exit(0)
+	} else {
+		version.PrintVersionInfo(false, vlog)
+	}
+
+	if validateConfigFlag {
+		report, exitCode := runValidateConfig(configFile)
+		fmt.Print(report)
+		os.Exit(exitCode)
+	}
+
+	if enableProfiling {
+		profiler.InitialiseProfiler(profileAddress)
+		vlog.Printf(theme.ColourProfiler("Profiling server started at http://%s/debug/pprof/\n"), profileAddress)
+	}
+
+	// Setup logging. This is a bootstrap logger only: OLLA_LOG_LEVEL controls it,
+	// and it exists purely so pre-config messages (version banner, config load
+	// errors) have somewhere to go. Once the config file is loaded below, we
+	// rebuild the logger against logging.level so the file's setting actually
+	// takes effect instead of being silently ignored.
+	lcfg := buildLoggerConfig()
+	logInstance, styledLogger, loggerCleanup, err := logger.NewWithTheme(lcfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialise logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { loggerCleanup() }()
+
+	slog.SetDefault(logInstance)
+
+	styledLogger.Info("Initialising", "version", version.Version, "pid", os.Getpid())
+	styledLogger.Info("System Configuration", "isContainerised", container.IsContainerised(), "numCPU", runtime.NumCPU(), "goVersion", runtime.Version())
+
+	// Setup graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	var shutdownTime time.Time
+
+	go func() {
+		sig := <-sigCh
+		styledLogger.Info("Shutdown signal received", "signal", sig.String())
+		shutdownTime = time.Now()
+		cancel()
+	}()
+
+	// Load configuration
+	cfg, err := config.Load(configFile)
+	if err != nil {
+		logger.FatalWithLogger(logInstance, "Failed to load configuration", "error", err)
+	}
+
+	// Validate model alias configuration at startup
+	if err = cfg.ValidateModelAliases(); err != nil {
+		logger.FatalWithLogger(logInstance, "Invalid model alias configuration", "error", err)
+	}
+
+	styledLogger.Info("Loaded configuration", "config", cfg.Filename)
+
+	// Now that the config file (and any OLLA_LOGGING_* overrides, applied
+	// inside config.Load) is known, swap the bootstrap logger for one running
+	// with the configured level/format/output. Only rebuild when something
+	// actually changes, so a default-vs-default startup doesn't pay for a
+	// second handler/file init.
+	// config.Load already folds OLLA_LOGGING_FORMAT into cfg.Logging.Format when
+	// set, so this only tells us whether that override applies - it decides
+	// whether the format should override TTY detection below.
+	envFormatSet := os.Getenv("OLLA_LOGGING_FORMAT") != ""
+	runtimeLevel := resolveRuntimeLogLevel(cfg.Logging.Level, styledLogger.Warn)
+	runtimeFormat := resolveRuntimeLogFormat(cfg.Logging.Format, envFormatSet, util.IsTerminal(), styledLogger.Warn)
+	runtimeOutput := resolveRuntimeLogOutput(cfg.Logging.Output, styledLogger.Warn)
+	runtimePrettyLogs := runtimeFormat == LogFormatText
+	runtimeFileOutput := runtimeOutput == LogOutputFile
+
+	if runtimeLevel != lcfg.Level || runtimePrettyLogs != lcfg.PrettyLogs || runtimeFileOutput != lcfg.FileOutput {
+		runtimeCfg := *lcfg
+		runtimeCfg.Level = runtimeLevel
+		runtimeCfg.PrettyLogs = runtimePrettyLogs
+		runtimeCfg.FileOutput = runtimeFileOutput
+
+		newLogInstance, newStyledLogger, newCleanup, rebuildErr := logger.NewWithTheme(&runtimeCfg)
+		if rebuildErr != nil {
+			styledLogger.Warn("Failed to apply configured logging settings, keeping bootstrap logger",
+				"level", runtimeLevel, "format", runtimeFormat, "output", runtimeOutput, "error", rebuildErr)
+		} else {
+			loggerCleanup()
+			logInstance, styledLogger, loggerCleanup = newLogInstance, newStyledLogger, newCleanup
+			slog.SetDefault(logInstance)
+		}
+	}
+
+	warnUnknownKeys(styledLogger.Warn, cfg.UnknownKeys)
+	warnDeprecatedProxyRetry(styledLogger.Warn, cfg)
+
+	// Create and start service manager
+	serviceManager, err := app.CreateAndStartServiceManager(ctx, cfg, styledLogger)
+	if err != nil {
+		logger.FatalWithLogger(logInstance, "Failed to create and start service manager", "error", err)
+	}
+
+	// Wait for shutdown signal
+	<-ctx.Done()
+
+	// Stop all services
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	defer shutdownCancel()
+
+	if err := serviceManager.Stop(shutdownCtx); err != nil {
+		styledLogger.Error("Error during shutdown", "error", err)
+	}
+
+	if cfg.Engineering.ShowNerdStats {
+		reportProcessStats(styledLogger, startTime)
+	}
+
+	styledLogger.Info("Cleaned up", "duration", time.Since(shutdownTime))
+	styledLogger.Info("Olla has shutdown", "uptime", format.Duration(time.Since(startTime)))
+}
+
+func reportProcessStats(logger logger.StyledLogger, startTime time.Time) {
+	runtime.GC()
+	stats := nerdstats.Snapshot(startTime)
+
+	logger.Info("Process Memory Stats",
+		"heap_alloc", format.Bytes(stats.HeapAlloc),
+		"heap_sys", format.Bytes(stats.HeapSys),
+		"heap_inuse", format.Bytes(stats.HeapInuse),
+		"heap_released", format.Bytes(stats.HeapReleased),
+		"stack_inuse", format.Bytes(stats.StackInuse),
+		"total_alloc", format.Bytes(stats.TotalAlloc),
+		"memory_pressure", stats.GetMemoryPressure(),
+	)
+
+	logger.Info("Process Allocation Stats",
+		"total_mallocs", stats.Mallocs,
+		"total_frees", stats.Frees,
+		"net_objects", util.SafeInt64Diff(stats.Mallocs, stats.Frees),
+	)
+
+	if stats.NumGC > 0 {
+		logger.Info("Garbage Collection Stats",
+			"num_gc_cycles", stats.NumGC,
+			"last_gc", stats.LastGC.Format(time.RFC3339),
+			"total_gc_time", format.Duration(stats.TotalGCTime),
+			"gc_cpu_fraction", fmt.Sprintf("%.4f%%", stats.GCCPUFraction*100),
+		)
+	}
+
+	logger.Info("Goroutine Stats",
+		"num_goroutines", stats.NumGoroutines,
+		"goroutine_health", stats.GetGoroutineHealthStatus(),
+		"num_cgo_calls", stats.NumCgoCall,
+	)
+
+	logger.Info("Runtime Stats",
+		"uptime", format.Duration(stats.Uptime),
+		"go_version", stats.GoVersion,
+		"num_cpu", stats.NumCPU,
+		"gomaxprocs", stats.GOMAXPROCS,
+	)
+
+	if buildInfo := stats.GetBuildInfoSummary(); len(buildInfo) > 0 {
+		var buildArgs []any
+		for key, value := range buildInfo {
+			buildArgs = append(buildArgs, key, value)
+		}
+		logger.Info("Build Info", buildArgs...)
+	}
+
+	logger.Info("Process Health Summary",
+		"memory_pressure", stats.GetMemoryPressure(),
+		"goroutine_status", stats.GetGoroutineHealthStatus(),
+		"uptime", format.Duration(stats.Uptime),
+		"avg_gc_pause", nerdstats.CalculateAverageGCPause(stats),
+	)
+}
+
+// resolveRuntimeLogLevel decides the level for the post-config logger. An
+// empty value (no logging.level in the file) keeps the built-in default.
+// An unrecognised value is a config mistake, not a reason to crash - warn
+// via the bootstrap logger and fall back so startup still succeeds.
+func resolveRuntimeLogLevel(configuredLevel string, warn func(msg string, args ...any)) string {
+	if configuredLevel == "" {

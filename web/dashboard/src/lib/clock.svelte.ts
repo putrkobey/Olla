@@ -10,15 +10,3 @@ import { pollScheduler } from './poll-scheduler';
 
 const CLOCK_INTERVAL_MS = 1000;
 const CLOCK_JOB_NAME = 'clock';
-
-let now = $state(Date.now());
-
-function tick(): void {
-  now = Date.now();
-}
-
-let registered = false;
-export function startClock(): void {
-  if (registered) return;
-  registered = true;
-  pollScheduler.register(CLOCK_JOB_NAME, CLOCK_INTERVAL_MS, tick);
