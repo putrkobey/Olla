@@ -18,13 +18,3 @@ echo ""
 PROXY_ENGINES=("sherpa" "olla")
 PROXY_PROFILES=("auto" "standard" "streaming")
 
-echo "Test matrix:"
-for engine in "${PROXY_ENGINES[@]}"; do
-    for profile in "${PROXY_PROFILES[@]}"; do
-        echo "  - $engine/$profile"
-    done
-done
-
-echo ""
-echo "Testing loop:"
-count=0
