@@ -540,3 +540,545 @@ class IntegrationTester:
             expected_headers = ["X-Olla-Endpoint", "X-Olla-Model",
                                 "X-Olla-Backend-Type", "X-Olla-Request-ID"]
             present = [h for h in expected_headers if r.headers.get(h)]
+            missing = [h for h in expected_headers if not r.headers.get(h)]
+            ok = len(missing) == 0
+            if missing:
+                detail = f"missing headers: {missing}"
+            else:
+                detail = f"all {len(present)} headers present"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Response headers (X-Olla-*)", ok, detail)
+        self.record(f"{phase}/headers", ok, detail, phase)
+
+    # -- Phase 5: Anthropic Translator Endpoints ------------------------------
+
+    def phase_anthropic_translator(self):
+        self._phase_header(5, "Anthropic Translator Endpoints")
+        phase = "anthropic"
+
+        if self.skip_anthropic:
+            self.pcolor(GREY, "  [SKIP] Anthropic tests skipped via --skip-anthropic")
+            return
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+        }
+
+        # GET /olla/anthropic/v1/models
+        r = self._get("/olla/anthropic/v1/models")
+        ok = False
+        detail = ""
+        if r and r.status_code == 200:
+            try:
+                r.json()
+                ok = True
+            except Exception:
+                detail = "invalid JSON"
+        elif r and r.status_code == 404:
+            detail = "endpoint not configured (404)"
+            self.pcolor(YELLOW, f"  [SKIP] Anthropic translator not configured, skipping phase")
+            self.record(f"{phase}/models", False, detail, phase)
+            return
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Anthropic model list (/olla/anthropic/v1/models)", ok, detail)
+        self.record(f"{phase}/models", ok, detail, phase)
+
+        if not self.selected_model:
+            self.pcolor(GREY, "  [SKIP] No model for Anthropic inference tests")
+            return
+
+        # POST /olla/anthropic/v1/messages non-streaming
+        body = {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "Say hello briefly"}],
+            "max_tokens": 10,
+        }
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=headers, json=body, timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            if self.verbose:
+                self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+            r = None
+
+        ok = False
+        detail = ""
+        mode_header = ""
+        if r and r.status_code == 200:
+            try:
+                r.json()
+                ok = True
+                mode_header = r.headers.get("X-Olla-Mode", "")
+                if mode_header:
+                    detail = f"mode={mode_header}"
+            except Exception:
+                detail = "invalid JSON"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Non-streaming messages", ok, detail)
+        self.record(f"{phase}/messages-nonstream", ok, detail, phase)
+
+        # Passthrough mode header check
+        if r and r.status_code == 200:
+            mode = r.headers.get("X-Olla-Mode", "")
+            # We just verify the header is either "passthrough" or absent (translation)
+            ok = True
+            detail = f"X-Olla-Mode={mode}" if mode else "no X-Olla-Mode (translation mode)"
+            self._print_result("Passthrough mode check", ok, detail)
+            self.record(f"{phase}/passthrough-check", ok, detail, phase)
+
+        # POST /olla/anthropic/v1/messages streaming
+        if not self.skip_streaming:
+            body_stream = {
+                "model": self.selected_model,
+                "messages": [{"role": "user", "content": "Say hello briefly"}],
+                "max_tokens": 10,
+                "stream": True,
+            }
+            try:
+                r = requests.post(
+                    f"{self.base_url}/olla/anthropic/v1/messages",
+                    headers=headers, json=body_stream, timeout=self.timeout,
+                    stream=True,
+                )
+            except Exception as e:
+                self._last_error = e
+                if self.verbose:
+                    self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+                r = None
+
+            ok = False
+            detail = ""
+            if r and r.status_code == 200:
+                ct = r.headers.get("Content-Type", "")
+                event_count = 0
+                for line in r.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        event_count += 1
+
+                if "text/event-stream" not in ct:
+                    detail = f"unexpected content-type: {ct}"
+                elif event_count == 0:
+                    detail = "no SSE data events"
+                else:
+                    ok = True
+                    detail = f"{event_count} SSE events"
+            else:
+                detail = self._error_detail(r)
+
+            self._print_result("Streaming messages (SSE)", ok, detail)
+            self.record(f"{phase}/messages-stream", ok, detail, phase)
+
+        # POST /olla/anthropic/v1/messages/count_tokens
+        token_body = {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "Count these tokens please"}],
+        }
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages/count_tokens",
+                headers=headers, json=token_body, timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            if self.verbose:
+                self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+            r = None
+
+        ok = False
+        detail = ""
+        if r and r.status_code == 200:
+            try:
+                data = r.json()
+                ok = True
+                token_count = data.get("input_tokens", "?")
+                detail = f"input_tokens={token_count}"
+            except Exception:
+                detail = "invalid JSON"
+        elif r and r.status_code == 404:
+            # Token counting may not be implemented for all backends
+            ok = True
+            detail = "not implemented (404) - acceptable"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Token count estimation", ok, detail)
+        self.record(f"{phase}/count-tokens", ok, detail, phase)
+
+    # -- Phase 6: Passthrough/Translation Mode Validation --------------------
+
+    def phase_passthrough_translation(self):
+        self._phase_header(6, "Passthrough/Translation Mode Validation")
+        phase = "passthrough"
+
+        if self.skip_anthropic:
+            self.pcolor(GREY, "  [SKIP] Skipped via --skip-anthropic")
+            return
+
+        has_pt = self.passthrough_model is not None
+        has_tr = self.translation_model is not None
+
+        if not has_pt and not has_tr:
+            self.pcolor(GREY, "  [SKIP] No passthrough or translation backends with models")
+            return
+
+        # -- Passthrough mode tests --
+        if has_pt:
+            pt_type = self.endpoint_types.get(self.passthrough_backend, "?")
+            self.pcolor(WHITE, f"  Passthrough: {CYAN}{self.passthrough_model}{RESET} "
+                               f"({self.passthrough_backend}, {pt_type})")
+
+            # Non-streaming passthrough
+            self._test_mode_nonstreaming(
+                model=self.passthrough_model,
+                expected_mode="passthrough",
+                label="passthrough/nonstream",
+                phase=phase,
+            )
+
+            # Streaming passthrough
+            if not self.skip_streaming:
+                self._test_mode_streaming(
+                    model=self.passthrough_model,
+                    expected_mode="passthrough",
+                    label="passthrough/stream",
+                    phase=phase,
+                )
+
+            # Passthrough response structure validation
+            self._test_passthrough_response_structure(
+                model=self.passthrough_model,
+                label="passthrough/response-structure",
+                phase=phase,
+            )
+        else:
+            self.pcolor(GREY, "  [SKIP] No healthy passthrough-capable backends with models")
+
+        # -- Translation mode tests --
+        if has_tr:
+            tr_type = self.endpoint_types.get(self.translation_backend, "?")
+            self.pcolor(WHITE, f"  Translation: {YELLOW}{self.translation_model}{RESET} "
+                               f"({self.translation_backend}, {tr_type})")
+
+            # Non-streaming translation
+            self._test_mode_nonstreaming(
+                model=self.translation_model,
+                expected_mode="translation",
+                label="translation/nonstream",
+                phase=phase,
+            )
+
+            # Streaming translation
+            if not self.skip_streaming:
+                self._test_mode_streaming(
+                    model=self.translation_model,
+                    expected_mode="translation",
+                    label="translation/stream",
+                    phase=phase,
+                )
+
+            # Translation response structure validation
+            self._test_translation_response_structure(
+                model=self.translation_model,
+                label="translation/response-structure",
+                phase=phase,
+            )
+        else:
+            self.pcolor(GREY, "  [SKIP] No healthy translation-required backends with models")
+
+        # -- Translator stats validation --
+        if has_pt or has_tr:
+            self._test_translator_stats(has_pt, has_tr, phase)
+
+    def _test_mode_nonstreaming(self, model: str, expected_mode: str,
+                                label: str, phase: str):
+        """Test that non-streaming Anthropic request uses the expected mode."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model),
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            mode = r.headers.get("X-Olla-Mode", "")
+            endpoint = r.headers.get("X-Olla-Endpoint", "")
+
+            if expected_mode == "passthrough":
+                ok = mode == "passthrough"
+                if not ok:
+                    detail = f"expected X-Olla-Mode=passthrough, got '{mode}'"
+                else:
+                    detail = f"mode=passthrough, endpoint={endpoint}"
+            else:
+                # Translation: X-Olla-Mode should be absent
+                ok = mode != "passthrough"
+                if not ok:
+                    detail = "unexpected X-Olla-Mode=passthrough for translation backend"
+                else:
+                    detail = f"mode=translation (no header), endpoint={endpoint}"
+
+        self._print_result(f"{expected_mode.title()} non-streaming", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_mode_streaming(self, model: str, expected_mode: str,
+                             label: str, phase: str):
+        """Test that streaming Anthropic request uses the expected mode and SSE format."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model, stream=True),
+                timeout=self.timeout,
+                stream=True,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+        notes = []
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            mode = r.headers.get("X-Olla-Mode", "")
+            ct = r.headers.get("Content-Type", "")
+
+            # Mode check
+            if expected_mode == "passthrough":
+                if mode != "passthrough":
+                    notes.append(f"expected X-Olla-Mode=passthrough, got '{mode}'")
+            else:
+                if mode == "passthrough":
+                    notes.append("unexpected X-Olla-Mode=passthrough")
+
+            # Content-Type check
+            if "text/event-stream" not in ct:
+                notes.append(f"content-type={ct}, expected text/event-stream")
+
+            # Parse SSE events
+            event_types = set()
+            event_count = 0
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("event: "):
+                    event_types.add(line[7:].strip())
+                if line.startswith("data: "):
+                    event_count += 1
+
+            # Validate event types
+            missing = ANTHROPIC_MIN_EVENTS - event_types
+            if missing:
+                notes.append(f"missing events: {missing}")
+
+            if event_count == 0:
+                notes.append("no SSE data events")
+
+            ok = len(notes) == 0
+            if ok:
+                detail = f"{event_count} events, {len(event_types)} types"
+            else:
+                detail = " | ".join(notes)
+
+        self._print_result(f"{expected_mode.title()} streaming", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_passthrough_response_structure(self, model: str, label: str, phase: str):
+        """Verify passthrough response has native Anthropic structure."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model),
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            try:
+                data = r.json()
+                notes = []
+                # Anthropic response should have: id, type, role, content, model, usage
+                if data.get("type") != "message":
+                    notes.append(f"type={data.get('type', 'missing')}")
+                if data.get("role") != "assistant":
+                    notes.append(f"role={data.get('role', 'missing')}")
+                if not isinstance(data.get("content"), list):
+                    notes.append("content not a list")
+                if not data.get("model"):
+                    notes.append("model missing")
+
+                ok = len(notes) == 0
+                if ok:
+                    usage = data.get("usage", {})
+                    detail = (f"type=message, role=assistant, "
+                              f"input={usage.get('input_tokens', '?')}/"
+                              f"output={usage.get('output_tokens', '?')} tokens")
+                else:
+                    detail = " | ".join(notes)
+            except Exception:
+                detail = "invalid JSON"
+
+        self._print_result("Passthrough response structure", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_translation_response_structure(self, model: str, label: str, phase: str):
+        """Verify translation response has valid Anthropic-format structure."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model),
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            try:
+                data = r.json()
+                notes = []
+                # Translated response should also follow Anthropic format
+                if data.get("type") != "message":
+                    notes.append(f"type={data.get('type', 'missing')}")
+                if data.get("role") != "assistant":
+                    notes.append(f"role={data.get('role', 'missing')}")
+                if not isinstance(data.get("content"), list):
+                    notes.append("content not a list")
+                # Check content has text blocks
+                content = data.get("content", [])
+                has_text = any(c.get("type") == "text" for c in content if isinstance(c, dict))
+                if content and not has_text:
+                    notes.append("no text content blocks")
+
+                ok = len(notes) == 0
+                if ok:
+                    detail = "valid Anthropic format (translated)"
+                else:
+                    detail = " | ".join(notes)
+            except Exception:
+                detail = "invalid JSON"
+
+        self._print_result("Translation response structure", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_translator_stats(self, had_passthrough: bool, had_translation: bool,
+                               phase: str):
+        """Verify translator stats reflect the requests we just made."""
+        r = self._get("/internal/stats/translators")
+        ok = False
+        detail = ""
+
+        if r is None or r.status_code != 200:
+            detail = self._error_detail(r)
+            self._print_result("Translator stats validation", ok, detail)
+            self.record(f"{phase}/stats", ok, detail, phase)
+            return
+
+        try:
+            data = r.json()
+            translators = data.get("translators", [])
+            # Find the anthropic translator
+            anthro = None
+            for t in translators:
+                if "anthropic" in t.get("translator_name", "").lower():
+                    anthro = t
+                    break
+
+            if not anthro:
+                detail = "no anthropic translator in stats"
+            else:
+                notes = []
+                total = anthro.get("total_requests", 0)
+                pt_req = anthro.get("passthrough_requests", 0)
+                tr_req = anthro.get("translation_requests", 0)
+                pt_rate = anthro.get("passthrough_rate", "")
+
+                if total == 0:
+                    notes.append("total_requests=0 (expected > 0)")
+                if had_passthrough and pt_req == 0:
+                    notes.append("passthrough_requests=0 (expected > 0)")
+                if had_translation and tr_req == 0:
+                    notes.append("translation_requests=0 (expected > 0)")
+
+                ok = len(notes) == 0
+                if ok:
+                    detail = (f"total={total}, passthrough={pt_req}, "
+                              f"translation={tr_req}, rate={pt_rate}")
+                else:
+                    detail = " | ".join(notes)
+        except Exception:
+            detail = "invalid JSON"
+
+        self._print_result("Translator stats validation", ok, detail)
+        self.record(f"{phase}/stats", ok, detail, phase)
+
+    # -- Phase 7: Provider-Specific Routes -----------------------------------
+
+    def phase_provider_routes(self):
+        self._phase_header(7, "Provider-Specific Routes")
+        phase = "providers"
+
+        if self.skip_providers:
+            self.pcolor(GREY, "  [SKIP] Provider tests skipped via --skip-providers")
+            return
+
+        if not self.discovered_providers:
+            self.pcolor(GREY, "  [SKIP] No providers discovered")
+            return
+
+        for provider in self.discovered_providers:
+            # Try the provider-specific models endpoint
+            # The URL pattern is /olla/{provider}/v1/models for most providers
+            provider_slug = provider
+            # Normalise some common provider type names to URL slugs
+            slug_map = {
+                "openai-compatible": "openai",
+                "lm-studio": "lm-studio",
+                "llamacpp": "llamacpp",
+                "vllm-mlx": "vllm-mlx",
+            }
+            provider_slug = slug_map.get(provider, provider)
