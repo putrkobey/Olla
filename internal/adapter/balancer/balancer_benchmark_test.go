@@ -202,3 +202,105 @@ func BenchmarkLargeEndpointSet(b *testing.B) {
 			endpoints := make([]*domain.Endpoint, size)
 			for i := range size {
 				status := domain.StatusHealthy
+				if i%4 == 0 {
+					status = domain.StatusBusy
+				} else if i%5 == 0 {
+					status = domain.StatusWarming
+				}
+				endpoints[i] = createBenchEndpoint(fmt.Sprintf("endpoint-%d", i), 11434+i, status, 100+i)
+			}
+
+			ctx := context.Background()
+
+			for selectorName, selector := range selectors {
+				b.Run(selectorName, func(b *testing.B) {
+					b.ResetTimer()
+					b.ReportAllocs()
+
+					for range b.N {
+						_, err := selector.Select(ctx, endpoints)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkFilteringRoutableEndpoints tests the cost of filtering routable endpoints
+func BenchmarkFilteringRoutableEndpoints(b *testing.B) {
+	// Mix of routable and non-routable endpoints
+	endpoints := make([]*domain.Endpoint, 20)
+	statuses := []domain.EndpointStatus{
+		domain.StatusHealthy, domain.StatusBusy, domain.StatusWarming, // Routable
+		domain.StatusOffline, domain.StatusUnhealthy, domain.StatusUnknown, // Not routable
+	}
+
+	for i := range 20 {
+		endpoints[i] = createBenchEndpoint(
+			fmt.Sprintf("endpoint-%d", i),
+			11434+i,
+			statuses[i%len(statuses)],
+			100+i*10,
+		)
+	}
+
+	mockStatsCollector := NewTestStatsCollector()
+	selectors := map[string]domain.EndpointSelector{
+		DefaultBalancerPriority:         NewPrioritySelector(mockStatsCollector),
+		DefaultBalancerRoundRobin:       NewRoundRobinSelector(mockStatsCollector),
+		DefaultBalancerLeastConnections: NewLeastConnectionsSelector(mockStatsCollector),
+	}
+
+	ctx := context.Background()
+
+	for name, selector := range selectors {
+		b.Run(name, func(b *testing.B) {
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for range b.N {
+				_, err := selector.Select(ctx, endpoints)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkMemoryUsage tests memory efficiency
+func BenchmarkMemoryUsage(b *testing.B) {
+	b.Run("factory-creation", func(b *testing.B) {
+		b.ReportAllocs()
+
+		for range b.N {
+			factory := NewFactory(NewTestStatsCollector())
+			_ = factory
+		}
+	})
+
+	b.Run("selector-creation", func(b *testing.B) {
+		factory := NewFactory(NewTestStatsCollector())
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for range b.N {
+			priority, _ := factory.Create(DefaultBalancerPriority)
+			roundRobin, _ := factory.Create(DefaultBalancerRoundRobin)
+			leastConn, _ := factory.Create(DefaultBalancerLeastConnections)
+
+			_ = priority
+			_ = roundRobin
+			_ = leastConn
+		}
+	})
+
+	b.Run("connection-tracking", func(b *testing.B) {
+		selector := NewPrioritySelector(NewTestStatsCollector())
+		endpoints := make([]*domain.Endpoint, 100)
+
+		for i := range 100 {
