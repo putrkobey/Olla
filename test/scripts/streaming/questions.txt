@@ -1,0 +1,4 @@
+# Questions for testing streaming latency
+# One question per line, lines starting with # are ignored
+
+Tell me a short story about a robot learning to paint.
