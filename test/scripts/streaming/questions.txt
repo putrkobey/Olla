@@ -2,3 +2,12 @@
 # One question per line, lines starting with # are ignored
 
 Tell me a short story about a robot learning to paint.
+Explain how photosynthesis works in simple terms.
+What are the main differences between machine learning and artificial intelligence?
+Describe the process of making bread from scratch.
+Write a haiku about the ocean.
+Explain the concept of recursion in programming with an example.
+What would happen if gravity suddenly became twice as strong?
+Tell me about the history of the internet in three paragraphs.
+How do solar panels convert sunlight into electricity?
+Write a dialogue between two characters meeting for the first time.
