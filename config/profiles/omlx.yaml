@@ -1,0 +1,73 @@
+# oMLX inference platform profile
+# oMLX (jundot/omlx) is a multi-model Apple Silicon inference server that
+# runs multiple models concurrently via MLX. It is fully OpenAI-compatible
+# on the wire, so we reuse the OpenAI parser/converter rather than writing
+# a custom one. Native Anthropic Messages API support means passthrough is
+# enabled — no translation overhead for Anthropic-format requests.
+name: omlx
+home: "https://github.com/jundot/omlx"
+version: "1.0"
+display_name: "oMLX"
+description: "oMLX multi-model Apple Silicon inference server (MLX-based)"
+
+# Routing configuration
+routing:
+  prefixes:
+    - omlx
+
+# API compatibility
+api:
+  openai_compatible: true
+
+  # Native Anthropic Messages API support (v0.4.2+)
+  # oMLX exposes /v1/messages AND /v1/messages/count_tokens natively,
+  # so Anthropic-format requests can be forwarded directly without
+  # the Anthropic-to-OpenAI translation layer.
+  #
+  # token_count stays false: oMLX has a native /v1/messages/count_tokens
+  # endpoint, but Olla does not yet forward to it (the token-count handler
+  # always uses the local estimator), so advertising the capability would
+  # be misleading. Flip to true once native count_tokens passthrough lands.
+  anthropic_support:
+    enabled: true
+    messages_path: /v1/messages
+    token_count: false
+
+  paths:
+    # Health endpoint — dedicated path, not model-discovery
+    - /health                  # 0: health check
+
+    # Model management
+    - /v1/models               # 1: list models (OpenAI-compatible; owned_by:"omlx")
+    - /v1/models/status        # 2: loaded-model state (oMLX-specific)
+
+    # Text generation endpoints (OpenAI-compatible)
+    - /v1/chat/completions     # 3: chat completions
+    - /v1/completions          # 4: text completions
+
+    # Embeddings
+    - /v1/embeddings           # 5: embeddings API
+
+    # Anthropic Messages API (native)
+    - /v1/messages             # 6: Anthropic Messages API (native passthrough)
+    - /v1/messages/count_tokens # 7: Anthropic token count endpoint
+
+    # OpenAI Responses API
+    - /v1/responses            # 8: OpenAI Responses API
+
+    # Reranking endpoint (Cohere/Jina-compatible)
+    - /v1/rerank               # 9: reranking API
+
+  model_discovery_path: /v1/models
+  health_check_path: /health
+
+# Platform characteristics
+# Apple Silicon servers are single-host; concurrency is constrained by ANE/GPU bandwidth
+characteristics:
+  timeout: 3m
+  max_concurrent_requests: 4
+  default_priority: 75
+  streaming_support: true
+
+# Detection hints for auto-discovery
+detection:

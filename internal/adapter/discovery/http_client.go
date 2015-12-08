@@ -141,3 +141,75 @@ func (c *HTTPModelDiscoveryClient) discoverWithProfile(ctx context.Context, endp
 	var discoveryURL string
 
 	// Skip model_url override for OpenAI-compatible unless it's a custom path
+	// This prevents issues with endpoints like Docker that have /models returning HTML
+	if platformProfile.GetName() == domain.ProfileOpenAICompatible {
+		if endpoint.ModelURLString != "" {
+			// Only use override if it's not a common problematic path
+			// /models often returns HTML in Docker/OpenWebUI setups, not model data
+			if endpoint.ModelURLString != "/v1/models" && endpoint.ModelURLString != "/models" {
+				discoveryURL = endpoint.ModelURLString
+			}
+			// If it's /models, use profile default (/v1/models) instead
+		}
+		// For all other cases, use profile default
+	} else {
+		// For other profiles (Ollama, LlamaCpp, etc.), respect the override
+		// This fixes Issue #86 where users need custom discovery paths
+		if endpoint.ModelURLString != "" {
+			discoveryURL = endpoint.ModelURLString
+		}
+	}
+
+	if discoveryURL == "" {
+		discoveryURL = platformProfile.GetModelDiscoveryURL(endpoint.URLString)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", discoveryURL, http.NoBody)
+	if err != nil {
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "create_request", 0, time.Since(startTime), err)
+	}
+	req.Header.Set("User-Agent", fmt.Sprintf(DefaultUserAgent, version.ShortName, version.Version))
+	req.Header.Set("Accept", DefaultContentType)
+
+	// Apply any per-endpoint custom headers then auth, mirroring what CopyHeaders does on
+	// the proxy path. Without this, authenticated backends 401 during model discovery.
+	for name, value := range endpoint.Headers {
+		req.Header.Set(name, value)
+	}
+	if endpoint.AuthHeaderName != "" {
+		req.Header.Set(endpoint.AuthHeaderName, endpoint.AuthHeaderValue)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		networkErr := &NetworkError{URL: discoveryURL, Err: err}
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "http_request", 0, time.Since(startTime), networkErr)
+	}
+	defer resp.Body.Close()
+
+	duration := time.Since(startTime)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "http_status", resp.StatusCode, duration, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status))
+	}
+
+	// Limit response size to prevent memory issues
+	limitedReader := io.LimitReader(resp.Body, MaxResponseSize+1)
+	body, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "read_response", resp.StatusCode, duration, err)
+	}
+
+	if len(body) > MaxResponseSize {
+		return nil, NewDiscoveryError(discoveryURL, platformProfile.GetName(), "read_response", resp.StatusCode, duration, fmt.Errorf("model response exceeds %d bytes: %w", MaxResponseSize, ErrResponseTooLarge))
+	}
+
+	models, err := platformProfile.ParseModelsResponse(body)
+	if err != nil {
+		// Include the actual discovery URL in the error for debugging
+		return nil, NewDiscoveryError(discoveryURL, platformProfile.GetName(), "parse_response", resp.StatusCode, duration, &ParseError{Format: platformProfile.GetName(), Err: err})
+	}
+
+	c.updateMetrics(func(m *DiscoveryMetrics) {
+		atomic.AddInt64(&m.SuccessfulRequests, 1)
+		m.LastDiscoveryTime = time.Now()
