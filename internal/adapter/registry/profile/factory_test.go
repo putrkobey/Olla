@@ -80,3 +80,85 @@ func TestValidateProfileType_WithRoutingPrefixes(t *testing.T) {
 	factory := testFactory(t)
 
 	tests := []struct {
+		name     string
+		provider string
+		expected bool
+	}{
+		// Direct profile names
+		{"ollama profile name", "ollama", true},
+		{"lm-studio profile name", "lm-studio", true},
+		{"openai-compatible profile name", "openai-compatible", true},
+
+		// Routing prefixes for lm-studio
+		{"lmstudio prefix", "lmstudio", true},
+		{"lm_studio prefix", "lm_studio", true},
+
+		// Routing prefix for openai
+		{"openai prefix", "openai", true},
+
+		// Auto profile
+		{"auto profile", "auto", true},
+
+		// Unknown providers
+		{"unknown provider", "unknown", false},
+		{"empty provider", "", false},
+
+		// vLLM if profile exists - not in built-in profiles
+		{"vllm provider", "vllm", false}, // vllm is not a built-in profile
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := factory.ValidateProfileType(tt.provider)
+			if result != tt.expected {
+				t.Errorf("ValidateProfileType(%q) = %v, want %v", tt.provider, result, tt.expected)
+			}
+		})
+	}
+}
+
+/*
+	func TestProfileFactoryRegistration(t *testing.T) {
+		factory := &Factory{
+			profiles: make(map[string]domain.PlatformProfile),
+		}
+
+		customProfile := &mockProfile{name: "custom"}
+		factory.RegisterProfile(customProfile)
+
+		profile, err := factory.GetProfile("custom")
+		if err != nil {
+			t.Fatalf("Failed to get custom profile: %v", err)
+		}
+		if profile.GetName() != "custom" {
+			t.Errorf("Expected custom profile, got %q", profile.GetName())
+		}
+	}
+
+	func TestProfileFactoryConcurrency(t *testing.T) {
+		factory := testFactory(t)
+
+		var wg sync.WaitGroup
+		errors := make(chan error, 100)
+
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := factory.GetProfile(domain.ProfileOllama)
+				if err != nil {
+					errors <- err
+				}
+			}()
+		}
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				custom := &mockProfile{name: fmt.Sprintf("custom-%d", id)}
+				factory.RegisterProfile(custom)
+			}(i)
+		}
+
+		wg.Wait()
