@@ -78,3 +78,83 @@ func (sl *PrettyStyledLogger) WarnWithEndpoint(msg string, endpoint string, args
 	sl.logger.Warn(styledMsg, args...)
 }
 
+func (sl *PrettyStyledLogger) ErrorWithEndpoint(msg string, endpoint string, args ...any) {
+	styledMsg := fmt.Sprintf("%s %s", msg, sl.Theme.Endpoint.Sprint(endpoint))
+	sl.logger.Error(styledMsg, args...)
+}
+
+func (sl *PrettyStyledLogger) InfoHealthy(msg string, endpoint string, args ...any) {
+	styledMsg := fmt.Sprintf("%s %s", msg, sl.Theme.HealthHealthy.Sprint(endpoint))
+	sl.logger.Info(styledMsg, args...)
+}
+func (sl *PrettyStyledLogger) InfoHealthStatus(msg string, name string, status domain.EndpointStatus, args ...any) {
+	var statusStyle *pterm.Style
+	var statusText string
+
+	switch status {
+	case domain.StatusHealthy:
+		statusStyle = sl.Theme.HealthHealthy
+		statusText = "Healthy"
+	case domain.StatusBusy:
+		statusStyle = sl.Theme.HealthBusy
+		statusText = "Busy"
+	case domain.StatusOffline:
+		statusStyle = sl.Theme.HealthOffline
+		statusText = "Offline"
+	case domain.StatusWarming:
+		statusStyle = sl.Theme.HealthWarming
+		statusText = "Warming"
+	case domain.StatusUnhealthy:
+		statusStyle = sl.Theme.HealthUnhealthy
+		statusText = "Unhealthy"
+	case domain.StatusUnknown:
+	default:
+		statusStyle = sl.Theme.HealthUnknown
+		statusText = "Unknown"
+	}
+
+	styledMsg := fmt.Sprintf("%s %s is %s",
+		msg,
+		sl.Theme.Endpoint.Sprint(name), statusStyle.Sprint(statusText))
+
+	sl.logger.Info(styledMsg, args...)
+}
+
+func (sl *PrettyStyledLogger) GetUnderlying() *slog.Logger {
+	return sl.logger
+}
+
+func (sl *PrettyStyledLogger) WithRequestID(requestID string) StyledLogger {
+	return sl.With(constants.ContextRequestIdKey, requestID)
+}
+
+func (sl *PrettyStyledLogger) InfoConfigChange(oldName, newName string) {
+	styledMsg := fmt.Sprintf("Endpoint configuration changed for %s to: %s",
+		sl.Theme.Endpoint.Sprint(oldName),
+		sl.Theme.Endpoint.Sprint(newName))
+	sl.logger.Info(styledMsg)
+}
+
+func (sl *PrettyStyledLogger) WithAttrs(attrs ...slog.Attr) StyledLogger {
+	args := make([]any, 0, len(attrs)*2)
+	for _, attr := range attrs {
+		args = append(args, attr.Key, attr.Value)
+	}
+
+	return &PrettyStyledLogger{
+		logger: sl.logger.With(args...),
+		Theme:  sl.Theme,
+	}
+}
+
+func (sl *PrettyStyledLogger) With(args ...any) StyledLogger {
+	return &PrettyStyledLogger{
+		logger: sl.logger.With(args...),
+		Theme:  sl.Theme,
+	}
+}
+
+func (sl *PrettyStyledLogger) InfoWithContext(msg string, endpoint string, ctx LogContext) {
+	sl.logWithContext(LogLevelInfo, msg, endpoint, ctx)
+}
+
