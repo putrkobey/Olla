@@ -25,3 +25,17 @@ afterEach(() => {
   document.body.innerHTML = '';
   navigation.set('overview'); // leave the singleton store clean for other test files
 });
+
+describe('App navigation authority', () => {
+  it('a programmatic jump updates both the rendered panel and the tab bar state', () => {
+    component = mount(App, { target: document.body });
+    flushSync();
+
+    expect(document.getElementById('panel-overview')).not.toBeNull();
+    expect(document.getElementById('tab-overview')!.getAttribute('aria-selected')).toBe('true');
+
+    // Simulate a programmatic jump the way OverviewPanel's "jump to
+    // endpoint" link does, via the same navigation authority App uses.
+    navigation.set('endpoints');
+    flushSync();
+
