@@ -34,3 +34,39 @@ func TestTranslationHandler_StrictRejection_DecisionAwareStatusAndHeaders(t *tes
 	chain := inspector.NewChain(styledLog)
 	bodyInspector, err := inspector.NewBodyInspector(styledLog)
 	require.NoError(t, err)
+	chain.AddInspector(bodyInspector)
+
+	trans, err := anthropic.NewTranslator(styledLog, config.AnthropicTranslatorConfig{})
+	require.NoError(t, err)
+
+	// Strict registry: the requested model exists nowhere in the fleet, so
+	// GetRoutableEndpointsForModel rejects with a genuine strict decision
+	// (action "rejected", reason model_not_found, status 404).
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{},
+		strict:            true,
+	}
+
+	app := &Application{
+		Config:           &config.Config{},
+		logger:           styledLog,
+		inspectorChain:   chain,
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		modelRegistry:    modelRegistry,
+		statsCollector:   &mockStatsCollector{},
+		proxyService: &mockProxyService{
+			proxyFunc: nil, // must never be reached
+		},
+	}
+
+	body := `{"model":"claude-not-registered","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w := httptest.NewRecorder()
+
+	app.translationHandler(trans).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusNotFound, w.Code, "must use the decision's status code, not a hardcoded default")
+	assert.Equal(t, "strict", w.Header().Get(constants.HeaderXOllaRoutingStrategy))
+	assert.Equal(t, "rejected", w.Header().Get(constants.HeaderXOllaRoutingDecision))
+	assert.Equal(t, "model_not_found", w.Header().Get(constants.HeaderXOllaRoutingReason))

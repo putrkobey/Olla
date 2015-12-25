@@ -216,3 +216,112 @@ func TestGetModelsByCapability(t *testing.T) {
 			name:        "Chat capability",
 			capability:  "chat",
 			expectedIDs: []string{"chat-model", "vision-model", "code-model"},
+		},
+		{
+			name:        "Chat completion capability (alternate name)",
+			capability:  "chat_completion",
+			expectedIDs: []string{"chat-model", "vision-model", "code-model"},
+		},
+		{
+			name:        "Embeddings capability",
+			capability:  "embeddings",
+			expectedIDs: []string{"embedding-model"},
+		},
+		{
+			name:        "Vision capability",
+			capability:  "vision",
+			expectedIDs: []string{"vision-model"},
+		},
+		{
+			name:        "Code generation capability",
+			capability:  "code",
+			expectedIDs: []string{"code-model"},
+		},
+		{
+			name:        "Function calling capability",
+			capability:  "function",
+			expectedIDs: []string{"code-model"},
+		},
+		{
+			name:        "Streaming capability",
+			capability:  "streaming",
+			expectedIDs: []string{"chat-model", "vision-model"},
+		},
+		{
+			name:        "Unknown capability",
+			capability:  "unknown",
+			expectedIDs: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			models, err := registry.GetModelsByCapability(ctx, tt.capability)
+			if err != nil {
+				t.Fatalf("GetModelsByCapability failed: %v", err)
+			}
+
+			if len(models) != len(tt.expectedIDs) {
+				t.Errorf("Expected %d models, got %d", len(tt.expectedIDs), len(models))
+			}
+
+			// Check that all expected models are returned
+			returnedIDs := make(map[string]bool)
+			for _, model := range models {
+				returnedIDs[model.ID] = true
+			}
+
+			for _, expectedID := range tt.expectedIDs {
+				if !returnedIDs[expectedID] {
+					t.Errorf("Expected model ID %s not found in results", expectedID)
+				}
+			}
+		})
+	}
+}
+
+func TestGetHealthyEndpointsForModel_ContextCancellation(t *testing.T) {
+	registry := createTestUnifiedRegistry()
+
+	// Create a cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	mockRepo := &mockEndpointRepository{}
+
+	_, err := registry.GetHealthyEndpointsForModel(ctx, "test-model", mockRepo)
+	if err == nil {
+		t.Error("Expected context cancellation error, got nil")
+	}
+}
+
+func TestGetModelsByCapability_ContextCancellation(t *testing.T) {
+	registry := createTestUnifiedRegistry()
+
+	// Create a cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := registry.GetModelsByCapability(ctx, "chat")
+	if err == nil {
+		t.Error("Expected context cancellation error, got nil")
+	}
+}
+
+// TestEndpointSetCaching verifies that the endpoint set cache improves performance
+func TestEndpointSetCaching(t *testing.T) {
+	ctx := context.Background()
+	registry := createTestUnifiedRegistry()
+
+	// Create test endpoints
+	endpoint1 := &domain.Endpoint{
+		URLString: "http://localhost:11434",
+		Name:      "ollama1",
+		Status:    domain.StatusHealthy,
+	}
+
+	endpoint2 := &domain.Endpoint{
+		URLString: "http://localhost:11435",
+		Name:      "ollama2",
+		Status:    domain.StatusHealthy,
+	}
