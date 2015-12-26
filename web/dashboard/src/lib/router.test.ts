@@ -53,3 +53,30 @@ describe('navigation <-> hash sync', () => {
     history.replaceState(null, '', '#overview');
     navigation.set('overview');
   });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('navigatePanel sets the store and pushes a history entry', () => {
+    navigatePanel('models');
+    expect(navigation.current).toBe('models');
+    expect(location.hash).toBe('#models');
+  });
+
+  it('pushRoute for an endpoint jump writes the full fragment', () => {
+    pushRoute({ panel: 'endpoints', endpointKey: 'w5c2gc' });
+    expect(location.hash).toBe('#endpoints/ep-w5c2gc');
+  });
+
+  it('hashchange updates the store on back/forward', () => {
+    const stop = startRouter(() => {});
+    history.replaceState(null, '', '#models');
+    window.dispatchEvent(new Event('hashchange'));
+    expect(navigation.current).toBe('models');
+    stop();
+  });
+
+  it('hashchange with an endpoint route fires the restore callback', () => {
+    const onEndpoint = vi.fn();
+    const stop = startRouter(onEndpoint);

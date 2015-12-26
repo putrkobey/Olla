@@ -61,3 +61,34 @@ func TestConverterFactory(t *testing.T) {
 		assert.Contains(t, qpErr.Reason, "lmstudio")
 		assert.Contains(t, qpErr.Reason, "sglang")
 		assert.Contains(t, qpErr.Reason, "vllm")
+		assert.Contains(t, qpErr.Reason, "vllm-mlx")
+		assert.Contains(t, qpErr.Reason, "docker-model-runner")
+	})
+
+	t.Run("GetSupportedFormats returns all formats", func(t *testing.T) {
+		formats := factory.GetSupportedFormats()
+		assert.Len(t, formats, 11)
+
+		// Check all expected formats are present
+		formatMap := make(map[string]bool)
+		for _, f := range formats {
+			formatMap[f] = true
+		}
+
+		assert.True(t, formatMap["unified"])
+		assert.True(t, formatMap["openai"])
+		assert.True(t, formatMap["ollama"])
+		assert.True(t, formatMap["lemonade"])
+		assert.True(t, formatMap["llamacpp"])
+		assert.True(t, formatMap["lmdeploy"])
+		assert.True(t, formatMap["sglang"])
+		assert.True(t, formatMap["vllm"])
+		assert.True(t, formatMap["vllm-mlx"])
+		assert.True(t, formatMap["lmstudio"])
+		assert.True(t, formatMap["docker-model-runner"])
+	})
+
+	t.Run("RegisterConverter adds new converter", func(t *testing.T) {
+		// Create a mock converter
+		mockConverter := &mockConverter{formatName: "custom"}
+
