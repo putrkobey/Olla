@@ -44,26 +44,3 @@ func (r *AliasResolver) GetActualModels(aliasName string) []string {
 // EndpointModelMapping maps an endpoint URL to the actual model name it should receive
 type EndpointModelMapping struct {
 	EndpointURL string
-	ModelName   string
-}
-
-// ResolveEndpoints queries the registry for all endpoints that serve any of the aliased
-// model names. It returns the combined endpoint list and a mapping from endpoint URL to
-// the actual model name that endpoint knows, so the proxy can rewrite the request body.
-func (r *AliasResolver) ResolveEndpoints(
-	ctx context.Context,
-	aliasName string,
-	registry domain.ModelRegistry,
-) (map[string]string, error) {
-	actualModels := r.aliases[aliasName]
-	if len(actualModels) == 0 {
-		return nil, nil
-	}
-
-	// endpointToModel maps endpoint URL → actual model name for that endpoint
-	endpointToModel := make(map[string]string)
-
-	for _, modelName := range actualModels {
-		endpoints, err := registry.GetEndpointsForModel(ctx, modelName)
-		if err != nil {
-			r.logger.Debug("Failed to get endpoints for aliased model",
