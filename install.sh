@@ -131,3 +131,137 @@ for cmd in curl grep sed; do
         fatal "Required command '$cmd' not found. Please install it and try again."
     fi
 done
+
+function extract_zip() {
+    local filename=$1
+    local file_path="${filename%.*}"
+    if [[ -x "$(command -v unzip)" ]]; then
+        echo "${CCyan}RUN${ENDMARKER} unzip -o ${CYellow}'${filename}'${ENDMARKER}"
+        unzip -o "${filename}" -d "${file_path}/"
+        if [ $? -eq 0 ]; then
+            echo "${CCyan}RAN${ENDMARKER} Extracted ${CGreen}${exec} ${version_display}${ENDMARKER} to ${CYellow}${file_path}/${ENDMARKER}"
+            rm -f "${filename}"
+            echo "${CCyan}DEL${ENDMARKER} rm ${CYellow}'${filename}'${ENDMARKER}"
+        else
+            fatal "Failed to extract ${filename}"
+        fi
+    else
+        echo "${BOLD}${CRed}ERROR:${ENDMARKER} unzip not found, please extract manually!${ENDMARKER}" >&2
+    fi
+}
+
+function extract_tar() {
+    local filename=$1
+    local file_path="${filename%.*}"
+    file_path="${file_path%.tar}"  # Remove .tar from .tar.gz
+    
+    if [[ -x "$(command -v tar)" ]]; then
+        # Create directory first (portable)
+        mkdir -p "${file_path}"
+        echo "${CCyan}RUN${ENDMARKER} tar -xzf ${CYellow}'${filename}'${ENDMARKER}"
+        tar -xzf "${filename}" -C "${file_path}/"
+        if [ $? -eq 0 ]; then
+            echo "${CCyan}RAN${ENDMARKER} Extracted ${CGreen}${exec} ${version_display}${ENDMARKER} to ${CYellow}${file_path}/${ENDMARKER}"
+            rm -f "${filename}"
+            echo "${CCyan}DEL${ENDMARKER} rm ${CYellow}'${filename}'${ENDMARKER}"
+        else
+            fatal "Failed to extract ${filename}"
+        fi
+    else
+        fatal "tar not found, please install it and try again"
+    fi
+}
+
+if [[ "$OSTYPE" == "linux-gnu"* ]] || [[ "$OSTYPE" == "linux-musl" ]] ; then
+  os="linux"
+  ext="tar.gz"
+  exe=""
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+  os="macos"
+  ext="zip"
+  exe=""
+elif [[ "$OSTYPE" == "cygwin" ]] || [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "win32" ]]; then
+  os="windows"
+  ext="zip"
+  exe=".exe"
+elif [[ "$OSTYPE" == "freebsd"* ]]; then
+  os="freebsd"
+  ext="tar.gz"
+  exe=""
+else
+  fatal "Unsupported OS Type $OSTYPE"
+fi
+
+# Detect the architecture
+case $(uname -m) in
+    x86_64)
+        arch="amd64"
+        ;;
+    arm64|aarch64)
+        arch="arm64"
+        ;;
+    armv7*|armv6*)
+        arch="arm"
+        ;;
+    i386|i686)
+        arch="386"
+        ;;
+    *)
+        echo "${CYellow}WARNING:${ENDMARKER} Unknown architecture '$(uname -m)', trying 'amd64'"
+        arch="amd64"
+        ;;
+esac
+
+echo "OS:      ${os}"
+echo "ARCH:    ${arch}"
+
+# Get version information
+if [[ "$version" == "latest" ]]; then
+    latest_release=$(curl --silent --fail "https://api.github.com/repos/thushan/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ -z "$latest_release" ]; then
+        fatal "Failed to get the latest release. Please check your internet connection or try again later."
+    fi
+    version_display="$latest_release"
+else
+    # Use specified version
+    latest_release="$version"
+    version_display="$version"
+fi
+
+echo "VERSION: ${version_display}"
+
+# Determine install directory
+if [[ -z "$install_dir" ]]; then
+    install_dir="./${name}_${version_display}_${os}_${arch}"
+fi
+
+echo "INSTALL: ${install_dir}"
+echo "----------------------"
+
+# Construct the file name (remove 'v' prefix if present for filename)
+version_clean="${latest_release#v}"
+file="${name}_v${version_clean}_${os}_${arch}.${ext}"
+temp_file="$file"
+
+# Construct the download URL
+url="https://github.com/thushan/$repo/releases/download/${latest_release}/${file}"
+
+# Handle local file or download
+if [[ -n "$local_file" ]]; then
+    # Use local file for testing
+    echo "${CCyan}USE${ENDMARKER} Local file: ${CBlue}${local_file}${ENDMARKER}"
+    if [[ ! -f "$local_file" ]]; then
+        fatal "Local file not found: $local_file"
+    fi
+    cp "$local_file" "$file"
+else
+    # Download from GitHub
+    echo "${CCyan}GET${ENDMARKER} ${CBlue}${url}${ENDMARKER}"
+    
+    # Download with progress if not quiet
+    if [[ "$show_progress" == true ]]; then
+        curl_opts="-L"
+    else
+        curl_opts="-sL"
+    fi
+    
