@@ -1,0 +1,336 @@
+package unifier
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+// fallbackConfig caches the error-path default so a run of LoadModelConfig
+// errors (extraction is called per-request) doesn't rebuild the whole
+// ModelUnificationConfig struct literal on every call. Deliberately a
+// separate cache from LoadModelConfig's own sync.Once/configOnce: this one
+// only ever holds the fixed embedded default, so it has nothing for
+// resetConfigSingleton to need to invalidate.
+var (
+	fallbackConfigOnce sync.Once
+	fallbackConfig     *ModelUnificationConfig
+)
+
+// getConfig returns the model unification config. LoadModelConfig already
+// caches via its own sync.Once, so this used to duplicate that with a second,
+// independent cache - which meant resetConfigSingleton (used by tests to force
+// a fresh reload) didn't actually reach extraction, since this package's own
+// Once stayed latched to whatever it saw first.
+func getConfig() *ModelUnificationConfig {
+	config, err := LoadModelConfig()
+	if err != nil {
+		fallbackConfigOnce.Do(func() {
+			fallbackConfig = getDefaultConfig()
+			// Uncompiled patterns make regex-driven extraction a silent no-op,
+			// so compile here as LoadModelConfig does on its own recovery path.
+			_ = fallbackConfig.compilePatterns()
+		})
+		return fallbackConfig
+	}
+	return config
+}
+
+// normalizeQuantization converts various quantization formats to a canonical form
+func normalizeQuantization(quant string) string {
+	if quant == "" {
+		return ""
+	}
+
+	config := getConfig()
+	quant = strings.ToUpper(quant)
+
+	// Use mappings from configuration
+	if normalized, exists := config.Quantization.Mappings[quant]; exists {
+		return normalized
+	}
+
+	// Try to extract quantization from model name patterns
+	// e.g., "llama-3.2-1b-instruct-q4_k_m.gguf" -> "q4km"
+	lowercaseQuant := strings.ToLower(quant)
+	for _, p := range quantNamePatterns {
+		if matches := p.regex.FindStringSubmatch(lowercaseQuant); matches != nil {
+			return p.regex.ReplaceAllString(matches[0], p.replacement)
+		}
+	}
+
+	return strings.ToLower(quant)
+}
+
+// Compiled once: these used to be rebuilt on every call, which was a quarter of the time
+// spent unifying a model list.
+var (
+	quantNamePatterns = []struct {
+		regex       *regexp.Regexp
+		replacement string
+	}{
+		{regexp.MustCompile(`(?i)q(\d+)_k_([msl])`), "q$1k$2"},
+		{regexp.MustCompile(`(?i)q(\d+)_(\d+)`), "q$1_$2"},
+		{regexp.MustCompile(`(?i)q(\d+)`), "q$1"},
+		{regexp.MustCompile(`(?i)f(\d+)`), "f$1"},
+		{regexp.MustCompile(`(?i)fp(\d+)`), "f$1"},
+		{regexp.MustCompile(`(?i)int(\d+)`), "int$1"},
+	}
+	paramSizePattern     = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*([BM]?)$`)
+	nameDelimiterPattern = regexp.MustCompile(`[-_:/]`)
+)
+
+// extractParameterSize extracts and normalizes parameter size from various formats
+func extractParameterSize(sizeStr string) (string, int64) {
+	if sizeStr == "" {
+		return "", 0
+	}
+
+	originalStr := sizeStr
+	sizeStr = strings.TrimSpace(strings.ToUpper(sizeStr))
+
+	matches := paramSizePattern.FindStringSubmatch(sizeStr)
+
+	if len(matches) != 3 {
+		return originalStr, 0
+	}
+
+	numStr := matches[1]
+	unit := matches[2]
+
+	num, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return originalStr, 0
+	}
+
+	var paramCount int64
+	var normalizedSize string
+
+	switch unit {
+	case "M":
+		paramCount = int64(num * 1_000_000)
+		billionValue := num / 1000.0
+		if billionValue >= 1.0 {
+			normalizedSize = fmt.Sprintf("%.1fb", billionValue)
+		} else {
+			normalizedSize = fmt.Sprintf("%.0fm", num)
+		}
+	case "B", "":
+		paramCount = int64(num * 1_000_000_000)
+		normalizedSize = fmt.Sprintf("%.1fb", num)
+	}
+
+	// Remove redundant decimal zeros for cleaner representation
+	if strings.HasSuffix(normalizedSize, ".0b") {
+		normalizedSize = strings.TrimSuffix(normalizedSize, ".0b") + "b"
+	}
+	if strings.HasSuffix(normalizedSize, ".0m") {
+		normalizedSize = strings.TrimSuffix(normalizedSize, ".0m") + "m"
+	}
+
+	return normalizedSize, paramCount
+}
+
+// nonGenerativeModelTypes are model types that never produce text, so they must
+// not inherit the text-generation default.
+var nonGenerativeModelTypes = map[string]struct{}{
+	"embeddings": {},
+	"embedding":  {},
+	"reranker":   {},
+	"classifier": {},
+}
+
+var embedderCapabilities = []string{"embeddings", "similarity", "vector-search"}
+
+// nonGenerativeCapabilities mark a model that scores or encodes text. Name
+// patterns can add them to a model whose backend doesn't report a kind (a vLLM
+// reranker, an OpenAI-style BGE embedder), and such a model must not keep the
+// text-generation default any more than a typed one does.
+var nonGenerativeCapabilities = []string{"embeddings", "rerank", "classification"}
+
+// dropGenerativeForNonGenerative removes the generative defaults from a model
+// that name patterns tagged as an embedder, reranker or classifier.
+func dropGenerativeForNonGenerative(capabilities map[string]bool, modelType string) {
+	// no model is both a reranker and an embedder, and "rerank" is the stronger
+	// signal (granite-embedding-reranker-*), so the embedder tags go. A model the
+	// backend typed as an embedder keeps them.
+	if capabilities["rerank"] {
+		if _, typedNonGenerative := nonGenerativeModelTypes[modelType]; !typedNonGenerative || modelType == "reranker" {
+			for _, c := range embedderCapabilities {
+				delete(capabilities, c)
+			}
+		}
+	}
+	for _, cap := range nonGenerativeCapabilities {
+		if capabilities[cap] {
+			delete(capabilities, "text-generation")
+			// chat reaches an unreported-kind model only through an instruct/chat
+			// name pattern (gte-Qwen2-7B-instruct is still an embedder); a
+			// declaration from the backend is re-applied later
+			delete(capabilities, "chat")
+			return
+		}
+	}
+}
+
+// inferCapabilitiesFromMetadata infers model capabilities from various metadata fields
+func inferCapabilitiesFromMetadata(modelType, modelName string, contextLength int64, metadata map[string]interface{}) []string {
+	capabilities := make(map[string]bool)
+	config := getConfig()
+
+	capabilities["text-generation"] = true
+
+	modelTypeLower := strings.ToLower(modelType)
+	if typeCaps, exists := config.Capabilities.TypeCapabilities[modelTypeLower]; exists {
+		for _, cap := range typeCaps {
+			capabilities[cap] = true
+		}
+	}
+	// embedding, rerank and classification models encode or score text, they
+	// don't generate it. The kind alone decides this, so it must not depend on
+	// the config having a type_capabilities entry for it.
+	if _, nonGenerative := nonGenerativeModelTypes[modelTypeLower]; nonGenerative {
+		delete(capabilities, "text-generation")
+	}
+
+	// Name-based inference using patterns from configuration
+	nameLower := strings.ToLower(modelName)
+	for _, pattern := range config.Capabilities.NamePatterns {
+		if pattern.regex != nil && pattern.regex.MatchString(nameLower) {
+			for _, cap := range pattern.Capabilities {
+				capabilities[cap] = true
+			}
+		}
+	}
+
+	// A backend that reports a generative kind (LM Studio's "llm", a "vlm") has
+	// said what the model is, so the name must not strip it. Only an unreported
+	// kind (vLLM) is left to the name patterns.
+	if modelTypeLower != "llm" && modelTypeLower != "vlm" {
+		dropGenerativeForNonGenerative(capabilities, modelTypeLower)
+	}
+
+	// Context window size determines long-form processing capabilities
+	if contextLength > 0 {
+		thresholds := config.Capabilities.ContextThresholds
+		switch {
+		case contextLength >= thresholds["ultra_long_context"]:
+			capabilities["ultra-long-context"] = true
+			capabilities["long-context"] = true
+		case contextLength >= thresholds["long_context"]:
+			capabilities["long-context"] = true
+		case contextLength >= thresholds["extended_context"]:
+			capabilities["extended-context"] = true
+		}
+	}
+
+	// Preserve explicitly declared capabilities from source metadata
+	if metadata != nil {
+		if caps, ok := metadata["capabilities"].([]interface{}); ok {
+			for _, cap := range caps {
+				if capStr, ok := cap.(string); ok {
+					capabilities[capStr] = true
+				}
+			}
+		}
+	}
+
+	result := make([]string, 0, len(capabilities))
+	for cap := range capabilities {
+		result = append(result, cap)
+	}
+
+	return result
+}
+
+// extractFamilyAndVariant extracts family and variant from model name
+func extractFamilyAndVariant(modelName string, arch string) (family, variant string) {
+	modelName = strings.TrimSpace(strings.ToLower(modelName))
+	config := getConfig()
+
+	// Preserved families (e.g. deepseek-coder-v2) must win outright, ahead of
+	// the deepseek pattern that would otherwise split them into a variant.
+	if preserved := matchPreserveFamily(modelName, arch, config); preserved != "" {
+		return preserved, ""
+	}
+
+	// Try architecture-based extraction first
+	if arch != "" {
+		family, variant = extractFromArchitecture(arch, modelName, config)
+		if family != "" {
+			return family, variant
+		}
+	}
+
+	// Try pattern-based extraction
+	family, variant = extractFromPatterns(modelName, config)
+	if family != "" {
+		return family, variant
+	}
+
+	// Fallback to delimiter-based extraction
+	family = extractFromDelimiters(modelName, config)
+	return family, variant
+}
+
+// matchPreserveFamily checks whether modelName or arch matches a configured
+// preserve_family entry, using exact or token-prefix matching (never a bare
+// substring contains) so that e.g. "deepseek-coder-v2" preserves whole while
+// "deepseek-coder" still falls through to the deepseek pattern below.
+func matchPreserveFamily(modelName, arch string, config *ModelUnificationConfig) string {
+	archLower := strings.ToLower(strings.TrimSpace(arch))
+
+	// Publisher-prefixed names (e.g. "moonshotai/kimi-k2-instruct" from
+	// LM Studio/vLLM backends) must match on the model's own name, not the
+	// publisher segment - strip everything up to and including the last '/'
+	// before applying the token-prefix check. The arch check above stays on
+	// the raw arch string, which is never publisher-prefixed.
+	nameForMatch := modelName
+	if idx := strings.LastIndex(nameForMatch, "/"); idx != -1 {
+		nameForMatch = nameForMatch[idx+1:]
+	}
+
+	for _, entry := range config.SpecialRules.PreserveFamily {
+		entryLower := strings.ToLower(entry)
+
+		if archLower == entryLower {
+			return entry
+		}
+		if matchesTokenPrefix(nameForMatch, entryLower) {
+			return entry
+		}
+	}
+
+	return ""
+}
+
+// matchesTokenPrefix reports whether name is exactly entry, or starts with
+// entry followed by a delimiter boundary. This stops "nomic-bert" matching
+// "nomic-bertson" while still matching "nomic-bert-v1.5".
+func matchesTokenPrefix(name, entry string) bool {
+	if name == entry {
+		return true
+	}
+	if !strings.HasPrefix(name, entry) {
+		return false
+	}
+
+	next := name[len(entry)]
+	switch next {
+	case '-', '_', ':', '/', '.':
+		return true
+	default:
+		return false
+	}
+}
+
+// extractFromArchitecture extracts family and variant from architecture info
+func extractFromArchitecture(arch, modelName string, config *ModelUnificationConfig) (family, variant string) {
+	archLower := strings.ToLower(arch)
+	mappedFamily, exists := config.ModelExtraction.ArchitectureMappings[archLower]
+	if !exists {
+		// Some backends (e.g. Ollama reporting "deepseek2") surface an
+		// architecture string that's an alias rather than a canonical family.
+		mappedFamily, exists = config.ModelExtraction.FamilyAliases[archLower]

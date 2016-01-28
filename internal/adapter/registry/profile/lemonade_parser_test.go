@@ -380,3 +380,130 @@ func TestLemonadeParser_Parse(t *testing.T) {
 		assert.Empty(t, model.Type, "provider names are not model kinds")
 
 		// Verify all expected fields are parsed
+		require.NotNil(t, model.Details)
+		require.NotNil(t, model.Details.ModifiedAt)
+		assert.Equal(t, int64(1759361710), model.Details.ModifiedAt.Unix())
+		require.NotNil(t, model.Details.Publisher)
+		assert.Equal(t, "amd", *model.Details.Publisher)
+		require.NotNil(t, model.Details.Format)
+		assert.Equal(t, "onnx", *model.Details.Format)
+	})
+}
+
+func TestLemonadeParser_DownloadedState(t *testing.T) {
+	parser := &lemonadeParser{}
+
+	// Lemonade reports per-model `downloaded` in /api/v1/models. A downloaded
+	// model is present on disk and serveable on demand, so it must map to an
+	// "available" state - otherwise the router treats it as unknown-state and
+	// excludes the endpoint from dispatch (no chat routing to Lemonade).
+	testCases := []struct {
+		name            string
+		downloadedField string // JSON snippet for the field, "" to omit it entirely
+		expectAvailable bool
+	}{
+		{"downloaded true marks model available", `"downloaded": true,`, true},
+		{"downloaded false leaves state unset", `"downloaded": false,`, false},
+		{"downloaded omitted leaves state unset", ``, false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := fmt.Sprintf(`{
+				"object": "list",
+				"data": [
+					{
+						"id": "Qwen3-0.6B-GGUF",
+						"object": "model",
+						"created": 1759361710,
+						"owned_by": "lemonade",
+						%s
+						"recipe": "llamacpp"
+					}
+				]
+			}`, tc.downloadedField)
+
+			models, err := parser.Parse([]byte(response))
+			require.NoError(t, err)
+			require.Len(t, models, 1)
+
+			model := models[0]
+			require.NotNil(t, model.Details) // recipe always produces details
+
+			if tc.expectAvailable {
+				require.NotNil(t, model.Details.State)
+				assert.Equal(t, "available", *model.Details.State)
+			} else {
+				assert.Nil(t, model.Details.State)
+			}
+		})
+	}
+}
+
+func TestLemonadeParser_RecipeInference(t *testing.T) {
+	t.Run("infers format correctly for all recipe types", func(t *testing.T) {
+		testCases := []struct {
+			recipe         string
+			expectedFormat string
+		}{
+			{"oga-cpu", "onnx"},
+			{"oga-npu", "onnx"},
+			{"oga-igpu", "onnx"},
+			{"llamacpp", "gguf"},
+			{"flm", "gguf"},
+			{"unknown", ""},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.recipe, func(t *testing.T) {
+				format := inferFormatFromRecipe(tc.recipe)
+				assert.Equal(t, tc.expectedFormat, format, "Recipe %s should infer format %s", tc.recipe, tc.expectedFormat)
+			})
+		}
+	})
+
+}
+
+func TestLemonadeParser_EdgeCases(t *testing.T) {
+	parser := &lemonadeParser{}
+
+	t.Run("handles checkpoint with multiple slashes", func(t *testing.T) {
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "complex-model",
+					"object": "model",
+					"created": 1759361810,
+					"owned_by": "lemonade",
+					"checkpoint": "organization/repo/model/variant",
+					"recipe": "oga-cpu"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		// Publisher should be extracted from first part only
+		require.NotNil(t, model.Details)
+		require.NotNil(t, model.Details.Publisher)
+		assert.Equal(t, "organization", *model.Details.Publisher)
+	})
+
+	t.Run("handles various checkpoint formats", func(t *testing.T) {
+		testCases := []struct {
+			checkpoint        string
+			expectedPublisher string
+		}{
+			{"meta-llama/Llama-3.2-3B", "meta-llama"},
+			{"microsoft/Phi-3.5-mini", "microsoft"},
+			{"amd/Qwen2.5-0.5B", "amd"},
+			{"bartowski/model-gguf", "bartowski"},
+			{"model-without-slash", ""},
+			{"/leading-slash-model", ""},
+			{"", ""},
+		}
+
