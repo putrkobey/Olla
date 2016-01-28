@@ -288,3 +288,100 @@ func TestDiscoveryRetry_BackoffLargerThanRemainingTimeoutIsSkipped(t *testing.T)
 	client := failNTimes(100, &NetworkError{URL: "x", Err: errors.New("down")}, &calls)
 	svc := NewModelDiscoveryService(client, &mockEndpointRepository{healthyEndpoints: []*domain.Endpoint{ep}}, &mockModelRegistry{},
 		DiscoveryConfig{Timeout: 500 * time.Millisecond, ConcurrentWorkers: 1, RetryAttempts: 5, RetryBackoff: time.Hour}, createTestLogger())
+
+	start := time.Now()
+	if err := svc.DiscoverEndpoint(context.Background(), ep); err == nil {
+		t.Fatal("expected failure")
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("cycle took %v, the oversized backoff should have been skipped", elapsed)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls=%d, want 1", calls.Load())
+	}
+	if got := svc.getFailureCount(ep.URLString); got != 1 {
+		t.Fatalf("failure count=%d, want 1", got)
+	}
+}
+
+func TestNextRetryBackoff(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ in, want time.Duration }{
+		{0, 0},
+		{time.Second, 2 * time.Second},
+		{20 * time.Second, maxRetryBackoff},
+		{maxRetryBackoff, maxRetryBackoff},
+		{time.Hour, maxRetryBackoff},
+	}
+	for _, tc := range cases {
+		if got := nextRetryBackoff(tc.in); got != tc.want {
+			t.Errorf("nextRetryBackoff(%v)=%v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Cancelling mid-backoff must return promptly rather than wait out the backoff.
+func TestDiscoveryRetry_CancelMidBackoffReturnsPromptly(t *testing.T) {
+	ep := createMockEndpoint("http://backend", "backend")
+	var calls atomic.Int32
+	client := failNTimes(100, &NetworkError{URL: "x", Err: errors.New("down")}, &calls)
+	svc := NewModelDiscoveryService(client, &mockEndpointRepository{healthyEndpoints: []*domain.Endpoint{ep}}, &mockModelRegistry{},
+		DiscoveryConfig{Timeout: 2 * time.Hour, ConcurrentWorkers: 1, RetryAttempts: 5, RetryBackoff: time.Hour}, createTestLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- svc.DiscoverEndpoint(ctx, ep) }()
+
+	for calls.Load() < 1 {
+		time.Sleep(time.Millisecond)
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancellation mid-backoff did not return")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("took %v to notice cancellation", elapsed)
+	}
+}
+
+// Against the real HTTP client: what is retried, and what is not, as seen on the wire.
+func TestDiscoveryRetry_HTTPBackend(t *testing.T) {
+	newService := func(t *testing.T, url string, attempts int) (*ModelDiscoveryService, *domain.Endpoint, *mockModelRegistry) {
+		t.Helper()
+		client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+		t.Cleanup(func() { _ = client.Close() })
+		ep := createTestEndpoint(url, domain.ProfileOllama)
+		reg := &mockModelRegistry{}
+		svc := NewModelDiscoveryService(client, &mockEndpointRepository{healthyEndpoints: []*domain.Endpoint{ep}}, reg,
+			DiscoveryConfig{Timeout: 5 * time.Second, ConcurrentWorkers: 1, RetryAttempts: attempts, RetryBackoff: time.Millisecond}, createTestLogger())
+		return svc, ep, reg
+	}
+	serve := func(t *testing.T, calls *atomic.Int32, handler http.HandlerFunc) *httptest.Server {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			handler(w, r)
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	t.Run("503 then success registers models without a failure", func(t *testing.T) {
+		var calls atomic.Int32
+		srv := serve(t, &calls, func(w http.ResponseWriter, _ *http.Request) {
+			if calls.Load() == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"models":[{"name":"m"}]}`))
+		})
+		svc, ep, reg := newService(t, srv.URL, 3)
+		if err := svc.DiscoverEndpoint(context.Background(), ep); err != nil {
+			t.Fatal(err)
+		}

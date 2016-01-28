@@ -28,18 +28,3 @@ func (p *llamaCppParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
 		} `json:"data"`
 	}
 	const LlamaCpp = "llamacpp"
-
-	if err := json.Unmarshal(data, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse llama.cpp response: %w", err)
-	}
-
-	models := make([]*domain.ModelInfo, 0, len(response.Data))
-	now := time.Now()
-
-	for _, model := range response.Data {
-		// SCOUT-86: Failure when llamacpp has no models
-		if model.ID == "" {
-			continue
-		}
-
-		modelInfo := &domain.ModelInfo{
