@@ -19,3 +19,25 @@ import (
 func TestLoadProfiles_MalformedYAMLSurfacesWarning(t *testing.T) {
 	dir := t.TempDir()
 
+	// invalid YAML: unbalanced flow mapping
+	broken := "name: broken-profile\nrouting: {prefixes: [broken\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "broken.yaml"), []byte(broken), 0644))
+
+	valid := "name: custom-valid\nversion: \"1.0\"\nrouting:\n  prefixes:\n    - custom-valid\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "valid.yaml"), []byte(valid), 0644))
+
+	loader := NewProfileLoader(dir)
+	require.NoError(t, loader.LoadProfiles(), "LoadProfiles must not fail outright for one bad file")
+
+	warnings := loader.LoadWarnings()
+	require.Len(t, warnings, 1, "expected exactly one load warning")
+	assert.Contains(t, warnings[0], "broken.yaml", "warning should name the broken file")
+
+	// the valid custom profile must still have loaded
+	_, ok := loader.GetProfile("custom-valid")
+	assert.True(t, ok, "valid profile in the same directory should still load")
+
+	// built-ins must still be present - a bad custom file must not wipe them out
+	_, ok = loader.GetProfile("ollama")
+	assert.True(t, ok, "built-in ollama profile should still be present")
+}
