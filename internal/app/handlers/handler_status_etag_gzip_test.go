@@ -69,3 +69,27 @@ func TestEndpointsStatusETag_GzipRequestReturnsBare304(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/status/endpoints", middleware.GzipFunc(app.endpointsStatusHandler))
 
+	first := httptest.NewRequest(http.MethodGet, "/internal/status/endpoints", nil)
+	first.Header.Set("Accept-Encoding", "gzip")
+	firstRec := httptest.NewRecorder()
+	mux.ServeHTTP(firstRec, first)
+	require.Equal(t, http.StatusOK, firstRec.Code)
+	etag := firstRec.Header().Get("ETag")
+	require.NotEmpty(t, etag)
+
+	second := httptest.NewRequest(http.MethodGet, "/internal/status/endpoints", nil)
+	second.Header.Set("Accept-Encoding", "gzip")
+	second.Header.Set("If-None-Match", etag)
+	secondRec := httptest.NewRecorder()
+	mux.ServeHTTP(secondRec, second)
+
+	assert.Equal(t, http.StatusNotModified, secondRec.Code)
+	assert.Equal(t, etag, secondRec.Header().Get("ETag"))
+	assert.Empty(t, secondRec.Header().Get("Content-Encoding"))
+	assert.Empty(t, secondRec.Body.Bytes())
+}
+
+// TestModelsStatusETag_GzipRequestReturnsBare304 is the same interaction for
+// /internal/status/models.
+func TestModelsStatusETag_GzipRequestReturnsBare304(t *testing.T) {
+	t.Parallel()

@@ -45,19 +45,3 @@ func (t *Translator) convertToolChoice(toolChoice interface{}) (interface{}, err
 			return openAIToolChoiceAuto, nil
 		}
 	}
-
-	// Handle object form
-	if choiceMap, ok := toolChoice.(map[string]interface{}); ok {
-		choiceType, _ := choiceMap["type"].(string)
-
-		switch choiceType {
-		case toolChoiceAuto:
-			return openAIToolChoiceAuto, nil
-		case toolChoiceAny:
-			// Semantic mapping: Anthropic "any" -> OpenAI "required"
-			return openAIToolChoiceRequired, nil
-		case toolChoiceTool:
-			// Force specific tool selection
-			toolName, ok := choiceMap["name"].(string)
-			if !ok {
-				return nil, errors.New("tool_choice type 'tool' requires 'name' field")
