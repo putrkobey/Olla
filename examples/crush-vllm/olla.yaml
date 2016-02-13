@@ -44,3 +44,26 @@ translators:
     max_message_size: 10485760       # 10MB max request size
 
 discovery:
+  type: "static"
+  refresh_interval: 30s
+  static:
+    endpoints:
+      # vLLM instance - High-performance GPU-optimised inference
+      - url: "http://vllm:8000"
+        name: "vllm-primary"
+        type: "vllm"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/health"
+        check_interval: 5s
+        check_timeout: 2s
+
+      # Example: Add more vLLM instances for load balancing
+      # - url: "http://vllm-secondary:8000"
+      #   name: "vllm-secondary"
+      #   type: "vllm"
+      #   priority: 75
+      #   model_url: "/v1/models"
+      #   health_check_url: "/health"
+      #   check_interval: 5s
+      #   check_timeout: 2s

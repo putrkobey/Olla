@@ -108,3 +108,58 @@ func TestExtractModelName(t *testing.T) {
 		{
 			name:    "HTML error page",
 			body:    []byte(`<html><body>502 Bad Gateway</body></html>`),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ExtractModelName(tt.body)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ExtractModelName() expected error, got model=%q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("ExtractModelName() unexpected error: %v", err)
+				return
+			}
+			if got != tt.wantModel {
+				t.Errorf("ExtractModelName() = %q, want %q", got, tt.wantModel)
+			}
+		})
+	}
+}
+
+// BenchmarkExtractModelName measures the lightweight gjson-based extraction
+func BenchmarkExtractModelName(b *testing.B) {
+	// Realistic Anthropic Messages API request body
+	body := []byte(`{
+		"model": "claude-3-opus-20240229",
+		"max_tokens": 4096,
+		"system": "You are a helpful assistant.",
+		"messages": [
+			{"role": "user", "content": "What is the capital of France?"}
+		],
+		"stream": true,
+		"temperature": 0.7
+	}`)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		_, _ = ExtractModelName(body)
+	}
+}
+
+// BenchmarkFullUnmarshal compares against a minimal struct unmarshal.
+// Note: This understates the real TransformRequest cost, which also includes:
+// - Field validation with custom rules
+// - Format conversion from Anthropic to OpenAI structure
+// - Message content transformation
+// - System prompt injection
+// - Buffer pool operations
+// The actual performance improvement over TransformRequest is larger than shown here.
