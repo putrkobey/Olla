@@ -78,3 +78,83 @@ func TestBaseConverter_FindProviderEndpoint(t *testing.T) {
 		{
 			name: "finds matching endpoint",
 			model: &domain.UnifiedModel{
+				SourceEndpoints: []domain.SourceEndpoint{
+					{
+						EndpointURL: "http://localhost:11434",
+						NativeName:  "llama3:latest",
+						State:       "loaded",
+					},
+					{
+						EndpointURL: "http://localhost:1234",
+						NativeName:  "something-else",
+						State:       "loaded",
+					},
+				},
+			},
+			providerName: "llama3:latest",
+			wantNil:      false,
+			wantEndpoint: "http://localhost:11434",
+		},
+		{
+			name: "no matching endpoint",
+			model: &domain.UnifiedModel{
+				SourceEndpoints: []domain.SourceEndpoint{
+					{
+						EndpointURL: "http://localhost:1234",
+						NativeName:  "microsoft/phi-4",
+						State:       "loaded",
+					},
+				},
+			},
+			providerName: "llama3:latest",
+			wantNil:      true,
+		},
+		{
+			name: "empty provider name",
+			model: &domain.UnifiedModel{
+				SourceEndpoints: []domain.SourceEndpoint{
+					{
+						EndpointURL: "http://localhost:11434",
+						NativeName:  "llama3:latest",
+						State:       "loaded",
+					},
+				},
+			},
+			providerName: "",
+			wantNil:      true,
+		},
+		{
+			name: "empty endpoints",
+			model: &domain.UnifiedModel{
+				SourceEndpoints: []domain.SourceEndpoint{},
+			},
+			providerName: "llama3:latest",
+			wantNil:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := base.FindProviderEndpoint(tt.model, tt.providerName)
+			if tt.wantNil {
+				assert.Nil(t, got)
+			} else {
+				assert.NotNil(t, got)
+				assert.Equal(t, tt.wantEndpoint, got.EndpointURL)
+			}
+		})
+	}
+}
+
+func TestBaseConverter_ExtractMetadata(t *testing.T) {
+	base := NewBaseConverter("test")
+
+	metadata := map[string]interface{}{
+		"string_val": "test",
+		"int_val":    42,
+		"float_val":  42.5,
+		"bool_val":   true,
+		"nil_val":    nil,
+		"wrong_type": []string{"array"},
+	}
+
