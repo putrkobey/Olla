@@ -8,14 +8,3 @@ const (
 	contentTypeThinking   = "thinking"
 )
 
-const (
-	toolChoiceAuto = "auto"
-	toolChoiceAny  = "any"
-	toolChoiceNone = "none"
-	toolChoiceTool = "tool"
-)
-
-const (
-	openAIToolChoiceRequired = "required"
-	openAIToolChoiceAuto     = "auto"
-	openAIToolChoiceNone     = "none"
