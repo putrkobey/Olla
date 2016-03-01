@@ -39,3 +39,23 @@ func DefaultConfig() Config {
 		EndpointHealthCheckInterval:  30 * time.Second,
 		MaxConsecutiveFailures:       3,
 		EnableStateTransitionLogging: false,
+		DiscoveryRetryPolicy: RetryPolicy{
+			MaxAttempts:       3,
+			InitialBackoff:    time.Second,
+			MaxBackoff:        30 * time.Second,
+			BackoffMultiplier: 2.0,
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:          true,
+			FailureThreshold: 5,
+			SuccessThreshold: 2,
+			OpenDuration:     60 * time.Second,
+			HalfOpenRequests: 3,
+		},
+	}
+}
+
+// Validate fixes invalid values rather than returning errors for operational stability
+func (c *Config) Validate() error {
+	if c.ModelTTL <= 0 {
+		c.ModelTTL = 24 * time.Hour
