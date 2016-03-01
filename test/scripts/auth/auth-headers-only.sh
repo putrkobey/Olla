@@ -54,3 +54,31 @@ server:
   port: ${OLLA_PORT}
   read_timeout: 10s
   write_timeout: 0s
+  shutdown_timeout: 2s
+  request_logging: false
+  request_limits:
+    max_body_size: 10485760
+    max_header_size: 524288
+  rate_limits:
+    global_requests_per_minute: 0
+    per_ip_requests_per_minute: 0
+    health_requests_per_minute: 0
+    burst_size: 50
+proxy:
+  engine: "olla"
+  profile: "auto"
+  load_balancer: "priority"
+  connection_timeout: 5s
+  response_timeout: 10s
+  read_timeout: 10s
+discovery:
+  type: "static"
+  refresh_interval: 10s
+  static:
+    endpoints:
+      - url: "${BACKEND_URL}"
+        name: "mock-headers"
+        type: "openai-compatible"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/v1/models"
