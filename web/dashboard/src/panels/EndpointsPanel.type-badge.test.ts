@@ -39,3 +39,17 @@ async function refreshWith(endpoint: Record<string, unknown>) {
 
 describe('EndpointsPanel type is shown exactly once per row', () => {
   it('renders no inline badge-type span in the name cell', async () => {
+    component = mount(EndpointsPanel, { target: document.body });
+    flushSync();
+
+    await refreshWith({
+      name: 'ollama-1',
+      url: 'http://ollama-1:11434',
+      type: 'ollama',
+      status: 'healthy',
+      priority: 100,
+      success_rate: '99.0%',
+      request_count: 10,
+      model_count: 1,
+      avg_latency_ms: 20,
+      min_latency_ms: 5,

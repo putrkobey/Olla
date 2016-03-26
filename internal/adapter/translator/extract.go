@@ -14,20 +14,3 @@ import (
 // used. A full TransformRequest parse is deferred to the translation path only.
 //
 // Uses gjson.GetBytes which scans forward to the first matching key without
-// allocating an intermediate map, making it significantly cheaper than
-// encoding/json.Unmarshal for this single-field lookup.
-func ExtractModelName(body []byte) (string, error) {
-	if len(body) == 0 {
-		return "", errors.New("empty request body")
-	}
-
-	result := gjson.GetBytes(body, "model")
-
-	if !result.Exists() {
-		return "", errors.New("model field is required (body may not be valid JSON)")
-	}
-
-	// gjson coerces non-string types via .String() (numbers become "123",
-	// arrays become their raw JSON). We only accept actual JSON strings.
-	if result.Type != gjson.String {
-		return "", fmt.Errorf("model field must be a string, got %s", result.Type)
