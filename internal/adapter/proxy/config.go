@@ -44,3 +44,49 @@ type Configuration struct {
 	MaxIdleConns    int
 	MaxConnsPerHost int
 }
+
+func (c *Configuration) GetProxyProfile() string {
+	if c.Profile == "" {
+		return constants.ConfigurationProxyProfileAuto
+	}
+	return c.Profile
+}
+func (c *Configuration) GetProxyPrefix() string {
+	if c.ProxyPrefix == "" {
+		return constants.ContextRoutePrefixKey
+	}
+	return c.ProxyPrefix
+}
+
+func (c *Configuration) GetConnectionTimeout() time.Duration {
+	if c.ConnectionTimeout == 0 {
+		return DefaultTimeout
+	}
+	return c.ConnectionTimeout
+}
+
+func (c *Configuration) GetConnectionKeepAlive() time.Duration {
+	if c.ConnectionKeepAlive == 0 {
+		return DefaultKeepAlive
+	}
+	return c.ConnectionKeepAlive
+}
+
+func (c *Configuration) GetResponseTimeout() time.Duration {
+	if c.ResponseTimeout == 0 {
+		return 0 // no timeout by default
+	}
+	return c.ResponseTimeout
+}
+
+func (c *Configuration) GetReadTimeout() time.Duration {
+	if c.ReadTimeout == 0 {
+		return DefaultReadTimeout
+	}
+	return c.ReadTimeout
+}
+
+// GetResponseHeaderTimeout returns the configured response-header timeout, or 0
+// when unset. The Olla engine applies its own default (DefaultResponseHeaderTimeout)
+// for a zero value, so the raw value is passed through here.
+func (c *Configuration) GetResponseHeaderTimeout() time.Duration {
