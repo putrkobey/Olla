@@ -37,3 +37,23 @@ func NewFactory(log logger.StyledLogger) *Factory {
 		return NewDefaultUnifier()
 	})
 
+	// Register lifecycle unifier
+	factory.Register(LifecycleUnifierType, func(l logger.StyledLogger) ports.ModelUnifier {
+		return NewLifecycleUnifier(DefaultConfig(), l)
+	})
+
+	return factory
+}
+
+// Register adds a new unifier type to the factory
+func (f *Factory) Register(name string, creator func(log logger.StyledLogger) ports.ModelUnifier) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creators[name] = creator
+}
+
+// Create instantiates a unifier of the specified type
+func (f *Factory) Create(name string) (ports.ModelUnifier, error) {
+	f.mu.RLock()
+	creator, exists := f.creators[name]
+	f.mu.RUnlock()
