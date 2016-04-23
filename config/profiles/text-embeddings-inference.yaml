@@ -81,3 +81,31 @@ models:
   # TEI instances serve embedding, classification or reranker models. The
   # served model's real kind (from /info's model_type) becomes its Olla model
   # type, which tags it embeddings, rerank or classification and never
+  # text-generation, so model-less /embed, /rerank and /predict requests are
+  # steered to an instance serving a model of the matching kind. This pattern
+  # only feeds profile-level capability checks, where every TEI model is
+  # non-generative.
+  capability_patterns:
+    embeddings:
+      - "*"
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "text-embeddings-inference"
+  parsing_rules:
+    model_field_name: "model"
+    supports_streaming: false
+
+# Path indices for specific functions, matching the enabled entries in
+# api.paths above. The remaining native endpoints are documentation only -
+# Olla's PathIndices struct only reads health, models, completions,
+# chat_completions and embeddings.
+path_indices:
+  health: 10
+  models: 9
+  embeddings: 0
+
+# Resource management
+resources:
