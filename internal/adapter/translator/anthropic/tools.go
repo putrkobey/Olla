@@ -13,35 +13,3 @@ func (t *Translator) convertTools(anthropicTools []AnthropicTool) []map[string]i
 			"type": openAITypeFunction,
 			"function": map[string]interface{}{
 				"name":        tool.Name,
-				"description": tool.Description,
-				"parameters":  tool.InputSchema, // Direct mapping - both use JSON Schema
-			},
-		}
-		openaiTools = append(openaiTools, openaiTool)
-	}
-
-	return openaiTools
-}
-
-// convertToolChoice transforms Anthropic tool_choice to OpenAI format
-// Handles both string and object forms with semantic mapping:
-// - "auto" -> "auto" (let model decide)
-// - "any" -> "required" (force tool use)
-// - {"type": "tool", "name": "X"} -> {"type": "function", "function": {"name": "X"}}
-func (t *Translator) convertToolChoice(toolChoice interface{}) (interface{}, error) {
-	// Handle string form
-	if choiceStr, ok := toolChoice.(string); ok {
-		switch choiceStr {
-		case toolChoiceAuto:
-			return openAIToolChoiceAuto, nil
-		case toolChoiceAny:
-			// Anthropic's "any" means require a tool call
-			// OpenAI uses "required" for this behaviour
-			return openAIToolChoiceRequired, nil
-		case toolChoiceNone:
-			return openAIToolChoiceNone, nil
-		default:
-			// Unknown string, default to auto
-			return openAIToolChoiceAuto, nil
-		}
-	}

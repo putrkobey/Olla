@@ -70,3 +70,39 @@ func TestTranslationHandler_StrictRejection_DecisionAwareStatusAndHeaders(t *tes
 	assert.Equal(t, "strict", w.Header().Get(constants.HeaderXOllaRoutingStrategy))
 	assert.Equal(t, "rejected", w.Header().Get(constants.HeaderXOllaRoutingDecision))
 	assert.Equal(t, "model_not_found", w.Header().Get(constants.HeaderXOllaRoutingReason))
+
+	// Anthropic-shaped JSON error body must be preserved - the route must never
+	// fall back to the plain-text writeNoRoutableEndpoints format.
+	var errResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Equal(t, "error", errResp["type"])
+	errObj, ok := errResp["error"].(map[string]interface{})
+	require.True(t, ok, "response must carry an Anthropic-shaped error object")
+	assert.Equal(t, "not_found_error", errObj["type"], "404 must map to Anthropic's not_found_error type")
+}
+
+// TestTranslationHandler_StrictRejection_ModelUnavailableMaps503 proves the 503 case
+// (model exists but only on unhealthy endpoints) also survives to the translation route,
+// where it previously would have been flattened to 404.
+func TestTranslationHandler_StrictRejection_ModelUnavailableMaps503(t *testing.T) {
+	t.Parallel()
+
+	styledLog := &mockStyledLogger{}
+
+	chain := inspector.NewChain(styledLog)
+	bodyInspector, err := inspector.NewBodyInspector(styledLog)
+	require.NoError(t, err)
+	chain.AddInspector(bodyInspector)
+
+	trans, err := anthropic.NewTranslator(styledLog, config.AnthropicTranslatorConfig{})
+	require.NoError(t, err)
+
+	// Model is known to the fleet but not present on the one healthy candidate returned
+	// by mockDiscoveryServiceForTranslation, so the strict registry rejects with 503.
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"claude-somewhere-else": {"http://some-other-host:9999"},
+		},
+		strict: true,
+	}
+
