@@ -107,3 +107,221 @@ func TestEventBus_ContextCancellation(t *testing.T) {
 
 	// Subscribe's cancellation watcher goroutine only fires eb.unsubscribe
 	// after ctx.Done() closes, with no completion signal exposed to the
+	// caller - polling Stats() is the only seam available, and the
+	// unsubscribe itself is a single cheap map delete, not something
+	// contending with backpressure, so it is guaranteed eventually true by
+	// construction regardless of runner core count.
+	require.Eventually(t, func() bool {
+		return bus.Stats().TotalSubscribers == 0
+	}, pollCeiling, pollInterval, "subscriber was not unsubscribed after context cancellation")
+
+	// Verify no more events are received (channel not closed to prevent panics)
+	select {
+	case event := <-events:
+		t.Errorf("Should not receive events after context cancellation, got: %+v", event)
+	case <-time.After(100 * time.Millisecond):
+		// Expected - no events after unsubscribe
+	}
+}
+
+func TestEventBus_BackpressureHandling(t *testing.T) {
+	config := EventBusConfig{
+		BufferSize:      2,         // Small buffer to test backpressure
+		CleanupPeriod:   time.Hour, // Disable cleanup for this test
+		InactiveTimeout: time.Hour,
+	}
+	bus := NewWithConfig[TestEvent](config)
+	defer bus.Shutdown()
+
+	ctx := context.Background()
+	events, cleanup := bus.Subscribe(ctx)
+	defer cleanup()
+
+	// Fill the buffer completely
+	for i := range 2 {
+		delivered := bus.Publish(TestEvent{ID: i, Message: "fill buffer"})
+		if delivered != 1 {
+			t.Errorf("Event %d: expected 1 delivery, got %d", i, delivered)
+		}
+	}
+
+	// This should be dropped due to full buffer
+	delivered := bus.Publish(TestEvent{ID: 999, Message: "should be dropped"})
+	if delivered != 0 {
+		t.Errorf("Expected 0 deliveries (buffer full), got %d", delivered)
+	}
+
+	stats := bus.Stats()
+	if stats.TotalDropped == 0 {
+		t.Error("Expected at least 1 dropped message")
+	}
+
+	// Drain buffer to verify first events made it through
+	for i := range 2 {
+		select {
+		case event := <-events:
+			if event.ID != i {
+				t.Errorf("Expected event ID %d, got %d", i, event.ID)
+			}
+		case <-time.After(time.Second):
+			t.Errorf("Timeout waiting for buffered event %d", i)
+		}
+	}
+}
+func TestEventBus_ConcurrentPublishSubscribe(t *testing.T) {
+	bus := New[TestEvent]()
+	defer bus.Shutdown()
+
+	const numPublishers = 10
+	const numSubscribers = 5
+	const eventsPerPublisher = 100
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var subscribers []<-chan TestEvent
+	var cleanups []func()
+	receivedCounts := make([]int64, numSubscribers)
+	var subscriberWg sync.WaitGroup
+
+	for i := range numSubscribers {
+		events, cleanup := bus.Subscribe(ctx)
+		subscribers = append(subscribers, events)
+		cleanups = append(cleanups, cleanup)
+
+		idx := i
+		subscriberWg.Add(1)
+		go func() {
+			defer subscriberWg.Done()
+			for {
+				select {
+				case <-events:
+					atomic.AddInt64(&receivedCounts[idx], 1)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	defer func() {
+		for _, cleanup := range cleanups {
+			cleanup()
+		}
+	}()
+
+	var wg sync.WaitGroup
+	totalPublished := int64(0)
+
+	for i := range numPublishers {
+		wg.Add(1)
+		go func(publisherID int) {
+			defer wg.Done()
+			for j := range eventsPerPublisher {
+				event := TestEvent{
+					ID:      publisherID*1000 + j,
+					Message: "concurrent test",
+				}
+				bus.Publish(event)
+				atomic.AddInt64(&totalPublished, 1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond) // Let subscribers process remaining events
+	cancel()                           // Stop subscribers
+	subscriberWg.Wait()
+
+	expectedTotal := int64(numPublishers * eventsPerPublisher)
+	if totalPublished != expectedTotal {
+		t.Errorf("Expected %d total published, got %d", expectedTotal, totalPublished)
+	}
+
+	for i, count := range receivedCounts {
+		if count == 0 {
+			t.Errorf("Subscriber %d received no events", i)
+		}
+	}
+}
+
+func TestEventBus_PublishAsync(t *testing.T) {
+	bus := New[TestEvent]()
+	defer bus.Shutdown()
+
+	ctx := context.Background()
+	events, cleanup := bus.Subscribe(ctx)
+	defer cleanup()
+
+	testEvent := TestEvent{ID: 1, Message: "async test"}
+
+	// PublishAsync should not block
+	start := time.Now()
+	bus.PublishAsync(testEvent)
+	duration := time.Since(start)
+
+	if duration > 10*time.Millisecond {
+		t.Errorf("PublishAsync took too long: %v", duration)
+	}
+
+	// Should still receive the event
+	select {
+	case received := <-events:
+		if received.ID != testEvent.ID {
+			t.Errorf("Event mismatch: expected %+v, got %+v", testEvent, received)
+		}
+	case <-time.After(time.Second):
+		t.Error("Timeout waiting for async event")
+	}
+}
+
+func TestEventBus_Shutdown(t *testing.T) {
+	bus := New[TestEvent]()
+
+	ctx := context.Background()
+	events, cleanup := bus.Subscribe(ctx)
+	defer cleanup()
+
+	// Drain any buffered events first
+	select {
+	case <-events:
+		// Drain the buffered event
+	case <-time.After(100 * time.Millisecond):
+		// No event to drain, that's fine
+	}
+
+	// Shutdown the bus
+	bus.Shutdown()
+
+	// Verify shutdown state
+	stats := bus.Stats()
+	if !stats.IsShutdown {
+		t.Error("Bus should report as shutdown")
+	}
+
+	// Attempts to publish should fail
+	delivered := bus.Publish(TestEvent{ID: 2, Message: "after shutdown"})
+	if delivered != 0 {
+		t.Errorf("Expected 0 deliveries after shutdown, got %d", delivered)
+	}
+
+	// Subscribe to shutdown bus should return closed channel
+	newEvents, newCleanup := bus.Subscribe(ctx)
+	defer newCleanup()
+
+	select {
+	case _, ok := <-newEvents:
+		if ok {
+			t.Error("Channel from shutdown bus should be closed")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected closed channel immediately")
+	}
+
+	// Original subscriber channel should stop receiving events but won't be closed
+	// (channels are left to GC to prevent send-on-closed-channel panics)
+	select {
+	case event := <-events:
+		t.Errorf("Should not receive events after shutdown, got: %+v", event)
+	case <-time.After(100 * time.Millisecond):
+		// Expected - no more events after shutdown
+	}
