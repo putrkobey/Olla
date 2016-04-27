@@ -1,0 +1,57 @@
+@import 'tailwindcss';
+
+/* ============================================================
+   SELF-HOSTED FONTS
+   Two weights of JetBrains Mono (the workhorse) and one of IBM
+   Plex Sans (prose only). Bundled locally so the dashboard works
+   air-gapped, matching the rest of Olla.
+   ============================================================ */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono-regular.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('./assets/fonts/jetbrains-mono-bold.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/fonts/ibm-plex-sans-regular.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ============================================================
+   DESIGN TOKENS (ported verbatim from design/mockups/v2-terminal-dense.html)
+   ============================================================ */
+:root {
+  color-scheme: light;
+
+  --bg: #f1efe5;
+  --bg-elevated: #fbfaf4;
+  --bg-inset: #e7e4d6;
+  --bg-header: #e9e6d8;
+  --border: #cfc9b4;
+  --border-strong: #a89f80;
+  --text: #23261f;
+  --text-dim: #5c5a49;
+  --text-faint: #6d6a58;
+  --accent: #0d6b60;
+  --accent-soft: #d9ece7;
+  --link: #0d6b60;
+  --blue: #0094c2;
+
+  --green: #187338;
