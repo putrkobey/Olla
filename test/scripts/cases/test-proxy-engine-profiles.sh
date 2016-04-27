@@ -86,3 +86,92 @@ parse_args() {
     print_color "$GREEN" "Using configuration: $BASE_CONFIG"
 }
 
+
+# Function to create test configuration for engine and profile
+create_engine_profile_config() {
+    local engine=$1
+    local profile=$2
+    
+    print_color "$CYAN" "Creating config: engine=$engine, profile=$profile, host=localhost, port=$TEST_PORT"
+    
+    # Use the create_test_config function from _olla.sh with yq modifications
+    if command_exists yq; then
+        create_test_config "$BASE_CONFIG" ".proxy.engine = \"$engine\" | .proxy.profile = \"$profile\" | .server.host = \"localhost\" | .server.port = $TEST_PORT"
+    else
+        # Use awk to modify YAML
+        print_color "$YELLOW" "Using awk to modify YAML configuration"
+        cp "$BASE_CONFIG" "$PROJECT_ROOT/$TEST_CONFIG"
+        
+        # Create a temporary file with all modifications
+        awk -v engine="$engine" -v profile="$profile" -v port="$TEST_PORT" '
+        BEGIN { in_server = 0; in_proxy = 0 }
+        
+        # Handle server section
+        /^server:/ { 
+            in_server = 1
+            in_proxy = 0
+            print
+            next
+        }
+        
+        # Handle proxy section
+        /^proxy:/ { 
+            in_proxy = 1
+            in_server = 0
+            print
+            next
+        }
+        
+        # Reset section flags when we hit a new top-level key
+        /^[a-zA-Z]/ && !/^[[:space:]]/ {
+            in_server = 0
+            in_proxy = 0
+        }
+        
+        # Update values in server section
+        in_server && /^[[:space:]]+host:/ {
+            sub(/host:.*/, "host: \"localhost\"")
+        }
+        in_server && /^[[:space:]]+port:/ {
+            sub(/port:.*/, "port: " port)
+        }
+        
+        # Update values in proxy section
+        in_proxy && /^[[:space:]]+engine:/ {
+            sub(/engine:.*/, "engine: \"" engine "\"")
+        }
+        in_proxy && /^[[:space:]]+profile:/ {
+            sub(/profile:.*/, "profile: \"" profile "\"")
+        }
+        
+        { print }
+        ' "$PROJECT_ROOT/$TEST_CONFIG" > "$PROJECT_ROOT/$TEST_CONFIG.tmp" && \
+        mv "$PROJECT_ROOT/$TEST_CONFIG.tmp" "$PROJECT_ROOT/$TEST_CONFIG"
+        
+        # Verify the changes
+        local actual_port=$(grep -A10 "^server:" "$PROJECT_ROOT/$TEST_CONFIG" | grep "port:" | head -1 | awk '{print $2}')
+        local actual_engine=$(grep -A10 "^proxy:" "$PROJECT_ROOT/$TEST_CONFIG" | grep "engine:" | head -1 | sed 's/.*engine:[[:space:]]*"\?\([^"]*\)"\?.*/\1/')
+        local actual_profile=$(grep -A10 "^proxy:" "$PROJECT_ROOT/$TEST_CONFIG" | grep "profile:" | head -1 | sed 's/.*profile:[[:space:]]*"\?\([^"]*\)"\?.*/\1/')
+        
+        print_color "$CYAN" "Configuration changes:"
+        print_color "$CYAN" "  Port: $actual_port (expected: $TEST_PORT)"
+        print_color "$CYAN" "  Engine: $actual_engine (expected: $engine)"
+        print_color "$CYAN" "  Profile: $actual_profile (expected: $profile)"
+        
+        if [[ "$actual_port" == "$TEST_PORT" ]]; then
+            print_color "$GREEN" "✓ Configuration updated successfully"
+        else
+            print_color "$RED" "ERROR: Failed to update port correctly"
+        fi
+        
+        # Show what we created
+        print_color "$CYAN" "Test configuration server section:"
+        grep -A5 "^server:" "$PROJECT_ROOT/$TEST_CONFIG" 2>/dev/null | sed 's/^/  /'
+        
+        print_color "$CYAN" "Test configuration proxy section:"
+        grep -A10 "^proxy:" "$PROJECT_ROOT/$TEST_CONFIG" 2>/dev/null | grep -E "^proxy:|engine:|profile:" | sed 's/^/  /'
+    fi
+}
+
+# Function to start Olla with custom log file
+start_olla_with_log() {

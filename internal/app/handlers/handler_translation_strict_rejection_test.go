@@ -106,3 +106,39 @@ func TestTranslationHandler_StrictRejection_ModelUnavailableMaps503(t *testing.T
 		strict: true,
 	}
 
+	app := &Application{
+		Config:           &config.Config{},
+		logger:           styledLog,
+		inspectorChain:   chain,
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		modelRegistry:    modelRegistry,
+		statsCollector:   &mockStatsCollector{},
+		proxyService: &mockProxyService{
+			proxyFunc: nil,
+		},
+	}
+
+	body := `{"model":"claude-somewhere-else","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w := httptest.NewRecorder()
+
+	app.translationHandler(trans).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, "model_unavailable must map to 503, not the hardcoded 404 default")
+	assert.Equal(t, "strict", w.Header().Get(constants.HeaderXOllaRoutingStrategy))
+	assert.Equal(t, "rejected", w.Header().Get(constants.HeaderXOllaRoutingDecision))
+	assert.Equal(t, "model_unavailable", w.Header().Get(constants.HeaderXOllaRoutingReason))
+
+	var errResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	errObj, ok := errResp["error"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "api_error", errObj["type"], "503 falls back to the generic api_error type per the Anthropic taxonomy")
+}
+
+// Repeated strict-routing rejections on the Anthropic route must stay bounded: the sampled
+// "Request rejected" line is the only diagnostic, not an ERROR per request on top of it.
+func TestTranslationHandler_StrictRejectionFloodLogsBounded(t *testing.T) {
+	t.Parallel()
+
