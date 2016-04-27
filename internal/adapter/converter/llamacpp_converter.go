@@ -44,3 +44,18 @@ func (c *LlamaCppConverter) ConvertToFormat(models []*domain.UnifiedModel, filte
 		Object: "list",
 		Data:   data,
 	}, nil
+}
+
+func (c *LlamaCppConverter) convertModel(model *domain.UnifiedModel) *profile.LlamaCppModel {
+	// llama.cpp uses simple OpenAI-compatible format with minimal fields
+	now := time.Now().Unix()
+	modelID := c.FindNativeName(model)
+	if modelID == "" {
+		// Fallback to first alias or unified ID
+		if len(model.Aliases) > 0 {
+			modelID = model.Aliases[0].Name
+		} else {
+			modelID = model.ID
+		}
+	}
+
