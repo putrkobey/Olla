@@ -27,3 +27,32 @@ func (a *Application) genericProviderModelsHandler(providerType, format string) 
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}
+}
+
+// genericModelShowHandler returns model details for any provider
+func (a *Application) genericModelShowHandler(providerType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Name string `json:"name"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		if req.Name == "" {
+			http.Error(w, "Model name is required", http.StatusBadRequest)
+			return
+		}
