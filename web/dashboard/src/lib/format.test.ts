@@ -35,3 +35,77 @@ const BYTE_CASES: Array<[number, string]> = [
   [1125899906842624, '1.00 PB'],
   // Real fixture from the spec: a model SizeBytes of 5_000_000_000.
   [5000000000, '4.66 GB'],
+  // Mockup's "184GB" traffic figure for sanity (Go and JS agree on 172.05).
+  [184738291200, '172.05 GB'],
+];
+
+describe('fmtBytes', () => {
+  for (const [input, expected] of BYTE_CASES) {
+    it(`maps ${input} -> "${expected}"`, () => {
+      expect(fmtBytes(input)).toBe(expected);
+    });
+  }
+
+  it('treats non-finite / negative as zero', () => {
+    expect(fmtBytes(NaN)).toBe('0 B');
+    expect(fmtBytes(-1)).toBe('0 B');
+    expect(fmtBytes(undefined as unknown as number)).toBe('0 B');
+  });
+});
+
+describe('fmtPct', () => {
+  it('matches pkg/format.Percentage for boundaries and one-decimal values', () => {
+    expect(fmtPct(0)).toBe('0%');
+    expect(fmtPct(100)).toBe('100%');
+    expect(fmtPct(97.4)).toBe('97.4%');
+    expect(fmtPct(99.95)).toBe('100.0%');
+  });
+});
+
+describe('fmtMs', () => {
+  it('renders sub-second and second-scale latencies', () => {
+    expect(fmtMs(0)).toBe('0ms');
+    expect(fmtMs(288)).toBe('288ms');
+    expect(fmtMs(1841)).toBe('1.8s');
+  });
+});
+
+describe('fmtInt', () => {
+  it('groups with en-AU thousands separators', () => {
+    expect(fmtInt(1337)).toBe('1,337');
+    expect(fmtInt(1284431)).toBe('1,284,431');
+    expect(fmtInt(0)).toBe('0');
+    expect(fmtInt(null)).toBe('0');
+  });
+});
+
+describe('scalePct', () => {
+  it('sqrt-scales so small values stay visible against a large max', () => {
+    expect(scalePct(0, 100)).toBe(0);
+    expect(scalePct(100, 100)).toBe(100);
+    // 288 against a 29400 max should be ~9.9%, not the ~0.98% a linear scale
+    // would give: that's the whole point of sqrt scaling.
+    expect(scalePct(288, 29400)).toBeCloseTo(9.9, 1);
+  });
+
+  it('clamps above 100', () => {
+    expect(scalePct(200, 100)).toBe(100);
+  });
+});
+
+describe('fmtDuration', () => {
+  // Mirrors pkg/format.TimeDuration: single-digit for <10s, then m/h/d.
+  it('matches Go TimeDuration at the boundaries Go cares about', () => {
+    expect(fmtDuration(0)).toBe('0s');
+    expect(fmtDuration(5_000)).toBe('5s');
+    expect(fmtDuration(9_000)).toBe('9s');
+    expect(fmtDuration(45_000)).toBe('45s');
+    expect(fmtDuration(60_000)).toBe('1m');
+    expect(fmtDuration(5 * 60_000)).toBe('5m');
+    expect(fmtDuration(2 * 3600_000)).toBe('2h');
+    expect(fmtDuration(3 * 86400_000)).toBe('3d');
+  });
+});
+
+describe('fmtAgo', () => {
+  it('returns empty for missing/zero so callers can show "never"', () => {
