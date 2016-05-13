@@ -62,3 +62,67 @@ func TestVLLMConverter_ConvertToFormat(t *testing.T) {
 
 		filters := ports.ModelFilters{}
 		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(VLLMModelResponse)
+		require.True(t, ok)
+		assert.Equal(t, "list", response.Object)
+		assert.Len(t, response.Data, 2)
+
+		// Check first model (TinyLlama)
+		tinyllama := response.Data[0]
+		assert.Equal(t, "TinyLlama/TinyLlama-1.1B-Chat-v1.0", tinyllama.ID)
+		assert.Equal(t, "model", tinyllama.Object)
+		assert.Equal(t, "TinyLlama", tinyllama.OwnedBy)
+		assert.Equal(t, "TinyLlama/TinyLlama-1.1B-Chat-v1.0", tinyllama.Root)
+		assert.NotNil(t, tinyllama.MaxModelLen)
+		assert.Equal(t, int64(2048), *tinyllama.MaxModelLen)
+
+		// Check permissions are generated
+		require.Len(t, tinyllama.Permission, 1)
+		perm := tinyllama.Permission[0]
+		assert.Equal(t, "model_permission", perm.Object)
+		assert.True(t, perm.AllowSampling)
+		assert.True(t, perm.AllowLogprobs)
+		assert.True(t, perm.AllowView)
+		assert.Equal(t, "*", perm.Organization)
+		assert.False(t, perm.IsBlocking)
+
+		// Check second model (Llama 3.1)
+		llama := response.Data[1]
+		assert.Equal(t, "meta-llama/Meta-Llama-3.1-8B-Instruct", llama.ID)
+		assert.Equal(t, "meta-llama", llama.OwnedBy)
+		assert.NotNil(t, llama.MaxModelLen)
+		assert.Equal(t, int64(131072), *llama.MaxModelLen)
+	})
+
+	t.Run("handles models without vLLM native names", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID:             "phi/4:14.7b-q4km",
+				Family:         "phi",
+				Variant:        "4",
+				ParameterSize:  "14.7b",
+				ParameterCount: 14700000000,
+				Format:         "gguf",
+				Aliases: []domain.AliasEntry{
+					{Name: "phi4:latest", Source: "ollama"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{
+						EndpointURL: "http://localhost:11434",
+						NativeName:  "phi4:latest",
+						State:       "loaded",
+					},
+				},
+			},
+		}
+
+		filters := ports.ModelFilters{}
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(VLLMModelResponse)
+		require.True(t, ok)
+		assert.Len(t, response.Data, 1)
+
