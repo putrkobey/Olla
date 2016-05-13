@@ -1,0 +1,136 @@
+# Lemonade SDK inference platform profile
+name: lemonade
+home: "https://lemonade-server.ai"
+version: "1.0"
+display_name: "Lemonade"
+description: "Lemonade local LLM serving platform with AMD Ryzen AI optimisation"
+
+# Routing configuration
+routing:
+  prefixes:
+    - lemonade
+
+# API compatibility
+api:
+  openai_compatible: true
+  paths:
+    # Health and system endpoints
+    - /api/v1/health      # 0: health check
+    - /api/v1/stats       # 1: runtime statistics
+    - /api/v1/system-info # 2: system information
+
+    # Model management (OpenAI-compatible)
+    - /api/v1/models      # 3: list models
+
+    # Text generation endpoints (OpenAI-compatible)
+    - /api/v1/chat/completions # 4: chat completions
+    - /api/v1/completions      # 5: text completions
+    - /api/v1/embeddings       # 6: embeddings (may not work on all recipes)
+
+    # Model lifecycle management (Lemonade-specific)
+    - /api/v1/pull        # 7: download/install models
+    - /api/v1/load        # 8: load models into memory
+    - /api/v1/unload      # 9: unload models from memory
+    - /api/v1/delete      # 10: delete models from disk
+
+    # OpenAI Responses API (routes/openai/text/responses.cpp). Lemonade also serves it
+    # without the /api prefix, which is the form a client calling /v1/responses sends.
+    - /api/v1/responses   # 11: OpenAI Responses API
+    - /v1/responses       # 12: OpenAI Responses API (unprefixed)
+    # Anthropic Messages API (Lemonade 10.0.0+; models on its internal vLLM backend need 10.9.0+).
+    - /v1/messages        # 13: Anthropic Messages API
+
+  model_discovery_path: /api/v1/models
+  health_check_path: /api/v1/health
+  stats_path: /api/v1/stats
+
+# Platform characteristics
+characteristics:
+  timeout: 2m
+  max_concurrent_requests: 100  # Conservative for local inference focus
+  default_priority: 75          # Lower than cloud solutions due to local focus
+  streaming_support: true
+
+# Detection hints for auto-discovery
+detection:
+  path_indicators:
+    - "/api/v1/models"
+    - "/api/v1/health"
+    - "/api/v1/system-info"  # Lemonade-specific
+  default_ports:
+    - 8000
+  response_headers:
+    - "X-Lemonade-Version"
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "lemonade"
+  parsing_rules:
+    chat_completions_path: "/api/v1/chat/completions"
+    completions_path: "/api/v1/completions"
+    model_field_name: "model"
+    supports_streaming: true
+
+# Path indices for specific functions
+path_indices:
+  health: 0
+  stats: 1
+  system_info: 2
+  models: 3
+  chat_completions: 4
+  completions: 5
+  embeddings: 6
+  pull: 7
+  load: 8
+  unload: 9
+  delete: 10
+
+# Model handling
+models:
+  name_format: "{{.Name}}"  # Lemonade uses friendly names like "Qwen2.5-0.5B-Instruct-CPU"
+  capability_patterns:
+    chat:
+      - "*-Instruct-*"
+      - "*-Chat-*"
+      - "*-it-*"
+    embeddings:
+      - "*embed*"
+    code:
+      - "*code*"
+      - "*Coder*"
+      - "*Devstral*"
+    vision:
+      - "*VL-*"
+      - "*vision*"
+      - "*Scout*"
+    reasoning:
+      - "*DeepSeek-R1*"
+      - "*Cogito*"
+    reranking:
+      - "*reranker*"
+  # Context window patterns for common local models
+  context_patterns:
+    - pattern: "*llama-3.1*"
+      context: 131072
+    - pattern: "*llama-3.2*"
+      context: 131072
+    - pattern: "*llama-3*"
+      context: 8192
+    - pattern: "*mistral*"
+      context: 32768
+    - pattern: "*phi*"
+      context: 4096
+    - pattern: "*qwen*"
+      context: 32768
+    - pattern: "*gemma*"
+      context: 8192
+
+# Lemonade-specific features
+features:
+  # Local inference optimisation
+  local_inference:
+    enabled: true
+    description: "Optimised for local deployment scenarios"
+
