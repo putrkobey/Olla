@@ -49,3 +49,54 @@ func TestGetClientIP_WithProxyHeaders_TrustedSource(t *testing.T) {
 }
 
 func TestGetClientIP_WithProxyHeaders_UntrustedSource(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "203.0.113.1:12345" // Untrusted external IP
+	req.Header.Set("X-Forwarded-For", "10.0.0.1")
+
+	trustedCIDRs, _ := ParseTrustedCIDRs([]string{"192.168.0.0/16"})
+
+	ip := GetClientIP(req, true, trustedCIDRs)
+	if ip != "203.0.113.1" {
+		t.Errorf("Expected 203.0.113.1 (ignoring untrusted proxy headers), got %s", ip)
+	}
+}
+
+func TestGetClientIP_XRealIP_TrustedSource(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	req.Header.Set("X-Real-IP", "203.0.113.50")
+
+	trustedCIDRs, _ := ParseTrustedCIDRs([]string{"10.0.0.0/8"})
+
+	ip := GetClientIP(req, true, trustedCIDRs)
+	if ip != "203.0.113.50" {
+		t.Errorf("Expected 203.0.113.50 from X-Real-IP, got %s", ip)
+	}
+}
+
+func TestGetClientIP_ProxyHeadersDisabled(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "192.168.1.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+
+	trustedCIDRs, _ := ParseTrustedCIDRs([]string{"192.168.0.0/16"})
+
+	ip := GetClientIP(req, false, trustedCIDRs)
+	if ip != "192.168.1.1" {
+		t.Errorf("Expected 192.168.1.1 (proxy headers disabled), got %s", ip)
+	}
+}
+
+func TestGetClientIP_EmptyTrustedCIDRs(t *testing.T) {
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "192.168.1.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.1")
+
+	ip := GetClientIP(req, true, nil)
+	if ip != "192.168.1.1" {
+		t.Errorf("Expected 192.168.1.1 (no trusted CIDRs), got %s", ip)
+	}
+}
+
+func TestParseTrustedCIDRs_Valid(t *testing.T) {
+	cidrs := []string{
