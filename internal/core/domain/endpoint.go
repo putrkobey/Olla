@@ -62,35 +62,3 @@ func (e *Endpoint) GetHealthCheckURLString() string {
 	return e.HealthCheckURLString
 }
 
-type EndpointStatus string
-
-const (
-	StatusHealthy   EndpointStatus = StatusStringHealthy
-	StatusBusy      EndpointStatus = StatusStringBusy
-	StatusOffline   EndpointStatus = StatusStringOffline
-	StatusWarming   EndpointStatus = StatusStringWarming
-	StatusUnhealthy EndpointStatus = StatusStringUnhealthy
-	StatusUnknown   EndpointStatus = StatusStringUnknown
-	// StatusConfigError indicates the endpoint is reachable but the credentials
-	// or headers are wrong. The operator must fix config; retrying achieves nothing.
-	StatusConfigError EndpointStatus = StatusStringConfigError
-	// StatusRateLimited indicates the endpoint returned 429. The scheduler should
-	// honour the Retry-After delay before probing again.
-	StatusRateLimited EndpointStatus = StatusStringRateLimited
-)
-
-func (s EndpointStatus) IsRoutable() bool {
-	switch s {
-	case StatusHealthy, StatusBusy, StatusWarming:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s EndpointStatus) GetTrafficWeight() float64 {
-	switch s {
-	case StatusHealthy:
-		return 1.0
-	case StatusBusy:
-		return 0.3
