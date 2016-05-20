@@ -366,3 +366,371 @@ func TestExtractFamilyAndVariant(t *testing.T) {
 		{"publisher-prefixed kimi with deepseek2 arch", "moonshotai/Kimi-K2-Instruct", "deepseek2", "kimi", ""},
 		{"publisher-prefixed deepseek-coder-v2 preserved", "deepseek-ai/DeepSeek-Coder-V2-Instruct", "", "deepseek-coder-v2", ""},
 
+		// A publisher segment that happens to share a preserve entry's name
+		// must not fool the check - the stripped, matched part is the model
+		// name after the last '/', not the publisher.
+		{"publisher segment matching a preserve entry must not match", "kimi/llama-3-8b", "", "llama", "3"},
+
+		// FamilyAliases delimiter-fallback for name-based extraction is covered
+		// separately in TestExtractFromDelimiters_UsesConfiguredAliases: the
+		// 2026 refresh (main) gave devstral its own family_pattern, so
+		// "devstral-24b" now resolves at the pattern stage as family
+		// "devstral" (see devstral-small-2505 above) and never reaches the
+		// delimiter fallback this alias mechanism exists for.
+
+		// FamilyAliases: architecture fallback for arch strings not in ArchitectureMappings
+		{"arch alias deepseek2", "model", "deepseek2", "deepseek", "2"},
+
+		// PreserveFamily: wins outright, ahead of the deepseek pattern
+		{"deepseek-coder-v2 preserved", "deepseek-coder-v2", "", "deepseek-coder-v2", ""},
+		{"deepseek-coder-v2 with suffix preserved", "deepseek-coder-v2-lite", "", "deepseek-coder-v2", ""},
+		{"nomic-bert preserved", "nomic-bert", "", "nomic-bert", ""},
+		{"nomic-bert with suffix preserved", "nomic-bert-v1.5", "", "nomic-bert", ""},
+
+		// PreserveFamily must NOT affect deepseek-coder (no -v2 suffix)
+		{"deepseek-coder still splits", "deepseek-coder", "", "deepseek", "coder"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			family, variant := extractFamilyAndVariant(tt.modelName, tt.arch)
+			assert.Equal(t, tt.expectedFamily, family, "Family mismatch")
+			assert.Equal(t, tt.expectedVariant, variant, "Variant mismatch")
+		})
+	}
+}
+
+// TestFamilyPatternBoundaries is the regression guard for the campaign-found
+// family_patterns bug: the 2026-refresh patterns used an optional delimiter
+// plus an optional catch-all suffix (e.g. kimi's old `^(kimi)[-_]?(.+)?`),
+// which is unanchored - "kimichef-70b" matched at position 0 with the
+// delimiter and suffix both empty, misclassifying it as family "kimi". Every
+// family listed here must now require the character immediately following
+// the family literal to be a delimiter ([-_.:]), a version digit, or the end
+// of the string - never a bare letter - while genuine delimited/versioned
+// names keep resolving correctly. Exercised directly against
+// extractFromPatterns (not extractFamilyAndVariant) so preserve_family
+// (which already has its own correct boundary logic for "kimi") can't mask a
+// regression in the pattern itself.
+func TestFamilyPatternBoundaries(t *testing.T) {
+	config := getDefaultConfig()
+	require.NoError(t, config.compilePatterns())
+
+	tests := []struct {
+		name           string
+		modelName      string
+		expectedFamily string
+	}{
+		{"kimi: unrelated name sharing the prefix must not match", "kimichef-70b", ""},
+		{"kimi: hyphen boundary", "kimi-k2", "kimi"},
+		{"kimi: dot boundary", "kimi.k2", "kimi"},
+		{"kimi: colon boundary", "kimi:latest", "kimi"},
+
+		{"nemotron: unrelated name sharing the prefix must not match", "nemotronian-model", ""},
+		{"nemotron: hyphen boundary", "nemotron-70b", "nemotron"},
+
+		{"hunyuan: unrelated name sharing the prefix must not match", "hunyuanite-1b", ""},
+		{"hunyuan: hyphen boundary", "hunyuan-a13b", "hunyuan"},
+
+		{"minimax: unrelated name sharing the prefix must not match", "minimaxwell-2", ""},
+		{"minimax: hyphen boundary", "minimax-m2", "minimax"},
+
+		{"gpt-oss: colon boundary", "gpt-oss:20b", "gpt-oss"},
+
+		{"seed-oss: unrelated name sharing the prefix must not match", "seed-ossify-1b", ""},
+		{"seed-oss: hyphen boundary", "seed-oss-36b-instruct", "seed-oss"},
+
+		{"command-r: unrelated name sharing the prefix must not match", "command-rocket-1b", ""},
+		{"command-r: hyphen boundary", "command-r-plus", "command-r"},
+
+		{"devstral family: unrelated name sharing the prefix must not match", "devstralia-1b", ""},
+		{"devstral family: hyphen boundary", "devstral-small-2505", "devstral"},
+
+		{"glm: unrelated name sharing the prefix must not match", "glmania-1b", ""},
+		{"glm: hyphen boundary", "glm-4.5-air", "glm"},
+		{"glm: bare digit boundary", "glm4", "glm"},
+
+		{"granite: unrelated name sharing the prefix must not match", "granitehybrid", ""},
+		{"granite: bare digit boundary", "granite3.3:8b", "granite"},
+
+		{"exaone: unrelated name sharing the prefix must not match", "exaonerous-1b", ""},
+		{"exaone: hyphen boundary", "exaone-4.0-32b", "exaone"},
+
+		{"olmo: unrelated name sharing the prefix must not match", "olmossy-1b", ""},
+		{"olmo: bare digit boundary", "olmo2-13b", "olmo"},
+
+		{"internlm: unrelated name sharing the prefix must not match", "internlmish-1b", ""},
+		{"internlm: bare digit boundary", "internlm3-8b", "internlm"},
+
+		{"smollm: unrelated name sharing the prefix must not match", "smollmish-1b", ""},
+		{"smollm: bare digit boundary", "smollm3-3b", "smollm"},
+
+		{"forge: unrelated name sharing the prefix must not match", "forgery-1b", ""},
+		{"forge: hyphen boundary", "forge-code-2.5-code", "forge"},
+
+		// gpt's variant is a restricted alternation (2|j|neox), not an
+		// arbitrary catch-all, but the same unanchored-suffix bug applied:
+		// "gptx-70b" used to match family "gpt" with an empty variant.
+		{"gpt: unrelated name sharing the prefix must not match", "gptx-70b", ""},
+		{"gpt: bare digit boundary", "gpt2", "gpt"},
+		{"gpt: hyphen boundary", "gpt-j-6b", "gpt"},
+		// gpt-oss is listed earlier in family_patterns and must keep winning
+		// over the plain "gpt" pattern for its own names.
+		{"gpt-oss: not shadowed by the plain gpt pattern", "gpt-oss:20b", "gpt-oss"},
+
+		{"deepseek: unrelated name sharing the prefix must not match", "deepseeker-1b", ""},
+		{"deepseek: hyphen boundary", "deepseek-coder", "deepseek"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			family, _ := extractFromPatterns(tt.modelName, config)
+			assert.Equal(t, tt.expectedFamily, family)
+		})
+	}
+
+	// gpt-oss's own boundary is checked against its compiled regex directly,
+	// not via extractFromPatterns: "gpt-ossify-1b" correctly fails the
+	// gpt-oss pattern, but then falls through to the separate "gpt" pattern
+	// (`^(gpt)(?:[-_.:]?(2|j|neox))?(?:$|[^a-zA-Z])`, boundary-tightened by a
+	// later fix), which still resolves it to family "gpt" - not a leftover
+	// bug, but the same accepted trade-off every boundary-tightened pattern
+	// in this file makes: a delimiter immediately after the family literal
+	// satisfies the boundary check on its own, regardless of what follows
+	// (see e.g. "granite-plus" -> "granite" reasoning elsewhere in this
+	// package). Exercising extractFromPatterns end-to-end here would fail on
+	// that unrelated "gpt" collision instead of testing gpt-oss's own
+	// boundary, so this checks gpt-oss's compiled regex in isolation.
+	var gptOssRegex *regexp.Regexp
+	for _, p := range config.ModelExtraction.FamilyPatterns {
+		if p.Description == "OpenAI open-weight gpt-oss models" {
+			gptOssRegex = p.regex
+			break
+		}
+	}
+	require.NotNil(t, gptOssRegex, "gpt-oss family pattern must exist in default config")
+	if gptOssRegex.MatchString("gpt-ossify-1b") {
+		t.Error("gpt-oss pattern must not match \"gpt-ossify-1b\" - letter immediately follows the family literal")
+	}
+}
+
+// TestMatchPreserveFamily_KimiTokenPrefixSemantics is a direct, isolated
+// sanity check for the kimi preserve_family fix (issue: PR #207 CodeRabbit
+// finding). matchPreserveFamily uses exact-or-token-prefix matching, not a
+// bare substring contains, so it must not fire for names that merely start
+// with the same letters, or arch strings that merely contain "kimi".
+// Exercised directly against matchPreserveFamily (rather than through
+// extractFamilyAndVariant) so this stays a pure unit test of that one
+// function, independent of the kimi family_pattern regex (now separately
+// boundary-tightened and guarded by TestFamilyPatternBoundaries above).
+func TestMatchPreserveFamily_KimiTokenPrefixSemantics(t *testing.T) {
+	config := &ModelUnificationConfig{}
+	config.SpecialRules.PreserveFamily = []string{"kimi"}
+
+	tests := []struct {
+		name      string
+		modelName string
+		arch      string
+		want      string
+	}{
+		{"exact name match", "kimi", "", "kimi"},
+		{"name with hyphen boundary", "kimi-k2-instruct", "", "kimi"},
+		{"name with dot boundary", "kimi.k2", "", "kimi"},
+		{"arch exact match", "unrelated-name", "kimi", "kimi"},
+		{"unrelated name sharing a prefix must not match", "kimichef-70b", "", ""},
+		{"arch that merely contains kimi as a substring must not match", "unrelated", "not-kimi-arch", ""},
+
+		// Publisher-prefixed names strip everything up to and including the
+		// last '/' before the token-prefix check runs.
+		{"publisher-prefixed name matches on the model part", "moonshotai/kimi-k2-instruct", "", "kimi"},
+		{"publisher-prefixed name with deepseek arch still matches on name", "moonshotai/kimi-k2-instruct", "deepseek", "kimi"},
+		{"publisher segment sharing the entry name must not match", "kimi/llama-3-8b", "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := matchPreserveFamily(tt.modelName, tt.arch, config)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestExtractFamilyAndVariant_PlainDeepseekUnaffectedByKimiPreserve confirms
+// adding "kimi" to preserve_family didn't collaterally change plain
+// deepseek model classification - the two entries are independent.
+func TestExtractFamilyAndVariant_PlainDeepseekUnaffectedByKimiPreserve(t *testing.T) {
+	tests := []struct {
+		name            string
+		modelName       string
+		arch            string
+		expectedFamily  string
+		expectedVariant string
+	}{
+		{"deepseek-v3", "deepseek-v3", "", "deepseek", "v3"},
+		{"deepseek-r1-distill-qwen-7b", "deepseek-r1-distill-qwen-7b", "", "deepseek", "r1-distill-qwen-7b"},
+		{"arch deepseek", "model", "deepseek", "deepseek", ""},
+		{"arch deepseek2 via alias fallback", "model", "deepseek2", "deepseek", "2"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			family, variant := extractFamilyAndVariant(tt.modelName, tt.arch)
+			assert.Equal(t, tt.expectedFamily, family, "Family mismatch")
+			assert.Equal(t, tt.expectedVariant, variant, "Variant mismatch")
+		})
+	}
+}
+
+// TestExtractFromDelimiters_UsesConfiguredAliases exercises the FamilyAliases
+// delimiter fallback directly, with a synthetic config, rather than through
+// the full extractFamilyAndVariant path against production config. Every
+// alias in the shipped config now also has its own family_pattern (that's
+// how the 2026 model families were added), so any real model name that
+// starts with an alias key gets resolved at the pattern stage first and
+// never reaches this fallback - a synthetic config keeps the fallback itself
+// under test regardless of how the shipped patterns evolve.
+func TestExtractFromDelimiters_UsesConfiguredAliases(t *testing.T) {
+	config := &ModelUnificationConfig{}
+	config.ModelExtraction.FamilyAliases = map[string]string{
+		"widgetcoder": "widget",
+	}
+
+	family := extractFromDelimiters("widgetcoder-24b", config)
+	assert.Equal(t, "widget", family)
+}
+
+// TestExtractFromDelimiters_NilConfigFallsBackToKnownFamilies confirms the
+// nil-config guard added when this became config-driven: a nil config must
+// not panic, and the hardcoded knownDelimiterFamilies list still resolves.
+func TestExtractFromDelimiters_NilConfigFallsBackToKnownFamilies(t *testing.T) {
+	family := extractFromDelimiters("llama-3.2-1b", nil)
+	assert.Equal(t, "llama", family)
+}
+
+func TestExtractPublisher(t *testing.T) {
+	tests := []struct {
+		name              string
+		modelName         string
+		metadata          map[string]interface{}
+		expectedPublisher string
+	}{
+		// From metadata
+		{
+			name:              "Publisher in metadata",
+			modelName:         "phi-4",
+			metadata:          map[string]interface{}{"publisher": "microsoft"},
+			expectedPublisher: "microsoft",
+		},
+		// From model name prefix
+		{
+			name:              "Publisher prefix",
+			modelName:         "microsoft/phi-4-mini",
+			metadata:          nil,
+			expectedPublisher: "microsoft",
+		},
+		{
+			name:              "Google prefix",
+			modelName:         "google/gemma-2",
+			metadata:          nil,
+			expectedPublisher: "google",
+		},
+		// Known patterns
+		{
+			name:              "Known Llama",
+			modelName:         "llama3.2:1b",
+			metadata:          nil,
+			expectedPublisher: "meta",
+		},
+		{
+			name:              "Known CodeLlama",
+			modelName:         "codellama-34b",
+			metadata:          nil,
+			expectedPublisher: "meta",
+		},
+		{
+			name:              "Known Gemma",
+			modelName:         "gemma-7b",
+			metadata:          nil,
+			expectedPublisher: "google",
+		},
+		{
+			name:              "Known Phi",
+			modelName:         "phi-3-mini",
+			metadata:          nil,
+			expectedPublisher: "microsoft",
+		},
+		{
+			name:              "Known Mistral",
+			modelName:         "mistral-7b",
+			metadata:          nil,
+			expectedPublisher: "mistral",
+		},
+		{
+			name:              "Known Qwen",
+			modelName:         "qwen2.5-coder",
+			metadata:          nil,
+			expectedPublisher: "alibaba",
+		},
+		{
+			name:              "Known Yi",
+			modelName:         "yi-34b",
+			metadata:          nil,
+			expectedPublisher: "01-ai",
+		},
+		{
+			name:              "Known StarCoder",
+			modelName:         "starcoder2-15b",
+			metadata:          nil,
+			expectedPublisher: "bigcode",
+		},
+		// Unknown
+		{
+			name:              "Unknown model",
+			modelName:         "custom-model",
+			metadata:          nil,
+			expectedPublisher: "",
+		},
+		// 2026 model families
+		{
+			name:              "Known Devstral",
+			modelName:         "devstral-small-2505",
+			metadata:          nil,
+			expectedPublisher: "mistral",
+		},
+		{
+			name:              "Known GLM",
+			modelName:         "glm-4.5-air",
+			metadata:          nil,
+			expectedPublisher: "zai-org",
+		},
+		{
+			name:              "Known Kimi",
+			modelName:         "kimi-k2",
+			metadata:          nil,
+			expectedPublisher: "moonshotai",
+		},
+		{
+			name:              "Known Granite",
+			modelName:         "granite3.3:8b",
+			metadata:          nil,
+			expectedPublisher: "ibm",
+		},
+		{
+			name:              "Known Command-R",
+			modelName:         "command-r-plus",
+			metadata:          nil,
+			expectedPublisher: "cohere",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			publisher := extractPublisher(tt.modelName, tt.metadata)
+			assert.Equal(t, tt.expectedPublisher, publisher)
+		})
+	}
+}
+
+func TestParseContextLength(t *testing.T) {
+	tests := []struct {
+		name     string
