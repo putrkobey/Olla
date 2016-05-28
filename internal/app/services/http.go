@@ -190,3 +190,99 @@ func (s *HTTPService) Start(ctx context.Context) error {
 		MaxHeaderBytes:    maxHeaderBytesFromConfig(s.fullConfig.Server.RequestLimits.MaxHeaderSize),
 	}
 
+	s.logger.Info("HTTP server listening",
+		"address", addr,
+		"readTimeout", readTimeout,
+		"readHeaderTimeout", readHeaderTimeout,
+		"writeTimeout", writeTimeout,
+		"idleTimeout", idleTimeout)
+
+	go func() {
+		if serr := s.server.Serve(ln); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+			s.logger.Error("HTTP server error", "error", serr)
+		}
+	}()
+
+	s.logger.Info("Olla started, waiting for requests...", "bind", addr)
+
+	s.printWarnings()
+	s.printDashboardURL(addr)
+	return nil
+}
+
+// printDashboardURL logs a standout line pointing at the admin dashboard once
+// the server is otherwise fully up. It runs after printWarnings so it is the
+// last thing an operator sees at the bottom of the startup log, mirroring the
+// InfoWithStatus "[ OK ]" treatment Stop() already uses for its loudest line.
+// Skipped silently if the bind address can't be turned into a URL - this is
+// cosmetic, not worth failing startup over.
+//
+// The line is honest about asset presence: a binary built without `make
+// build-web` (e.g. via `go install`) carries only the .gitkeep sentinel, so
+// the dashboard route would 503 on every request. Claiming "ready" there
+// sends the operator on a dead debugging loop. We log a separate line that
+// names the fix instead.
+func (s *HTTPService) printDashboardURL(bindAddr string) {
+	if !s.fullConfig.Dashboard.Enabled {
+		return
+	}
+
+	url, ok := dashboardURL(bindAddr)
+	if !ok {
+		return
+	}
+
+	s.logger.Info(dashboardStartupLine(url, dashboard.AssetsBuilt()))
+}
+
+// dashboardStartupLine renders the line printDashboardURL emits for a given
+// URL and asset-present flag. Split out so the decision is unit-testable
+// without standing up a logger.
+func dashboardStartupLine(url string, assetsBuilt bool) string {
+	if assetsBuilt {
+		return fmt.Sprintf("Admin dashboard ready - %s", url)
+	}
+	return fmt.Sprintf("Admin dashboard at %s (assets not built - run `make build-web` or use a release binary)", url)
+}
+
+// dashboardURL derives a clickable dashboard URL from a listener bind address.
+// An unspecified host (0.0.0.0, ::, [::], or an empty host) isn't something a
+// browser can open, so it's substituted with localhost. IPv6 literals are
+// bracketed for a valid URL authority.
+func dashboardURL(bindAddr string) (string, bool) {
+	host, port, err := net.SplitHostPort(bindAddr)
+	if err != nil || port == "" {
+		return "", false
+	}
+
+	// net.JoinHostPort brackets IPv6 literals itself, so displayHost is left
+	// unbracketed here regardless of address family.
+	displayHost := host
+	if addr, perr := netip.ParseAddr(host); host == "" || (perr == nil && addr.IsUnspecified()) {
+		displayHost = "localhost"
+	}
+
+	return fmt.Sprintf("http://%s/internal/ui/", net.JoinHostPort(displayHost, port)), true
+}
+
+// applyCORS wraps the root handler with CORS as the outermost layer so that
+// browser preflight (OPTIONS) requests are answered directly by rs/cors and
+// never reach the per-route security chain (rate-limiting, access logging).
+// This is correct CORS behaviour: preflights carry no credentials or body and
+// never reach a backend, so letting the security chain return 401/403/429 to
+// a preflight probe would break legitimate browser clients. Actual GET/POST
+// requests pass through rs/cors and then traverse the full security chain as
+// normal. Kept as a seam so the enable/disable wiring is testable without
+// standing up the full HTTP server.
+func applyCORS(handler http.Handler, cfg config.CorsConfig) http.Handler {
+	if !cfg.Enabled {
+		return handler
+	}
+	return middleware.NewCORS(cfg).Handler(handler)
+}
+
+// bindListener binds a TCP listener on addr synchronously so that any
+// port-in-use error surfaces immediately to the caller. Using ListenConfig
+// means the listener also respects context cancellation during startup.
+func bindListener(ctx context.Context, addr string) (net.Listener, error) {
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)

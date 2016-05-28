@@ -81,31 +81,3 @@ discovery:
         priority: 100
         model_url: "/v1/models"
         health_check_url: "/v1/models"
-        check_interval: 5s
-        check_timeout: 2s
-        auth:
-          type: api_key
-          key: "${GOOD_KEY}"
-          header: "${KEY_HEADER}"
-  model_discovery:
-    enabled: false
-model_registry:
-  type: "memory"
-  enable_unifier: false
-  routing_strategy:
-    type: "optimistic"
-    options:
-      fallback_behavior: "all"
-logging:
-  level: "warn"
-  format: "text"
-  output: "stdout"
-YAML
-
-free_port "$OLLA_PORT"
-go run "$REPO_ROOT" --config "$CONFIG" >"$OLLA_LOG" 2>&1 &
-OLLA_PID=$!
-wait_for_url "${OLLA_URL}/internal/health" 20
-
-# Test 1: correct key → 200
-status=$(http_status_for "${OLLA_URL}/olla/openai-compatible/v1/chat/completions")
