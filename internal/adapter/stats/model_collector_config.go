@@ -33,21 +33,3 @@ type ModelCollectorConfig struct {
 // DefaultModelCollectorConfig returns the default configuration
 func DefaultModelCollectorConfig() *ModelCollectorConfig {
 	return &ModelCollectorConfig{
-		MaxTrackedModels:         50,               // Reduced from 100
-		ModelStatsTTL:            6 * time.Hour,    // Reduced from 24h
-		ModelCleanupInterval:     30 * time.Minute, // More frequent cleanup
-		MaxUniqueClientsPerModel: 100,
-		PercentileSampleSize:     100,
-		EnableDetailedStats:      false,
-		PercentileTrackerType:    "reservoir",
-		ClientIPRetentionTime:    1 * time.Hour,
-	}
-}
-
-// Validate ensures the configuration values are reasonable
-func (c *ModelCollectorConfig) Validate() *ModelCollectorConfig {
-	if c.MaxTrackedModels <= 0 {
-		c.MaxTrackedModels = 50
-	}
-	if c.ModelStatsTTL <= 0 {
-		c.ModelStatsTTL = 6 * time.Hour
