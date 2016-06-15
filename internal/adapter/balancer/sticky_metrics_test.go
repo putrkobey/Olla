@@ -32,3 +32,107 @@ func TestStickySessionWrapper_Stats_TracksMetrics(t *testing.T) {
 
 	// Second select: hit on the same key → Hits++.
 	ctx2, _ := injectKey(context.Background(), "stats-key:llama3", "session_header")
+	_, err = w.Select(ctx2, endpoints)
+	require.NoError(t, err)
+
+	stats := w.Stats()
+	assert.True(t, stats.Enabled, "Stats.Enabled must be true for an active wrapper")
+	assert.Equal(t, 1, stats.ActiveSessions, "one unique key should produce one active session")
+	assert.GreaterOrEqual(t, stats.Insertions, uint64(1), "insertion counter must be tracked by the underlying ttlcache")
+	assert.GreaterOrEqual(t, stats.Hits, uint64(1), "hit counter must be tracked by the underlying ttlcache")
+}
+
+// TestComputeStickyKey_PrefixHash_PromptFallback verifies that legacy completions
+// requests (which use "prompt" instead of "messages") still produce a sticky key
+// via the prefix_hash source. Without the fallback, /v1/completions and
+// llamaswap-style passthrough requests bypass sticky entirely and the metrics
+// counters never advance.
+func TestComputeStickyKey_PrefixHash_PromptFallback(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"llama3","prompt":"why is the sky blue?","max_tokens":50}`)
+	req, _ := http.NewRequest(http.MethodPost, "/", nil)
+
+	cfg := config.StickySessionConfig{
+		KeySources:      []string{"prefix_hash"},
+		PrefixHashBytes: 512,
+	}
+	key, source := ComputeStickyKey(req, "llama3", cfg, body)
+
+	assert.Equal(t, "prefix_hash", source, "prompt-only body must still resolve via prefix_hash")
+	assert.NotEmpty(t, key, "prompt fallback must produce a non-empty key")
+}
+
+// TestComputeStickyKey_PrefixHash_PreferMessagesOverPrompt ensures the prompt
+// fallback does not accidentally override the canonical messages path when both
+// are present.
+func TestComputeStickyKey_PrefixHash_PreferMessagesOverPrompt(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.StickySessionConfig{
+		KeySources:      []string{"prefix_hash"},
+		PrefixHashBytes: 512,
+	}
+
+	chatBody := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	mixedBody := []byte(`{"messages":[{"role":"user","content":"hi"}],"prompt":"different content"}`)
+
+	keyChat, _ := ComputeStickyKey(&http.Request{}, "m", cfg, chatBody)
+	keyMixed, _ := ComputeStickyKey(&http.Request{}, "m", cfg, mixedBody)
+
+	assert.Equal(t, keyChat, keyMixed, "messages must take precedence over prompt when both exist")
+}
+
+// TestComputeStickyKey_SessionHeader_EmptyModel verifies that an unidentified
+// model (e.g. llamaswap requests where no inspector populates pr.model) still
+// produces a usable, distinct key per session ID. Reproduces a slice of
+// issue #139 where requests without model identification appeared to bypass
+// sticky entirely.
+func TestComputeStickyKey_SessionHeader_EmptyModel(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.StickySessionConfig{
+		KeySources:      []string{"session_header"},
+		PrefixHashBytes: 512,
+	}
+
+	req1, _ := http.NewRequest(http.MethodPost, "/", nil)
+	req1.Header.Set(constants.HeaderXOllaSessionID, "session-A")
+
+	req2, _ := http.NewRequest(http.MethodPost, "/", nil)
+	req2.Header.Set(constants.HeaderXOllaSessionID, "session-B")
+
+	keyA, sourceA := ComputeStickyKey(req1, "", cfg, nil)
+	keyB, sourceB := ComputeStickyKey(req2, "", cfg, nil)
+
+	assert.Equal(t, "session_header", sourceA)
+	assert.Equal(t, "session_header", sourceB)
+	assert.NotEmpty(t, keyA, "empty model must still produce a key when session header is present")
+	assert.NotEmpty(t, keyB)
+	assert.NotEqual(t, keyA, keyB, "distinct session IDs must produce distinct keys even with empty model")
+}
+
+// TestComputeStickyKey_PrefixHash_EmptyMessagesArray verifies that an empty
+// messages array falls through to the prompt field, so requests like
+// {"messages":[],"prompt":"hi"} still produce a sticky key rather than
+// being treated as keyless (which would break sticky for completions endpoints
+// that serialise an empty messages slice alongside a prompt).
+func TestComputeStickyKey_PrefixHash_EmptyMessagesArray(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"llama3","messages":[],"prompt":"hi","max_tokens":50}`)
+	req, _ := http.NewRequest(http.MethodPost, "/", nil)
+
+	cfg := config.StickySessionConfig{
+		KeySources:      []string{"prefix_hash"},
+		PrefixHashBytes: 512,
+	}
+	key, source := ComputeStickyKey(req, "llama3", cfg, body)
+
+	assert.Equal(t, "prefix_hash", source, "empty messages array must fall back to prompt via prefix_hash")
+	assert.NotEmpty(t, key, "prompt fallback must produce a non-empty key when messages is []")
+}
+
+// TestStickySessionWrapper_EmptyModel_RoutesAndPins verifies the end-to-end path:
+// a session header arrives with no identified model, the wrapper computes a key,
+// pins a backend, and a second request with the same session ID hits the same

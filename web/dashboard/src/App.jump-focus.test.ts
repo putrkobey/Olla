@@ -128,3 +128,68 @@ describe('Overview "jump to endpoint" scroll and focus', () => {
   // this case flips that and jumps from node-a, asserting it lands on node-a.
   it('jumps from node-a to node-a (not node.a) when names collide once slugged', async () => {
     component = mount(App, { target: document.body });
+    flushSync();
+
+    global.fetch = vi.fn(async (url) => {
+      if (String(url).includes('/internal/status/endpoints')) {
+        return jsonResponse({
+          endpoints: [
+            {
+              name: 'node.a',
+              url: 'http://node-a:11434',
+              type: 'ollama',
+              status: 'healthy',
+              priority: 100,
+              success_rate: '99.0%',
+              request_count: 10,
+              model_count: 1,
+              avg_latency_ms: 20,
+              min_latency_ms: 5,
+              max_latency_ms: 40,
+            },
+            {
+              name: 'node-a',
+              url: 'http://node-b:11434',
+              type: 'ollama',
+              status: 'healthy',
+              priority: 90,
+              success_rate: '98.0%',
+              request_count: 8,
+              model_count: 1,
+              avg_latency_ms: 25,
+              min_latency_ms: 5,
+              max_latency_ms: 40,
+            },
+          ],
+          total_count: 2,
+          healthy_count: 2,
+          routable_count: 2,
+        });
+      }
+      return jsonResponse(sysBody);
+    });
+    overview.refresh();
+    endpoints.refresh();
+    await vi.waitFor(() => {
+      expect(overview.data?.system?.status).toBe('healthy');
+      expect(endpoints.data?.endpoints?.length).toBe(2);
+    });
+    flushSync();
+
+    // Both glance rows rendered - the panel did not blank on the collision.
+    const glanceLinks = [...document.querySelectorAll<HTMLElement>('.glance-link .txt')].map((el) =>
+      el.textContent!.trim()
+    );
+    expect(glanceLinks).toEqual(expect.arrayContaining(['node.a', 'node-a']));
+
+    // The two endpoint rows carry DISTINCT DOM ids (the old code gave both
+    // ep-node-a).
+    const nodeAUrl = 'http://node-a:11434';
+    const nodeBUrl = 'http://node-b:11434';
+    const idA = `ep-${stableId(nodeAUrl)}`;
+    const idB = `ep-${stableId(nodeBUrl)}`;
+    expect(idA).not.toBe(idB);
+
+    // Jump from node-a's glance row.
+    const jumpBtn = [...document.querySelectorAll<HTMLElement>('.glance-link')].find(
+      (btn) => btn.querySelector('.txt')?.textContent?.trim() === 'node-a'
