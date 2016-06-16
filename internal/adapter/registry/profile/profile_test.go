@@ -483,3 +483,165 @@ func TestParseModelErrorHandling(t *testing.T) {
 }
 
 func TestPlatformSpecificMetadata(t *testing.T) {
+	// Test Ollama nested details parsing
+	t.Run("Ollama nested details", func(t *testing.T) {
+		profile := getTestProfile(t, domain.ProfileOllama)
+		responseBody := []byte(`{
+			"models": [{
+				"name": "test-model",
+				"digest": "abc123",
+				"modified_at": "2025-05-30T14:24:44Z",
+				"details": {
+					"parameter_size": "7B",
+					"quantization_level": "Q4_K_M",
+					"family": "llama",
+					"families": ["llama", "code"],
+					"format": "gguf"
+				}
+			}]
+		}`)
+
+		models, err := profile.ParseModelsResponse(responseBody)
+
+		if err != nil || len(models) != 1 {
+			t.Fatalf("Failed to parse: %v", err)
+		}
+
+		model := models[0]
+		if model.Details == nil {
+			t.Fatal("Expected details to be parsed")
+		}
+
+		tests := map[string]string{
+			"parameter_size":     "7B",
+			"quantization_level": "Q4_K_M",
+			"family":             "llama",
+			"format":             "gguf",
+		}
+
+		for field, expected := range tests {
+			var actual *string
+			switch field {
+			case "parameter_size":
+				actual = model.Details.ParameterSize
+			case "quantization_level":
+				actual = model.Details.QuantizationLevel
+			case "family":
+				actual = model.Details.Family
+			case "format":
+				actual = model.Details.Format
+			}
+
+			if actual == nil || *actual != expected {
+				t.Errorf("Expected %s to be %q, got %v", field, expected, actual)
+			}
+		}
+
+		if len(model.Details.Families) != 2 {
+			t.Errorf("Expected 2 families, got %d", len(model.Details.Families))
+		}
+	})
+
+	// Test LM Studio flat structure parsing
+	t.Run("LM Studio flat structure", func(t *testing.T) {
+		profile := getTestProfile(t, domain.ProfileLmStudio)
+		responseBody := []byte(`{
+			"data": [{
+				"id": "test-model",
+				"arch": "qwen2_vl",
+				"quantization": "4bit",
+				"compatibility_type": "mlx",
+				"max_context_length": 32768,
+				"state": "loaded"
+			}]
+		}`)
+
+		models, err := profile.ParseModelsResponse(responseBody)
+
+		if err != nil || len(models) != 1 {
+			t.Fatalf("Failed to parse: %v", err)
+		}
+
+		model := models[0]
+		if model.Details == nil {
+			t.Fatal("Expected details to be parsed")
+		}
+
+		if model.Details.Family == nil || *model.Details.Family != "qwen2_vl" {
+			t.Error("Expected family to be mapped from arch")
+		}
+
+		// Check that Families field is populated correctly
+		if model.Details.Families == nil || len(model.Details.Families) != 1 {
+			t.Error("Expected Families array to be populated with one entry")
+		} else if model.Details.Families[0] != "qwen2_vl" {
+			t.Errorf("Expected Families[0] to be 'qwen2_vl', got %s", model.Details.Families[0])
+		}
+
+		if model.Details.QuantizationLevel == nil || *model.Details.QuantizationLevel != "4bit" {
+			t.Error("Expected quantization_level to be mapped from quantization")
+		}
+
+		if model.Details.Format == nil || *model.Details.Format != "mlx" {
+			t.Error("Expected format to be mapped from compatibility_type")
+		}
+
+		if *model.Details.MaxContextLength != 32768 {
+			t.Error("Expected MaxConnectionLength to contain context length")
+		}
+
+		if !strings.Contains(*model.Details.State, "loaded") {
+			t.Error("Expected State to be 'loaded'")
+		}
+	})
+
+	// Test specifically for LM Studio Families field population
+	t.Run("LM Studio Families field population", func(t *testing.T) {
+		profile := getTestProfile(t, domain.ProfileLmStudio)
+
+		// Test with multiple models with different architectures
+		responseBody := []byte(`{
+			"data": [
+				{
+					"id": "llama-model",
+					"object": "model",
+					"arch": "llama",
+					"quantization": "Q4_K_M"
+				},
+				{
+					"id": "mistral-model",
+					"object": "model",
+					"arch": "mistral",
+					"quantization": "Q5_K_M"
+				},
+				{
+					"id": "phi-model",
+					"object": "model",
+					"arch": "phi",
+					"quantization": "Q8_0"
+				}
+			]
+		}`)
+
+		models, err := profile.ParseModelsResponse(responseBody)
+		if err != nil {
+			t.Fatalf("Failed to parse: %v", err)
+		}
+
+		if len(models) != 3 {
+			t.Fatalf("Expected 3 models, got %d", len(models))
+		}
+
+		// Check each model has both Family and Families fields populated correctly
+		expectedArchs := map[string]string{
+			"llama-model":   "llama",
+			"mistral-model": "mistral",
+			"phi-model":     "phi",
+		}
+
+		for _, model := range models {
+			expectedArch := expectedArchs[model.Name]
+
+			// Check Family field
+			if model.Details == nil {
+				t.Errorf("Model %s: Details field is nil", model.Name)
