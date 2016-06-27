@@ -35,3 +35,77 @@ func TestPerformTimedRead_NoGoroutineLeak_Stress(t *testing.T) {
 	for range 50 {
 		ctx := context.Background()
 
+		// Use a reader that delays then returns data
+		reader := &delayedReader{delay: 150 * time.Millisecond} // Longer than read timeout
+
+		// Create a new buffer for each iteration to avoid race
+		localBuffer := make([]byte, 1024)
+
+		// This should timeout after 100ms
+		result, err := s.performTimedRead(ctx, reader, localBuffer, 100*time.Millisecond, state, logger)
+		if err == nil && result != nil {
+			t.Fatal("Expected timeout but got result")
+		}
+	}
+
+	// Also test context cancellation with non-blocking reader
+	for range 50 {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		// Use a reader that returns data immediately
+		reader := strings.NewReader("test data")
+
+		// Create a new buffer for each iteration to avoid race
+		localBuffer := make([]byte, 1024)
+
+		// Cancel context immediately
+		cancel()
+
+		// This should return nil due to context cancellation
+		s.performTimedRead(ctx, reader, localBuffer, 100*time.Millisecond, state, logger)
+	}
+
+	// Give goroutines time to exit
+	time.Sleep(100 * time.Millisecond)
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+
+	// Check goroutine count
+	finalGoroutines := runtime.NumGoroutine()
+	leaked := finalGoroutines - initialGoroutines
+
+	if leaked > 2 { // Allow small variance
+		t.Errorf("Goroutine leak detected: initial=%d, final=%d, leaked=%d",
+			initialGoroutines, finalGoroutines, leaked)
+	}
+
+	t.Logf("STRESS TEST completed - tested 100 timeout scenarios sequentially")
+}
+
+// TestPerformTimedRead_ConcurrentStress tests many concurrent reads
+func TestPerformTimedRead_ConcurrentStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping concurrent stress test in short mode")
+	}
+	// Get initial goroutine count
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	initialGoroutines := runtime.NumGoroutine()
+
+	s := &Service{
+		configuration: func() *Configuration {
+			c := &Configuration{}
+			c.ReadTimeout = 50 * time.Millisecond
+			return c
+		}(),
+	}
+
+	logger := createTestLogger()
+
+	// Run MANY concurrent reads
+	var wg sync.WaitGroup
+	const numConcurrent = 100
+
+	for i := range numConcurrent {
+		wg.Add(1)
+		go func(idx int) {
