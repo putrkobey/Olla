@@ -17,13 +17,3 @@ type ThrottleSet struct {
 // Track registers t and returns it, so construction and registration read as one step.
 func (s *ThrottleSet) Track(t *Throttle) *Throttle {
 	if s == nil || t == nil {
-		return t
-	}
-	s.mu.Lock()
-	s.throttles = append(s.throttles, t)
-	s.mu.Unlock()
-	return t
-}
-
-// Flush reports every tracked throttle's pending summaries.
-func (s *ThrottleSet) Flush() {
