@@ -608,3 +608,206 @@ func BenchmarkBodyInspector_LargeBody(b *testing.B) {
 		messages[i] = `{"role": "user", "content": "This is a test message"}`
 	}
 	body := `{"model": "gpt-4", "messages": [` + strings.Join(messages, ",") + `]}`
+
+	b.ResetTimer()
+	for range b.N {
+		req := &http.Request{
+			Body:          io.NopCloser(bytes.NewReader([]byte(body))),
+			Header:        make(http.Header),
+			ContentLength: int64(len(body)),
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		profile := domain.NewRequestProfile("/v1/chat/completions")
+
+		inspectErr := inspector.Inspect(ctx, req, profile)
+		if inspectErr != nil {
+			b.Fatal(inspectErr)
+		}
+	}
+}
+
+// mockStyledLogger is a simple mock implementation of StyledLogger for testing
+type mockStyledLogger struct {
+	underlying *slog.Logger
+}
+
+func (m *mockStyledLogger) Debug(msg string, args ...any)                                {}
+func (m *mockStyledLogger) Info(msg string, args ...any)                                 {}
+func (m *mockStyledLogger) Warn(msg string, args ...any)                                 {}
+func (m *mockStyledLogger) Error(msg string, args ...any)                                {}
+func (m *mockStyledLogger) ResetLine()                                                   {}
+func (m *mockStyledLogger) InfoWithStatus(msg string, status string, args ...any)        {}
+func (m *mockStyledLogger) InfoWithCount(msg string, count int, args ...any)             {}
+func (m *mockStyledLogger) InfoWithEndpoint(msg string, endpoint string, args ...any)    {}
+func (m *mockStyledLogger) InfoWithHealthCheck(msg string, endpoint string, args ...any) {}
+func (m *mockStyledLogger) InfoWithNumbers(msg string, numbers ...int64)                 {}
+func (m *mockStyledLogger) WarnWithEndpoint(msg string, endpoint string, args ...any)    {}
+func (m *mockStyledLogger) ErrorWithEndpoint(msg string, endpoint string, args ...any)   {}
+func (m *mockStyledLogger) InfoHealthy(msg string, endpoint string, args ...any)         {}
+func (m *mockStyledLogger) InfoHealthStatus(msg string, name string, status domain.EndpointStatus, args ...any) {
+}
+func (m *mockStyledLogger) GetUnderlying() *slog.Logger                                         { return m.underlying }
+func (m *mockStyledLogger) WithRequestID(requestID string) logger.StyledLogger                  { return m }
+func (m *mockStyledLogger) WithPrefix(prefix string) logger.StyledLogger                        { return m }
+func (m *mockStyledLogger) WithAttrs(attrs ...slog.Attr) logger.StyledLogger                    { return m }
+func (m *mockStyledLogger) With(args ...any) logger.StyledLogger                                { return m }
+func (m *mockStyledLogger) InfoWithContext(msg string, endpoint string, ctx logger.LogContext)  {}
+func (m *mockStyledLogger) WarnWithContext(msg string, endpoint string, ctx logger.LogContext)  {}
+func (m *mockStyledLogger) ErrorWithContext(msg string, endpoint string, ctx logger.LogContext) {}
+func (m *mockStyledLogger) InfoConfigChange(oldName, newName string)                            {}
+
+// The path inspector runs first and may already have set what the path implies;
+// a body that detects its own capabilities must not erase them. For rerank and
+// classification the path is the stronger signal: their bodies carry `input`,
+// which the body detector reads as embeddings, and no model does both.
+func TestBodyInspector_PathCapabilitiesVersusBody(t *testing.T) {
+	t.Parallel()
+
+	log, _, err := logger.New(&logger.Config{Level: "debug", PrettyLogs: false})
+	require.NoError(t, err)
+	inspector, err := NewBodyInspector(&mockStyledLogger{underlying: log})
+	require.NoError(t, err)
+
+	tests := []struct {
+		name           string
+		prior          *domain.ModelCapabilities
+		body           string
+		wantRerank     bool
+		wantClassify   bool
+		wantEmbeddings bool
+		wantFunctions  bool
+	}{
+		{"rerank path beats body input", &domain.ModelCapabilities{Rerank: true}, `{"input":"hello"}`, true, false, false, false},
+		{"classification path beats body input", &domain.ModelCapabilities{Classification: true}, `{"input":"hello"}`, false, true, false, false},
+		{"rerank path still merges function calling", &domain.ModelCapabilities{Rerank: true}, `{"input":"hello","tools":[{"type":"function"}]}`, true, false, false, true},
+		{"embed path keeps embeddings", &domain.ModelCapabilities{Embeddings: true}, `{"input":"hello"}`, false, false, true, false},
+		{"embed path merges function calling", &domain.ModelCapabilities{Embeddings: true}, `{"tools":[{"type":"function"}]}`, false, false, true, true},
+		{"no path capability uses body embeddings", nil, `{"input":"hello"}`, false, false, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reqProfile := domain.NewRequestProfile("/x")
+			reqProfile.ModelCapabilities = tt.prior
+
+			req, err := http.NewRequest(http.MethodPost, "/x", strings.NewReader(tt.body))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			require.NoError(t, inspector.Inspect(context.Background(), req, reqProfile))
+
+			require.NotNil(t, reqProfile.ModelCapabilities)
+			assert.Equal(t, tt.wantRerank, reqProfile.ModelCapabilities.Rerank, "rerank")
+			assert.Equal(t, tt.wantClassify, reqProfile.ModelCapabilities.Classification, "classification")
+			assert.Equal(t, tt.wantEmbeddings, reqProfile.ModelCapabilities.Embeddings, "embeddings")
+			assert.Equal(t, tt.wantFunctions, reqProfile.ModelCapabilities.FunctionCalling, "function calling")
+		})
+	}
+}
+
+func TestBodyInspector_BodyDecidesNotContentType(t *testing.T) {
+	t.Parallel()
+	log, _, err := logger.New(&logger.Config{Level: "debug", PrettyLogs: false})
+	require.NoError(t, err)
+	styledLog := &mockStyledLogger{underlying: log}
+
+	const embedBody = `{"model":"nomic-embed-text","input":"hi"}`
+	bigPad := strings.Repeat("A", MaxBodySize+1000)
+	lateModelBig := `{"messages":[{"content":"` + bigPad + `"}],"model":"late-model"}`
+	earlyModelBig := `{"model":"early-model","messages":[{"content":"` + bigPad + `"}]}`
+
+	tests := []struct {
+		name         string
+		body         string
+		contentType  string
+		encoding     string
+		unknownLen   bool
+		wantModel    string
+		wantEmbed    bool
+		wantUntouch  bool // body must not be interpreted at all
+		skipCapCheck bool
+	}{
+		{name: "form-urlencoded (curl default)", body: embedBody, contentType: "application/x-www-form-urlencoded", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "text/plain", body: embedBody, contentType: "text/plain", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "text/plain charset", body: embedBody, contentType: "text/plain;charset=UTF-8", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "vnd.api+json", body: embedBody, contentType: "application/vnd.api+json", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "ld+json", body: embedBody, contentType: "application/ld+json", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "x-ndjson", body: embedBody, contentType: "application/x-ndjson", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "octet-stream", body: embedBody, contentType: "application/octet-stream", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "missing header", body: embedBody, contentType: "", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "uppercase JSON", body: embedBody, contentType: "APPLICATION/JSON", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "json with charset", body: embedBody, contentType: "application/json; charset=utf-8", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "leading whitespace", body: "  \r\n\t" + embedBody, contentType: "text/plain", wantModel: "nomic-embed-text", wantEmbed: true},
+
+		{name: "multipart with model field", body: "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper\r\n--b--\r\n", contentType: "multipart/form-data; boundary=b", wantUntouch: true},
+		{name: "multipart even if body looks like JSON", body: embedBody, contentType: "multipart/form-data; boundary=b", wantUntouch: true},
+		{name: "gzip body", body: "\x1f\x8b\x08\x00binary", contentType: "application/json", encoding: "gzip", wantUntouch: true},
+		{name: "encoded header on JSON-looking body", body: embedBody, contentType: "application/json", encoding: "gzip", wantUntouch: true},
+		{name: "identity encoding is no encoding", body: embedBody, contentType: "application/json", encoding: "identity", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "identity encoding, padded and mixed case", body: embedBody, contentType: "application/json", encoding: "  Identity ", wantModel: "nomic-embed-text", wantEmbed: true},
+		{name: "br body", body: embedBody, contentType: "application/json", encoding: "br", wantUntouch: true},
+		{name: "encoding list with identity is still encoded", body: embedBody, contentType: "application/json", encoding: "gzip, identity", wantUntouch: true},
+		{name: "real form body", body: "model=nomic-embed-text&input=hi", contentType: "application/x-www-form-urlencoded", wantUntouch: true},
+		{name: "binary body", body: "\x00\x01\x02model\xff", contentType: "application/octet-stream", wantUntouch: true},
+		{name: "array body", body: `[{"model":"x"}]`, contentType: "application/json", wantUntouch: true},
+		{name: "whitespace only", body: "   \n  ", contentType: "text/plain", wantUntouch: true},
+
+		{name: "large body, early model, text/plain", body: earlyModelBig, contentType: "text/plain", wantModel: "early-model", skipCapCheck: true},
+		{name: "large body, late model, form-urlencoded", body: lateModelBig, contentType: "application/x-www-form-urlencoded", wantModel: "late-model", skipCapCheck: true},
+		{name: "small chunked body keeps capability detection", body: embedBody, contentType: "text/plain", unknownLen: true, wantModel: "nomic-embed-text", wantEmbed: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			bi, err := NewBodyInspector(styledLog)
+			require.NoError(t, err)
+
+			req := &http.Request{
+				Body:          io.NopCloser(strings.NewReader(tt.body)),
+				Header:        make(http.Header),
+				ContentLength: int64(len(tt.body)),
+			}
+			if tt.unknownLen {
+				req.ContentLength = -1
+			}
+			if tt.contentType != "" {
+				req.Header.Set("Content-Type", tt.contentType)
+			}
+			if tt.encoding != "" {
+				req.Header.Set("Content-Encoding", tt.encoding)
+			}
+			profile := domain.NewRequestProfile("/v1/embeddings")
+
+			require.NoError(t, bi.Inspect(context.Background(), req, profile))
+
+			if tt.wantUntouch {
+				assert.Empty(t, profile.ModelName)
+				assert.Nil(t, profile.ModelCapabilities)
+			} else {
+				assert.Equal(t, tt.wantModel, profile.ModelName)
+				if !tt.skipCapCheck {
+					require.NotNil(t, profile.ModelCapabilities)
+					assert.Equal(t, tt.wantEmbed, profile.ModelCapabilities.Embeddings)
+				}
+			}
+
+			got, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			assert.True(t, tt.body == string(got), "body must be restored byte-for-byte (len want %d got %d)", len(tt.body), len(got))
+		})
+	}
+}
+
+func TestBodyInspector_CloseReachesOriginalBody(t *testing.T) {
+	t.Parallel()
+	log, _, err := logger.New(&logger.Config{Level: "debug", PrettyLogs: false})
+	require.NoError(t, err)
+	bi, err := NewBodyInspector(&mockStyledLogger{underlying: log})
+	require.NoError(t, err)
+
+	for _, body := range []string{`{"model":"m"}`, "not json", ""} {
+		closer := &closeTracker{Reader: strings.NewReader(body)}
+		req := &http.Request{Body: closer, Header: make(http.Header), ContentLength: int64(len(body)) + 1}
+		require.NoError(t, bi.Inspect(context.Background(), req, domain.NewRequestProfile("/x")))
+		require.NoError(t, req.Body.Close())
