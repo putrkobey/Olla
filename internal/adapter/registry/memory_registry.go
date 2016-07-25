@@ -243,3 +243,125 @@ func (r *MemoryModelRegistry) exactEndpoints(modelName string) []string {
 	var endpoints []string
 	endpointSet.Range(func(endpoint string, _ struct{}) bool {
 		endpoints = append(endpoints, endpoint)
+		return true
+	})
+	return endpoints
+}
+
+func (r *MemoryModelRegistry) defaultTagEndpoints(modelName string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.ollamaDefaultTagEndpoints(modelName)
+}
+
+// RegisterModelsWithEndpoint registers models and remembers the endpoint's type,
+// which the base registry otherwise never sees, so the Ollama default-tag rule can
+// be scoped to Ollama-sourced models.
+func (r *MemoryModelRegistry) RegisterModelsWithEndpoint(ctx context.Context, endpoint *domain.Endpoint, models []*domain.ModelInfo) error {
+	r.noteEndpointType(endpoint)
+	return r.RegisterModels(ctx, endpoint.GetURLString(), models)
+}
+
+func (r *MemoryModelRegistry) noteEndpointType(endpoint *domain.Endpoint) {
+	if endpoint == nil || endpoint.GetURLString() == "" {
+		return
+	}
+	if endpoint.Type == domain.ProfileOllama {
+		r.ollamaEndpoints.Store(endpoint.GetURLString(), struct{}{})
+		return
+	}
+	r.ollamaEndpoints.Delete(endpoint.GetURLString())
+}
+
+// ollamaDefaultTagEndpoints answers a name without a tag from Ollama-sourced
+// "name:latest" entries. Callers have already missed the exact lookup, so a model
+// that really is called "name" is never shadowed. Scoping to Ollama endpoints
+// matters: a vLLM host serving "name:latest" has not been asked for "name" and
+// would be sent a name it does not know. Callers hold r.mu.
+func (r *MemoryModelRegistry) ollamaDefaultTagEndpoints(modelName string) []string {
+	tagged, ok := domain.OllamaDefaultTagName(modelName)
+	if !ok {
+		return []string{}
+	}
+	endpointSet, ok := r.modelToEndpoints.Load(tagged)
+	if !ok {
+		return []string{}
+	}
+	endpoints := []string{}
+	endpointSet.Range(func(endpoint string, _ struct{}) bool {
+		if _, isOllama := r.ollamaEndpoints.Load(endpoint); isOllama {
+			endpoints = append(endpoints, endpoint)
+		}
+		return true
+	})
+	return endpoints
+}
+
+// CanonicalModelName returns the native name a request for name resolves to, so
+// stats and sticky keys for "foo" and "foo:latest" land together. It differs from
+// name only when the exact lookup misses and an Ollama host serves "name:latest".
+// Forwarded request bodies are never rewritten with it.
+func (r *MemoryModelRegistry) CanonicalModelName(name string) string {
+	tagged, ok := domain.OllamaDefaultTagName(name)
+	if !ok {
+		return name
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if _, exact := r.modelToEndpoints.Load(name); exact {
+		return name
+	}
+	if len(r.ollamaDefaultTagEndpoints(name)) > 0 {
+		return tagged
+	}
+	return name
+}
+
+func (r *MemoryModelRegistry) IsModelAvailable(ctx context.Context, modelName string) bool {
+	if modelName == "" {
+		return false
+	}
+
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	endpointSet, ok := r.modelToEndpoints.Load(modelName)
+	if !ok {
+		return len(r.ollamaDefaultTagEndpoints(modelName)) > 0
+	}
+
+	// Check if the set has any endpoints
+	hasEndpoints := false
+	endpointSet.Range(func(_ string, _ struct{}) bool {
+		hasEndpoints = true
+		return false // Stop after first item
+	})
+
+	return hasEndpoints
+}
+
+func (r *MemoryModelRegistry) GetAllModels(ctx context.Context) (map[string][]*domain.ModelInfo, error) {
+	select {
+	case <-ctx.Done():
+		return nil, domain.NewModelRegistryError("get_all_models", "", "", ctx.Err())
+	default:
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make(map[string][]*domain.ModelInfo)
+	r.endpointModels.Range(func(endpointURL string, endpointData *domain.EndpointModels) bool {
+		models := make([]*domain.ModelInfo, len(endpointData.Models))
+		for i, model := range endpointData.Models {
+			models[i] = &domain.ModelInfo{
+				Name:        model.Name,
+				Size:        model.Size,

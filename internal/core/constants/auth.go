@@ -16,3 +16,12 @@ const (
 
 	// AuthDefaultAPIKeyHeader is the fallback header name when an api_key auth
 	// block omits the optional header field.
+	AuthDefaultAPIKeyHeader = "X-Api-Key" //nolint:gosec // false positive: this is a header name, not a credential
+)
+
+// Auth scheme prefixes. Note the trailing space; these are prepended to the
+// credential value when building the final Authorization header.
+const (
+	AuthSchemeBearer = "Bearer "
+	AuthSchemeBasic  = "Basic "
+)
