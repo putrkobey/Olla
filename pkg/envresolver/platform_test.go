@@ -1,0 +1,3 @@
+package envresolver
+
+import "runtime"
