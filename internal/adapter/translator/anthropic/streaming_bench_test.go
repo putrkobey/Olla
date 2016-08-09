@@ -93,3 +93,50 @@ func BenchmarkStreaming_ThinkingDeltas(b *testing.B) {
 		rec := httptest.NewRecorder()
 		b.StartTimer()
 
+		if err := tr.TransformStreamingResponse(ctx, stream, rec, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkStreaming_ToolArgDeltas measures allocations on the input_json_delta hot path.
+// Run with: go test -bench=BenchmarkStreaming_ToolArgDeltas -benchmem -count=5
+func BenchmarkStreaming_ToolArgDeltas(b *testing.B) {
+	const chunks = 50
+
+	tr := newTestTranslator()
+	ctx := context.Background()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		b.StopTimer()
+		stream := buildToolStream(chunks)
+		rec := httptest.NewRecorder()
+		b.StartTimer()
+
+		if err := tr.TransformStreamingResponse(ctx, stream, rec, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkWriteEvent_TextDelta isolates the writeEvent + JSON encode path for a single
+// text_delta event. This directly measures the allocation savings from the pooled buffer
+// and typed struct, independent of the incoming OpenAI chunk parse overhead.
+// Run with: go test -bench=BenchmarkWriteEvent -benchmem -count=5
+func BenchmarkWriteEvent_TextDelta(b *testing.B) {
+	tr := newTestTranslator()
+	rec := httptest.NewRecorder()
+	evt := sseDeltaEvent{
+		Delta: sseTextDelta{Text: "hello world", Type: "text_delta"},
+		Index: 0,
+		Type:  "content_block_delta",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for range b.N {
+		rec.Body.Reset()
