@@ -26,32 +26,3 @@ func (s *ProxyStats) RecordSuccess(latency int64) {
 		oldMin := atomic.LoadInt64(&s.MinLatency)
 		if oldMin != 0 && oldMin <= latency {
 			break
-		}
-		if atomic.CompareAndSwapInt64(&s.MinLatency, oldMin, latency) {
-			break
-		}
-	}
-
-	// Update max latency
-	for {
-		oldMax := atomic.LoadInt64(&s.MaxLatency)
-		if oldMax >= latency {
-			break
-		}
-		if atomic.CompareAndSwapInt64(&s.MaxLatency, oldMax, latency) {
-			break
-		}
-	}
-}
-
-// RecordFailure records a failed proxy request
-func (s *ProxyStats) RecordFailure() {
-	atomic.AddInt64(&s.FailedRequests, 1)
-}
-
-// GetStats returns current statistics
-func (s *ProxyStats) GetStats() ports.ProxyStats {
-	total := atomic.LoadInt64(&s.TotalRequests)
-	successful := atomic.LoadInt64(&s.SuccessfulRequests)
-	failed := atomic.LoadInt64(&s.FailedRequests)
-	totalLatency := atomic.LoadInt64(&s.TotalLatency)

@@ -8,8 +8,3 @@ PROXY_PROFILES=("auto" "standard" "streaming")
 echo "Starting test matrix..."
 
 total=$((${#PROXY_ENGINES[@]} * ${#PROXY_PROFILES[@]}))
-current=0
-
-for engine in "${PROXY_ENGINES[@]}"; do
-    for profile in "${PROXY_PROFILES[@]}"; do
-        current=$((current + 1))
