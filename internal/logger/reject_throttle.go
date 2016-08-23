@@ -9,3 +9,9 @@ import "time"
 // layers share a message ("Request rejected" is written by both the size limit and the proxy
 // handler) and run separate windows, so without it two summary lines read as one. now is nil
 // outside tests.
+func NewRejectThrottle(log StyledLogger, msg, layer, keyAttr string, now func() time.Time) *Throttle {
+	return NewThrottle(ThrottleConfig{
+		Now: now,
+		OnSummary: func(key string, suppressed int, window time.Duration) {
+			log.Warn(msg+", repeats suppressed",
+				"layer", layer,

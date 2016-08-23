@@ -152,3 +152,81 @@ func TestStreaming_Reasoning_NoReasoningUnchanged(t *testing.T) {
 }
 
 // TestStreaming_Reasoning_BlockOrderExactSequence pins the full SSE event sequence
+// for reasoning + content to ensure the thinking block is fully closed before
+// the text block opens (Anthropic spec requirement).
+func TestStreaming_Reasoning_BlockOrderExactSequence(t *testing.T) {
+	t.Parallel()
+	tr := newTestTranslator()
+
+	stream := mockOpenAIStream([]string{
+		reasoningChunk("chatcmpl-seq", "deepseek-r1", "thinking..."),
+		textChunk("chatcmpl-seq", "", "answer"),
+		finishChunk("chatcmpl-seq", "stop"),
+		doneChunk(),
+	})
+
+	recorder := httptest.NewRecorder()
+	require.NoError(t, tr.TransformStreamingResponse(context.Background(), stream, recorder, nil))
+	events := parseAnthropicEvents(t, recorder.Body.String())
+
+	assertEventSequence(t, events, []string{
+		"message_start",
+		"content_block_start", // index 0, thinking
+		"content_block_delta", // thinking_delta
+		"content_block_stop",  // index 0 — thinking closed before text opens
+		"content_block_start", // index 1, text
+		"content_block_delta", // text_delta
+		"content_block_stop",  // index 1
+		"message_delta",
+		"message_stop",
+	})
+
+	// verify indices
+	starts := findEventsByType(events, "content_block_start")
+	idx0, _ := getContentBlockIndex(starts[0])
+	assert.Equal(t, 0, idx0)
+	idx1, _ := getContentBlockIndex(starts[1])
+	assert.Equal(t, 1, idx1)
+}
+
+// TestStreaming_Reasoning_MultipleChunksAccumulated verifies that multiple reasoning
+// chunks produce separate thinking_delta events (one per chunk) rather than being
+// collapsed, preserving the streaming semantics.
+func TestStreaming_Reasoning_MultipleChunksAccumulated(t *testing.T) {
+	t.Parallel()
+	tr := newTestTranslator()
+
+	stream := mockOpenAIStream([]string{
+		reasoningChunk("chatcmpl-multi", "deepseek-r1", "chunk1"),
+		reasoningChunk("chatcmpl-multi", "", "chunk2"),
+		reasoningChunk("chatcmpl-multi", "", "chunk3"),
+		textChunk("chatcmpl-multi", "", "result"),
+		finishChunk("chatcmpl-multi", "stop"),
+		doneChunk(),
+	})
+
+	recorder := httptest.NewRecorder()
+	require.NoError(t, tr.TransformStreamingResponse(context.Background(), stream, recorder, nil))
+
+	body := recorder.Body.String()
+	events := parseAnthropicEvents(t, body)
+
+	// three thinking_delta events (one per chunk), one text_delta
+	deltas := findEventsByType(events, "content_block_delta")
+	thinkingDeltas := 0
+	textDeltas := 0
+	for _, d := range deltas {
+		delta, ok := d["delta"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch delta["type"] {
+		case "thinking_delta":
+			thinkingDeltas++
+		case "text_delta":
+			textDeltas++
+		}
+	}
+	assert.Equal(t, 3, thinkingDeltas, "one thinking_delta per reasoning chunk")
+	assert.Equal(t, 1, textDeltas, "one text_delta for content")
+
