@@ -208,3 +208,108 @@ func TestPrioritySelector_ConnectionTracking(t *testing.T) {
 	selector.DecrementConnections(endpoint)
 	connectionStats = mockCollector.GetConnectionStats()
 	count = connectionStats[endpoint.URL.String()]
+	if count != 0 {
+		t.Errorf("Expected 0 connections, got %d", count)
+	}
+}
+
+func TestPrioritySelector_DecrementBelowZero(t *testing.T) {
+	mockCollector := NewTestStatsCollector()
+	selector := NewPrioritySelector(mockCollector)
+	endpoint := createPriorityEndpoint("test", 11434, domain.StatusHealthy, 100)
+
+	selector.DecrementConnections(endpoint)
+
+	connectionStats := mockCollector.GetConnectionStats()
+	count := connectionStats[endpoint.URL.String()]
+	if count != 0 {
+		t.Errorf("Expected 0 connections after decrement below zero, got %d", count)
+	}
+}
+func TestPrioritySelector_GetConnectionStats(t *testing.T) {
+	selector := NewPrioritySelector(NewTestStatsCollector())
+
+	endpoints := []*domain.Endpoint{
+		createPriorityEndpoint("endpoint-1", 11434, domain.StatusHealthy, 100),
+		createPriorityEndpoint("endpoint-2", 11435, domain.StatusHealthy, 200),
+	}
+
+	selector.IncrementConnections(endpoints[0])
+	selector.IncrementConnections(endpoints[0])
+	selector.IncrementConnections(endpoints[1])
+
+	stats := selector.statsCollector.GetConnectionStats()
+	if len(stats) != 2 {
+		t.Errorf("Expected 2 entries in stats, got %d", len(stats))
+	}
+
+	url1 := endpoints[0].URL.String()
+	url2 := endpoints[1].URL.String()
+
+	if stats[url1] != 2 {
+		t.Errorf("Expected 2 connections for endpoint-1, got %d", stats[url1])
+	}
+	if stats[url2] != 1 {
+		t.Errorf("Expected 1 connection for endpoint-2, got %d", stats[url2])
+	}
+}
+
+func TestPrioritySelector_WeightedSelect_ZeroWeight(t *testing.T) {
+	selector := NewPrioritySelector(NewTestStatsCollector())
+	ctx := context.Background()
+
+	// All endpoints have zero weight (emulating an offline status)
+	endpoints := []*domain.Endpoint{
+		createPriorityEndpoint("offline-1", 11434, domain.StatusOffline, 100),
+		createPriorityEndpoint("offline-2", 11435, domain.StatusOffline, 100),
+	}
+
+	// Should still work, but fallback to random selection
+	// We just verify no panic or error occurs
+	for range 10 {
+		_, err := selector.Select(ctx, endpoints)
+		if err == nil {
+			t.Error("Expected error for offline endpoints")
+		}
+	}
+}
+
+func TestPrioritySelector_WeightedSelect_SingleEndpointSamePriority(t *testing.T) {
+	selector := NewPrioritySelector(NewTestStatsCollector())
+	ctx := context.Background()
+
+	endpoints := []*domain.Endpoint{
+		createPriorityEndpoint("single", 11434, domain.StatusHealthy, 100),
+	}
+
+	for range 10 {
+		endpoint, err := selector.Select(ctx, endpoints)
+		if err != nil {
+			t.Fatalf("Select failed: %v", err)
+		}
+		if endpoint.Name != "single" {
+			t.Errorf("Expected 'single', got %s", endpoint.Name)
+		}
+	}
+}
+
+func TestPrioritySelector_ConcurrentAccess(t *testing.T) {
+	selector := NewPrioritySelector(NewTestStatsCollector())
+	ctx := context.Background()
+
+	endpoints := []*domain.Endpoint{
+		createPriorityEndpoint("endpoint-1", 11434, domain.StatusHealthy, 200),
+		createPriorityEndpoint("endpoint-2", 11435, domain.StatusHealthy, 100),
+		createPriorityEndpoint("endpoint-3", 11436, domain.StatusBusy, 200),
+	}
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 100)
+
+	// probably a bit lame way to test concurrency
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				_, err := selector.Select(ctx, endpoints)
