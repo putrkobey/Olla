@@ -844,3 +844,285 @@ func TestConvertToolUse_InvalidData(t *testing.T) {
 		}
 		result := translator.convertToolUse(block)
 		assert.Nil(t, result)
+	})
+
+	t.Run("nil_input", func(t *testing.T) {
+		block := map[string]interface{}{
+			"type": "tool_use",
+			"id":   "tool_123",
+			"name": "get_weather",
+			// input is nil/missing
+		}
+		result := translator.convertToolUse(block)
+		require.NotNil(t, result)
+		function := result["function"].(map[string]interface{})
+		assert.Equal(t, "null", function["arguments"])
+	})
+}
+
+func TestTransformRequest_NoMessages(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	anthropicReq := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		Messages:  []AnthropicMessage{},
+	}
+
+	body, err := json.Marshal(anthropicReq)
+	require.NoError(t, err)
+
+	req := &http.Request{
+		Body: io.NopCloser(bytes.NewReader(body)),
+	}
+
+	_, err = translator.TransformRequest(context.Background(), req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least one message is required")
+}
+
+func TestTransformRequest_ToolChoiceObjectForm(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	anthropicReq := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: "What's the weather?",
+			},
+		},
+		Tools: []AnthropicTool{
+			{
+				Name:        "get_weather",
+				Description: "Get weather",
+				InputSchema: map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		},
+		ToolChoice: map[string]interface{}{
+			"type": "tool",
+			"name": "get_weather",
+		},
+	}
+
+	body, err := json.Marshal(anthropicReq)
+	require.NoError(t, err)
+
+	req := &http.Request{
+		Body: io.NopCloser(bytes.NewReader(body)),
+	}
+
+	result, err := translator.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	toolChoice, ok := result.OpenAIRequest["tool_choice"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "function", toolChoice["type"])
+
+	function, ok := toolChoice["function"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "get_weather", function["name"])
+}
+
+func TestTransformRequest_MixedTextAndToolResults(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	anthropicReq := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		Messages: []AnthropicMessage{
+			{
+				Role: "user",
+				Content: []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": "Here's the result:",
+					},
+					map[string]interface{}{
+						"type":        "tool_result",
+						"tool_use_id": "tool_mixed",
+						"content":     "Data from tool",
+					},
+				},
+			},
+		},
+	}
+
+	body, err := json.Marshal(anthropicReq)
+	require.NoError(t, err)
+
+	req := &http.Request{
+		Body: io.NopCloser(bytes.NewReader(body)),
+	}
+
+	result, err := translator.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	messages, ok := result.OpenAIRequest["messages"].([]map[string]interface{})
+	require.True(t, ok)
+	require.Len(t, messages, 2)
+
+	// tool messages must come before the user text so they sit immediately after
+	// the assistant tool_calls message; OpenAI-compatible backends reject any
+	// other role between them.
+	assert.Equal(t, "tool", messages[0]["role"])
+	assert.Equal(t, "tool_mixed", messages[0]["tool_call_id"])
+	assert.Equal(t, "Data from tool", messages[0]["content"])
+
+	assert.Equal(t, "user", messages[1]["role"])
+	assert.Equal(t, "Here's the result:", messages[1]["content"])
+}
+
+func TestConvertSystemPrompt_AllFormats(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	t.Run("string_format", func(t *testing.T) {
+		result := translator.convertSystemPrompt("You are a helpful assistant")
+		assert.Equal(t, "You are a helpful assistant", result)
+	})
+
+	t.Run("empty_string", func(t *testing.T) {
+		result := translator.convertSystemPrompt("")
+		assert.Nil(t, result)
+	})
+
+	t.Run("interface_array_format", func(t *testing.T) {
+		systemBlocks := []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "First part. ",
+			},
+			map[string]interface{}{
+				"type": "text",
+				"text": "Second part.",
+			},
+		}
+		result := translator.convertSystemPrompt(systemBlocks)
+		assert.Equal(t, "First part. Second part.", result)
+	})
+
+	t.Run("interface_array_with_empty_blocks", func(t *testing.T) {
+		systemBlocks := []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "",
+			},
+		}
+		result := translator.convertSystemPrompt(systemBlocks)
+		assert.Nil(t, result)
+	})
+
+	t.Run("strongly_typed_contentblock_array", func(t *testing.T) {
+		contentBlocks := []ContentBlock{
+			{
+				Type: "text",
+				Text: "Strongly-typed first part. ",
+			},
+			{
+				Type: "text",
+				Text: "Strongly-typed second part.",
+			},
+		}
+		result := translator.convertSystemPrompt(contentBlocks)
+		assert.Equal(t, "Strongly-typed first part. Strongly-typed second part.", result)
+	})
+
+	t.Run("strongly_typed_contentblock_with_empty_text", func(t *testing.T) {
+		contentBlocks := []ContentBlock{
+			{
+				Type: "text",
+				Text: "",
+			},
+		}
+		result := translator.convertSystemPrompt(contentBlocks)
+		assert.Nil(t, result)
+	})
+
+	t.Run("strongly_typed_contentblock_mixed_types", func(t *testing.T) {
+		contentBlocks := []ContentBlock{
+			{
+				Type: "image",
+				Text: "",
+			},
+			{
+				Type: "text",
+				Text: "Valid text content",
+			},
+			{
+				Type: "tool_use",
+				Text: "",
+			},
+		}
+		result := translator.convertSystemPrompt(contentBlocks)
+		assert.Equal(t, "Valid text content", result)
+	})
+
+	t.Run("nil_system_prompt", func(t *testing.T) {
+		result := translator.convertSystemPrompt(nil)
+		assert.Nil(t, result)
+	})
+
+	t.Run("unsupported_type", func(t *testing.T) {
+		result := translator.convertSystemPrompt(42)
+		assert.Nil(t, result)
+	})
+}
+
+func TestTransformRequest_SystemPromptWithContentBlocks(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	anthropicReq := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "You are a helpful ",
+			},
+			map[string]interface{}{
+				"type": "text",
+				"text": "AI assistant.",
+			},
+		},
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: "Hello",
+			},
+		},
+	}
+
+	body, err := json.Marshal(anthropicReq)
+	require.NoError(t, err)
+
+	req := &http.Request{
+		Body: io.NopCloser(bytes.NewReader(body)),
+	}
+
+	result, err := translator.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	messages, ok := result.OpenAIRequest["messages"].([]map[string]interface{})
+	require.True(t, ok)
+	require.Len(t, messages, 2)
+
+	assert.Equal(t, "system", messages[0]["role"])
+	assert.Equal(t, "You are a helpful AI assistant.", messages[0]["content"])
+
+	assert.Equal(t, "user", messages[1]["role"])
+	assert.Equal(t, "Hello", messages[1]["content"])
+}
+
+func TestTransformRequest_StronglyTypedSystemPrompt(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	req := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
