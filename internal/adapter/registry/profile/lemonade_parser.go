@@ -51,3 +51,29 @@ func (p *lemonadeParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
 			details.Checkpoint = &model.Checkpoint
 			hasDetails = true
 
+			// Extract publisher from checkpoint path (before first "/")
+			// HuggingFace organisation prefix (e.g., "amd" from "amd/model-name")
+			if idx := strings.Index(model.Checkpoint, "/"); idx > 0 {
+				publisher := model.Checkpoint[:idx]
+				details.Publisher = &publisher
+			}
+		}
+
+		// Store recipe (inference engine identifier)
+		// Determines which backend handles execution (oga-cpu, oga-npu, llamacpp, flm)
+		if model.Recipe != "" {
+			details.Recipe = &model.Recipe
+			hasDetails = true
+
+			// Infer format from recipe for compatibility checking
+			format := inferFormatFromRecipe(model.Recipe)
+			if format != "" {
+				details.Format = &format
+			}
+		}
+
+		// Map Lemonade's `downloaded` flag to an available state. Lemonade loads
+		// models on demand, so a downloaded model is serveable - the equivalent
+		// of a pulled Ollama model. Without this the model has no state, which
+		// the router treats as unknown and excludes from dispatch, making the
+		// Lemonade endpoint unroutable for chat.
