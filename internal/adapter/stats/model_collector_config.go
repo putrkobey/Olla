@@ -15,21 +15,3 @@ type ModelCollectorConfig struct {
 	ModelStatsTTL time.Duration
 
 	// ModelCleanupInterval is how often to clean up old data (default: 30m)
-	ModelCleanupInterval time.Duration
-
-	// MaxUniqueClientsPerModel is the maximum number of unique clients to track per model (default: 100)
-	MaxUniqueClientsPerModel int
-
-	// PercentileSampleSize is the size of the reservoir for percentile calculation (default: 100)
-	PercentileSampleSize int
-
-	// ClientIPRetentionTime is how long to keep client IP records (default: 1h)
-	ClientIPRetentionTime time.Duration
-
-	// EnableDetailedStats enables detailed model-endpoint statistics tracking (default: false)
-	EnableDetailedStats bool
-}
-
-// DefaultModelCollectorConfig returns the default configuration
-func DefaultModelCollectorConfig() *ModelCollectorConfig {
-	return &ModelCollectorConfig{

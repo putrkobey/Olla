@@ -278,3 +278,143 @@ func testStreamingProfilesForSuite(t *testing.T, suite ProxyTestSuite) {
 // TestStreamingProfilesWithContextOverride tests that context stream value works with profiles
 func TestStreamingProfilesWithContextOverride(t *testing.T) {
 	suites := []ProxyTestSuite{
+		SherpaTestSuite{},
+		OllaTestSuite{},
+	}
+
+	for _, suite := range suites {
+		t.Run(suite.Name(), func(t *testing.T) {
+			// Create upstream that sends binary content
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(constants.HeaderContentType, constants.ContentTypeImagePNG)
+				w.WriteHeader(http.StatusOK)
+
+				// Send fake binary data in chunks
+				for range 3 {
+					w.Write([]byte{0xFF, 0xD8, 0xFF, 0xE0}) // Fake JPEG header
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}))
+			defer upstream.Close()
+
+			// Setup proxy with auto profile
+			endpoint := createTestEndpoint("test", upstream.URL, domain.StatusHealthy)
+			discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+			selector := &mockEndpointSelector{endpoint: endpoint}
+			collector := createTestStatsCollector()
+
+			var proxy ports.ProxyService
+			if suite.Name() == "Sherpa" {
+				config := &sherpa.Configuration{}
+				config.Profile = constants.ConfigurationProxyProfileAuto
+				config.ResponseTimeout = 5 * time.Second
+				config.ReadTimeout = 5 * time.Second
+				config.StreamBufferSize = 8192
+				proxy = suite.CreateProxy(discovery, selector, config, collector)
+			} else {
+				config := &olla.Configuration{}
+				config.Profile = constants.ConfigurationProxyProfileAuto
+				config.ResponseTimeout = 5 * time.Second
+				config.ReadTimeout = 5 * time.Second
+				config.StreamBufferSize = 8192
+				config.MaxIdleConns = 10
+				config.IdleConnTimeout = 90 * time.Second
+				config.MaxConnsPerHost = 5
+				proxy = suite.CreateProxy(discovery, selector, config, collector)
+			}
+
+			// Test 1: Auto profile with binary content and stream=true in context
+			t.Run("context_stream_true_overrides_binary_detection", func(t *testing.T) {
+				req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+				// Add stream=true to context
+				ctx := context.WithValue(req.Context(), constants.ContextKeyStream, true)
+				req = req.WithContext(ctx)
+
+				w := &mockResponseWriter{
+					ResponseRecorder: *httptest.NewRecorder(),
+				}
+
+				err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+				if err != nil {
+					t.Fatalf("Proxy request failed: %v", err)
+				}
+
+				// Should flush because context stream=true overrides binary detection
+				if w.getFlushCount() == 0 {
+					t.Error("Expected flushes when context stream=true for binary content in auto mode")
+				}
+			})
+
+			// Test 2: Auto profile with binary content and no context override
+			t.Run("auto_profile_buffers_binary_without_context_override", func(t *testing.T) {
+				req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+
+				w := &mockResponseWriter{
+					ResponseRecorder: *httptest.NewRecorder(),
+				}
+
+				err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+				if err != nil {
+					t.Fatalf("Proxy request failed: %v", err)
+				}
+
+				// Should NOT flush binary content in auto mode
+				if w.getFlushCount() > 0 {
+					t.Error("Expected no flushes for binary content in auto mode without context override")
+				}
+			})
+		})
+	}
+}
+
+// TestStreamingProfilesComprehensive tests all profile combinations with different scenarios
+func TestStreamingProfilesComprehensive(t *testing.T) {
+	suites := []ProxyTestSuite{
+		SherpaTestSuite{},
+		OllaTestSuite{},
+	}
+
+	for _, suite := range suites {
+		t.Run(suite.Name(), func(t *testing.T) {
+			// Test matrix covering all profile/context combinations
+			tests := []struct {
+				name          string
+				profile       string
+				contentType   string
+				contextStream interface{} // nil, true, or false
+				expectFlushes bool
+				description   string
+			}{
+				// standard profile - should NEVER flush regardless of context
+				{
+					name:          "standard_sse_no_context",
+					profile:       constants.ConfigurationProxyProfileStandard,
+					contentType:   "text/event-stream",
+					contextStream: nil,
+					expectFlushes: false,
+					description:   "standard profile should not flush SSE without context",
+				},
+				{
+					name:          "standard_sse_stream_true",
+					profile:       constants.ConfigurationProxyProfileStandard,
+					contentType:   "text/event-stream",
+					contextStream: true,
+					expectFlushes: false,
+					description:   "standard profile ignores context stream=true",
+				},
+				{
+					name:          "standard_binary_stream_true",
+					profile:       constants.ConfigurationProxyProfileStandard,
+					contentType:   "image/png",
+					contextStream: true,
+					expectFlushes: false,
+					description:   "standard profile should not flush binary even with stream=true",
+				},
+
+				// Streaming profile - should ALWAYS flush regardless of context
+				{
+					name:          "streaming_binary_no_context",
+					profile:       constants.ConfigurationProxyProfileStreaming,
