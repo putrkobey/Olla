@@ -87,3 +87,47 @@ func TestSimpleStatsTracker(t *testing.T) {
 		}
 
 		if min := st.GetMin(); min != 10 {
+			t.Errorf("Expected min 10, got %d", min)
+		}
+
+		if max := st.GetMax(); max != 50 {
+			t.Errorf("Expected max 50, got %d", max)
+		}
+	})
+
+	t.Run("Empty tracker", func(t *testing.T) {
+		st := NewSimpleStatsTracker()
+
+		if st.Count() != 0 {
+			t.Error("Empty tracker should have count 0")
+		}
+
+		if avg := st.GetAverage(); avg != 0 {
+			t.Error("Empty tracker should have average 0")
+		}
+
+		p50, p95, p99 := st.GetPercentiles()
+		if p50 != 0 || p95 != 0 || p99 != 0 {
+			t.Error("Empty tracker should return zero percentiles")
+		}
+	})
+
+	t.Run("Reset functionality", func(t *testing.T) {
+		st := NewSimpleStatsTracker()
+
+		for i := range 100 {
+			st.Add(int64(i))
+		}
+
+		st.Reset()
+
+		if st.Count() != 0 {
+			t.Error("Count should be 0 after reset")
+		}
+
+		if st.GetMin() != 0 || st.GetMax() != 0 {
+			t.Error("Min/Max should be reset")
+		}
+	})
+}
+
