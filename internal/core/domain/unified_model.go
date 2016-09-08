@@ -1,0 +1,158 @@
+package domain
+
+import (
+	"fmt"
+	"time"
+)
+
+// AliasEntry represents an alias with its source attribution
+type AliasEntry struct {
+	Name   string `json:"name"`
+	Source string `json:"source"` // e.g., "ollama", "lmstudio", "generated"
+}
+
+// UnifiedModel represents the canonical model format with platform-agnostic naming
+type UnifiedModel struct {
+	LastSeen         time.Time              `json:"last_seen"`
+	MaxContextLength *int64                 `json:"max_context_length,omitempty"`
+	Metadata         map[string]interface{} `json:"metadata"`                     // Platform-specific extras
+	ID               string                 `json:"id"`                           // Canonical ID: {family}/{variant}:{size}-{quant}
+	Family           string                 `json:"family"`                       // Model family (e.g., phi, llama, qwen)
+	Variant          string                 `json:"variant"`                      // Version/variant (e.g., 4, 3.3, 3)
+	ParameterSize    string                 `json:"parameter_size"`               // Normalised size (e.g., 14.7b, 70.6b)
+	Quantization     string                 `json:"quantization"`                 // Normalised quantization (e.g., q4km, q3kl)
+	Format           string                 `json:"format"`                       // Model format (gguf, safetensors, etc.)
+	PromptTemplateID string                 `json:"prompt_template_id,omitempty"` // Associated prompt template
+	Aliases          []AliasEntry           `json:"aliases"`                      // All known aliases with source attribution
+	SourceEndpoints  []SourceEndpoint       `json:"source_endpoints"`             // Where this model is available
+	Capabilities     []string               `json:"capabilities"`                 // Inferred capabilities (chat, completion, vision)
+	ParameterCount   int64                  `json:"parameter_count"`              // Actual parameter count for sorting
+	DiskSize         int64                  `json:"disk_size"`                    // Total disk size across all endpoints
+}
+
+// SourceEndpoint represents where a unified model is available
+type SourceEndpoint struct {
+	LastSeen       time.Time          `json:"last_seen"`
+	LastStateCheck time.Time          `json:"last_state_check"`
+	StateInfo      *EndpointStateInfo `json:"state_info,omitempty"`
+	EndpointURL    string             `json:"-"` // Hidden from JSON output for security
+	EndpointName   string             `json:"endpoint_name"`
+	NativeName     string             `json:"native_name"` // Original name on this platform
+	Platform       string             `json:"-"`           // Platform that serves it (ollama, vllm, ...); scopes name rules such as the Ollama default tag
+	State          string             `json:"state"`       // loaded, not-loaded, etc.
+	ModelState     ModelState         `json:"model_state"` // New typed state
+	DiskSize       int64              `json:"disk_size"`
+}
+
+// UnificationStats tracks performance metrics for model unification
+type UnificationStats struct {
+	LastUnificationAt  time.Time `json:"last_unification_at"`
+	TotalUnified       int64     `json:"total_unified"`
+	TotalErrors        int64     `json:"total_errors"`
+	CacheHits          int64     `json:"cache_hits"`
+	CacheMisses        int64     `json:"cache_misses"`
+	AverageUnifyTimeMs float64   `json:"average_unify_time_ms"`
+}
+
+// UnificationError represents errors during model unification
+type UnificationError struct {
+	Err          error
+	SourceModel  string
+	PlatformType string
+	Operation    string
+}
+
+func (e *UnificationError) Error() string {
+	return fmt.Sprintf("unification %s failed for %s model %s: %v",
+		e.Operation, e.PlatformType, e.SourceModel, e.Err)
+}
+
+func (e *UnificationError) Unwrap() error {
+	return e.Err
+}
+
+func NewUnificationError(operation, platformType, sourceModel string, err error) *UnificationError {
+	return &UnificationError{
+		Operation:    operation,
+		PlatformType: platformType,
+		SourceModel:  sourceModel,
+		Err:          err,
+	}
+}
+
+// IsEquivalent checks if two unified models represent the same underlying model
+func (u *UnifiedModel) IsEquivalent(other *UnifiedModel) bool {
+	if u == nil || other == nil {
+		return false
+	}
+	return u.ID == other.ID
+}
+
+// HasAlias checks if the unified model has a specific alias
+func (u *UnifiedModel) HasAlias(alias string) bool {
+	for _, a := range u.Aliases {
+		if a.Name == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// Clone returns a deep copy that shares no mutable memory with the receiver,
+// including nested Metadata maps and slices. The unifier catalog and the
+// registry publish *UnifiedModel pointers to lock-free readers, so every writer
+// must clone, mutate the clone and swap it in rather than touch a published model.
+func (u *UnifiedModel) Clone() *UnifiedModel {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	if u.MaxContextLength != nil {
+		v := *u.MaxContextLength
+		c.MaxContextLength = &v
+	}
+	if u.Aliases != nil {
+		c.Aliases = make([]AliasEntry, len(u.Aliases))
+		copy(c.Aliases, u.Aliases)
+	}
+	if u.Capabilities != nil {
+		c.Capabilities = make([]string, len(u.Capabilities))
+		copy(c.Capabilities, u.Capabilities)
+	}
+	if u.SourceEndpoints != nil {
+		c.SourceEndpoints = make([]SourceEndpoint, len(u.SourceEndpoints))
+		for i, se := range u.SourceEndpoints {
+			if se.StateInfo != nil {
+				info := *se.StateInfo
+				info.Metadata = cloneMetadataMap(se.StateInfo.Metadata)
+				se.StateInfo = &info
+			}
+			c.SourceEndpoints[i] = se
+		}
+	}
+	c.Metadata = cloneMetadataMap(u.Metadata)
+	return &c
+}
+
+func cloneMetadataMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = cloneMetadataValue(v)
+	}
+	return out
+}
+
+// cloneMetadataValue copies the container types that metadata is known to carry
+// (the unifier keeps a map[string]bool under "platforms"). Scalars and unknown
+// types are shared, which is safe because nothing mutates them in place.
+func cloneMetadataValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return cloneMetadataMap(t)
+	case map[string]bool:
+		out := make(map[string]bool, len(t))
+		for k, b := range t {
+			out[k] = b
