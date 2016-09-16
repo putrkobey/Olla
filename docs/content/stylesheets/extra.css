@@ -79,30 +79,3 @@
 .md-typeset .admonition.info,
 .md-typeset details.info {
   border-color: var(--olla-accent);
-}
-
-.md-typeset .info > .admonition-title,
-.md-typeset .info > summary {
-  background-color: rgba(103, 183, 233, 0.1);
-  border-color: var(--olla-accent);
-}
-
-/* Search highlighting */
-.md-search-result__article--document .md-search-result__title {
-  color: var(--olla-primary);
-}
-
-/* Logo and branding area */
-.md-header__title {
-  font-weight: 600;
-  color: white;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
-}
-
-/* Header navigation text */
-.md-header__button {
-  color: white;
-}
-
-.md-search__input {
-  background-color: rgba(255, 255, 255, 0.9);

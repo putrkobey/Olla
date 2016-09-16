@@ -32,37 +32,3 @@ func (c *VLLMConverter) GetFormatName() string {
 }
 
 func (c *VLLMConverter) ConvertToFormat(models []*domain.UnifiedModel, filters ports.ModelFilters) (interface{}, error) {
-	filtered := filterModels(models, filters)
-
-	data := make([]profile.VLLMModel, 0, len(filtered))
-	for _, model := range filtered {
-		vllmModel := c.convertModel(model)
-		if vllmModel != nil {
-			data = append(data, *vllmModel)
-		}
-	}
-
-	return profile.VLLMResponse{
-		Object: "list",
-		Data:   data,
-	}, nil
-}
-
-func (c *VLLMConverter) convertModel(model *domain.UnifiedModel) *profile.VLLMModel {
-	// For vLLM, prefer the native vLLM name if available from source endpoints
-	now := time.Now().Unix()
-	modelID := c.FindNativeName(model)
-	if modelID == "" {
-		// Fallback to first alias or unified ID
-		if len(model.Aliases) > 0 {
-			modelID = model.Aliases[0].Name
-		} else {
-			modelID = model.ID
-		}
-	}
-
-	vllmModel := &profile.VLLMModel{
-		ID:      modelID,
-		Object:  "model",
-		Created: now,
-		OwnedBy: c.determineOwner(modelID),
