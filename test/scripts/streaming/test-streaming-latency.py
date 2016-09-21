@@ -118,3 +118,124 @@ class StreamingLatencyTester:
                 self.print_color(RED, f"No valid questions found in {question_file}")
                 return False
                 
+            self.print_color(GREEN, f"Loaded {len(self.questions)} questions from {question_file}")
+            return True
+            
+        except Exception as e:
+            self.print_color(RED, f"Error loading questions: {e}")
+            return False
+            
+    def create_default_questions(self, question_file: str):
+        """Create a default questions file"""
+        default_questions = [
+            "# Questions for testing streaming latency",
+            "# One question per line, lines starting with # are ignored",
+            "",
+            "Tell me a short story about a robot learning to paint.",
+            "Explain how photosynthesis works in simple terms.",
+            "What are the main differences between machine learning and artificial intelligence?",
+            "Describe the process of making bread from scratch.",
+            "Write a haiku about the ocean.",
+            "Explain the concept of recursion in programming with an example.",
+            "What would happen if gravity suddenly became twice as strong?",
+            "Tell me about the history of the internet in three paragraphs.",
+            "How do solar panels convert sunlight into electricity?",
+            "Write a dialogue between two characters meeting for the first time.",
+            "Explain why the sky appears blue during the day.",
+            "What are the benefits and drawbacks of renewable energy?",
+            "Describe how a computer processor works at a basic level.",
+            "Tell me about an interesting historical event from the 1960s.",
+            "How do vaccines help prevent diseases?",
+            "Write a short poem about autumn leaves.",
+            "Explain the water cycle and its importance to life on Earth.",
+            "What makes a good leader, and can leadership skills be learned?",
+            "Describe the process of evolution by natural selection.",
+            "How do search engines like Google find and rank web pages?"
+        ]
+        
+        try:
+            with open(question_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(default_questions))
+            self.print_color(GREEN, f"Created default questions file: {question_file}")
+        except Exception as e:
+            self.print_color(RED, f"Error creating questions file: {e}")
+            
+    def select_model(self, model_arg: Optional[str], manual_select: bool = False) -> Optional[str]:
+        """Select model from CLI arg, auto-select phi4:latest, or user input"""
+        if model_arg:
+            if model_arg in self.available_models:
+                self.print_color(GREEN, f"Using specified model: {model_arg}")
+                return model_arg
+            else:
+                self.print_color(RED, f"Model '{model_arg}' not found in available models")
+                return None
+                
+        # Auto-select phi models if available and not manual selection
+        if not manual_select:
+            preferred_models = ['phi4:latest', 'phi3.5:latest', 'phi3:latest']
+            for model in preferred_models:
+                if model in self.available_models:
+                    self.print_color(GREEN, f"Auto-selecting {model}")
+                    return model
+            
+            # No phi models found
+            self.print_color(YELLOW, "No phi models found (phi4:latest, phi3.5:latest, or phi3:latest)")
+            self.print_color(YELLOW, "Please select a model manually:")
+                
+        print()
+        self.print_color(WHITE, "Select a model to test:")
+        
+        try:
+            choice = input(f"{CYAN}Enter model number (1-{len(self.available_models)}): {RESET}")
+            model_index = int(choice.strip()) - 1
+            
+            if 0 <= model_index < len(self.available_models):
+                selected = self.available_models[model_index]
+                self.print_color(GREEN, f"Selected model: {selected}")
+                return selected
+            else:
+                self.print_color(RED, "Invalid selection")
+                return None
+                
+        except (ValueError, KeyboardInterrupt):
+            self.print_color(RED, "Invalid input or cancelled")
+            return None
+            
+    def get_random_question(self) -> str:
+        """Get a random question from the loaded questions"""
+        return random.choice(self.questions)
+        
+    def test_streaming_latency(self, model: str, question: str) -> Dict[str, Any]:
+        """Test streaming latency for a specific model and question"""
+        result = {
+            'model': model,
+            'question': question[:50] + "..." if len(question) > 50 else question,
+            'success': False,
+            'chunks_received': 0,
+            'total_chars': 0,
+            'time_to_first_token': 0.0,
+            'total_time': 0.0,
+            'endpoint_used': '',
+            'chunk_intervals': [],
+            'error': None,
+            'streaming_quality': 'unknown'
+        }
+        
+        # Use OpenAI-compatible endpoint (most common)
+        url = f"{self.base_url}/olla/openai/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": question}
+            ],
+            "stream": True,
+            "max_tokens": 200,
+            "temperature": 0.7
+        }
+        
+        try:
+            start_time = time.time()
+            last_chunk_time = start_time
+            
+            self.print_color(GREY, f"    Question: {question[:60]}{'...' if len(question) > 60 else ''}")
+            self.print_color(YELLOW, f"    Streaming: ", end='')
