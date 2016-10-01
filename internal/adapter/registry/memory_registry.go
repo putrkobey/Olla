@@ -365,3 +365,126 @@ func (r *MemoryModelRegistry) GetAllModels(ctx context.Context) (map[string][]*d
 			models[i] = &domain.ModelInfo{
 				Name:        model.Name,
 				Size:        model.Size,
+				Type:        model.Type,
+				Description: model.Description,
+				LastSeen:    model.LastSeen,
+				Details:     model.Details,
+			}
+		}
+		result[endpointURL] = models
+		return true
+	})
+
+	return result, nil
+}
+
+func (r *MemoryModelRegistry) GetEndpointModelMap(ctx context.Context) (map[string]*domain.EndpointModels, error) {
+	select {
+	case <-ctx.Done():
+		return nil, domain.NewModelRegistryError("get_endpoint_model_map", "", "", ctx.Err())
+	default:
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make(map[string]*domain.EndpointModels)
+	r.endpointModels.Range(func(endpointURL string, endpointData *domain.EndpointModels) bool {
+		result[endpointURL] = &domain.EndpointModels{
+			EndpointURL: endpointData.EndpointURL,
+			Models:      endpointData.Models,
+			LastUpdated: endpointData.LastUpdated,
+		}
+		return true
+	})
+
+	return result, nil
+}
+
+func (r *MemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpointURL string) error {
+	if endpointURL == "" {
+		return domain.NewModelRegistryError("remove_endpoint", endpointURL, "", errors.New("endpoint URL cannot be empty"))
+	}
+
+	select {
+	case <-ctx.Done():
+		return domain.NewModelRegistryError("remove_endpoint", endpointURL, "", ctx.Err())
+	default:
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.removeEndpointFromIndex(endpointURL)
+	r.endpointModels.Delete(endpointURL)
+	r.ollamaEndpoints.Delete(endpointURL)
+	r.updateStats()
+
+	return nil
+}
+
+func (r *MemoryModelRegistry) GetStats(ctx context.Context) (domain.RegistryStats, error) {
+	select {
+	case <-ctx.Done():
+		return domain.RegistryStats{}, domain.NewModelRegistryError("get_stats", "", "", ctx.Err())
+	default:
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	modelsPerEndpoint := make(map[string]int, len(r.stats.ModelsPerEndpoint))
+	for k, v := range r.stats.ModelsPerEndpoint {
+		modelsPerEndpoint[k] = v
+	}
+
+	return domain.RegistryStats{
+		TotalEndpoints:    r.stats.TotalEndpoints,
+		TotalModels:       r.stats.TotalModels,
+		ModelsPerEndpoint: modelsPerEndpoint,
+		LastUpdated:       r.stats.LastUpdated,
+	}, nil
+}
+
+func (r *MemoryModelRegistry) validateInputs(endpointURL, modelName string) error {
+	if endpointURL == "" {
+		return errors.New("endpoint URL cannot be empty")
+	}
+
+	if modelName == "" {
+		return errors.New("model name cannot be empty")
+	}
+
+	if strings.TrimSpace(endpointURL) == "" {
+		return errors.New("endpoint URL cannot be whitespace only")
+	}
+
+	if strings.TrimSpace(modelName) == "" {
+		return errors.New("model name cannot be whitespace only")
+	}
+
+	parsedURL, err := url.Parse(endpointURL)
+	if err != nil {
+		return fmt.Errorf("invalid endpoint URL: %w", err)
+	}
+
+	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return errors.New("endpoint URL must have scheme and host")
+	}
+
+	return nil
+}
+
+func (r *MemoryModelRegistry) removeEndpointFromIndex(endpointURL string) {
+	endpointData, ok := r.endpointModels.Load(endpointURL)
+	if ok {
+		for _, model := range endpointData.Models {
+			endpointSet, exists := r.modelToEndpoints.Load(model.Name)
+			if exists {
+				endpointSet.Delete(endpointURL)
+				// Check if the set is now empty and remove it
+				isEmpty := true
+				endpointSet.Range(func(_ string, _ struct{}) bool {
+					isEmpty = false
+					return false // Stop after first item
+				})
