@@ -80,3 +80,85 @@ func TestTrustedProxyCIDRsIntegration(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = tc.remoteAddr
+
+			if tc.xForwardedFor != "" {
+				req.Header.Set("X-Forwarded-For", tc.xForwardedFor)
+			}
+			if tc.xRealIP != "" {
+				req.Header.Set("X-Real-IP", tc.xRealIP)
+			}
+
+			ip := util.GetClientIP(req, cfg.Server.RateLimits.TrustProxyHeaders, trustedCIDRs)
+			if ip != tc.expectedIP {
+				t.Errorf("%s: expected %s, got %s", tc.description, tc.expectedIP, ip)
+			}
+		})
+	}
+}
+
+func TestConfigDefaultCIDRsIntegration(t *testing.T) {
+	// Test that default config CIDRs parse correctly
+	cfg := config.DefaultConfig()
+
+	trustedCIDRs, err := util.ParseTrustedCIDRs(cfg.Server.RateLimits.TrustedProxyCIDRs)
+	if err != nil {
+		t.Fatalf("Default config CIDRs should parse without error: %v", err)
+	}
+
+	if len(trustedCIDRs) != 4 {
+		t.Errorf("Expected 4 default CIDRs, got %d", len(trustedCIDRs))
+	}
+
+	// Test that common private IPs are in the trusted ranges
+	commonPrivateIPs := []string{
+		"127.0.0.1",   // localhost
+		"10.0.0.1",    // private class A
+		"172.16.0.1",  // private class B
+		"192.168.1.1", // private class C
+	}
+
+	for _, ipStr := range commonPrivateIPs {
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.RemoteAddr = ipStr + ":12345"
+		req.Header.Set("X-Real-IP", "203.0.113.1")
+
+		ip := util.GetClientIP(req, true, trustedCIDRs)
+		if ip != "203.0.113.1" {
+			t.Errorf("IP %s should be trusted by default config, but got %s instead of 203.0.113.1", ipStr, ip)
+		}
+	}
+}
+
+func TestRealWorldScenarios(t *testing.T) {
+	scenarios := []struct {
+		name        string
+		description string
+		setup       func() (*http.Request, []*net.IPNet, bool)
+		expectedIP  string
+	}{
+		{
+			name:        "nginx_reverse_proxy",
+			description: "Common nginx reverse proxy setup",
+			setup: func() (*http.Request, []*net.IPNet, bool) {
+				req := httptest.NewRequest("GET", "/api/test", nil)
+				req.RemoteAddr = "127.0.0.1:12345"
+				req.Header.Set("X-Real-IP", "203.0.113.1")
+				req.Header.Set("X-Forwarded-For", "203.0.113.1")
+				req.Header.Set("X-Forwarded-Proto", "https")
+
+				cidrs, _ := util.ParseTrustedCIDRs([]string{"127.0.0.0/8"})
+				return req, cidrs, true
+			},
+			expectedIP: "203.0.113.1",
+		},
+		{
+			name:        "cloudflare_proxy",
+			description: "Request through Cloudflare",
+			setup: func() (*http.Request, []*net.IPNet, bool) {
+				req := httptest.NewRequest("GET", "/api/test", nil)
+				req.RemoteAddr = "192.168.1.1:12345"                         // Internal load balancer
+				req.Header.Set("X-Forwarded-For", "203.0.113.1, 104.16.1.1") // Client IP, CF IP
+				req.Header.Set("CF-Connecting-IP", "203.0.113.1")
+
+				cidrs, _ := util.ParseTrustedCIDRs([]string{"192.168.0.0/16"})
