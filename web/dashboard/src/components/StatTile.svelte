@@ -6,3 +6,19 @@
   // sub props were an opt-in XSS sink on a shared component - inert while
   // only closed server-controlled values flowed through it, but a footgun the
   // moment an endpoint or model name did. Snippets compose into the DOM as
+  // normal, escaped content.
+  interface Props {
+    label: string;
+    value?: string;
+    sub?: string;
+    children?: Snippet<[]>;
+    subSnippet?: Snippet<[]>;
+  }
+  let { label, value, sub, children, subSnippet }: Props = $props();
+</script>
+
+<div class="tile">
+  <span class="label">{label}</span>
+  {#if children}
+    <span class="value">{@render children()}</span>
+  {:else}
