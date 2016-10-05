@@ -11,3 +11,16 @@ type HealthCheckResult struct {
 	RateLimitedUntil time.Time
 	Error            error
 	Status           EndpointStatus
+	Latency          time.Duration
+	ErrorType        HealthCheckErrorType
+	StatusCode       int
+}
+
+type HealthCheckErrorType int
+
+const (
+	ErrorTypeNone HealthCheckErrorType = iota
+	ErrorTypeNetwork
+	ErrorTypeTimeout
+	ErrorTypeHTTPError
+	ErrorTypeCircuitOpen
