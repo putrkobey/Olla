@@ -21,26 +21,3 @@ type AliasResolver struct {
 func NewAliasResolver(aliases map[string][]string, logger logger.StyledLogger) *AliasResolver {
 	if len(aliases) == 0 {
 		return nil
-	}
-
-	return &AliasResolver{
-		aliases: aliases,
-		logger:  logger,
-	}
-}
-
-// IsAlias returns true if the given model name is a configured alias
-func (r *AliasResolver) IsAlias(modelName string) bool {
-	_, ok := r.aliases[modelName]
-	return ok
-}
-
-// GetActualModels returns the list of actual model names for an alias.
-// Returns nil if the model name is not an alias.
-func (r *AliasResolver) GetActualModels(aliasName string) []string {
-	return r.aliases[aliasName]
-}
-
-// EndpointModelMapping maps an endpoint URL to the actual model name it should receive
-type EndpointModelMapping struct {
-	EndpointURL string
