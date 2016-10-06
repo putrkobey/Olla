@@ -214,3 +214,111 @@ func TestTransformRequest_SystemPromptString(t *testing.T) {
 		MaxTokens: 1024,
 		System:    "You are a helpful assistant",
 		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: "Hello",
+			},
+		},
+	}
+
+	body, err := json.Marshal(anthropicReq)
+	require.NoError(t, err)
+
+	req := &http.Request{
+		Body: io.NopCloser(bytes.NewReader(body)),
+	}
+
+	result, err := translator.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+
+	messages, ok := result.OpenAIRequest["messages"].([]map[string]interface{})
+	require.True(t, ok)
+	require.Len(t, messages, 2)
+
+	// System message should work as before
+	assert.Equal(t, "system", messages[0]["role"])
+	assert.Equal(t, "You are a helpful assistant", messages[0]["content"])
+}
+
+// TestTransformRequest_CombinedThinkingAndSystemArray tests both new features together
+func TestTransformRequest_CombinedThinkingAndSystemArray(t *testing.T) {
+	translator := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	anthropicReq := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		System: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "You are an expert problem solver.",
+			},
+		},
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: "Solve this puzzle",
+			},
+		},
+		Thinking: map[string]interface{}{
+			"type":          "enabled",
+			"budget_tokens": 2000,
+		},
+	}
+
+	body, err := json.Marshal(anthropicReq)
+	require.NoError(t, err)
+
+	req := &http.Request{
+		Body: io.NopCloser(bytes.NewReader(body)),
+	}
+
+	result, err := translator.TransformRequest(context.Background(), req)
+	require.NoError(t, err)
+	assert.NotNil(t, result)
+
+	messages, ok := result.OpenAIRequest["messages"].([]map[string]interface{})
+	require.True(t, ok)
+	require.Len(t, messages, 2)
+
+	// System message from array
+	assert.Equal(t, "system", messages[0]["role"])
+	assert.Equal(t, "You are an expert problem solver.", messages[0]["content"])
+
+	// User message
+	assert.Equal(t, "user", messages[1]["role"])
+	assert.Equal(t, "Solve this puzzle", messages[1]["content"])
+}
+
+// TestCountSystemChars tests token counting with different system prompt formats
+func TestCountSystemChars(t *testing.T) {
+	tests := []struct {
+		name          string
+		system        interface{}
+		expectedChars int
+		desc          string
+	}{
+		{
+			name:          "nil_system",
+			system:        nil,
+			expectedChars: 0,
+			desc:          "Nil system should return 0",
+		},
+		{
+			name:          "empty_string",
+			system:        "",
+			expectedChars: 0,
+			desc:          "Empty string should return 0",
+		},
+		{
+			name:          "simple_string",
+			system:        "You are helpful",
+			expectedChars: 15,
+			desc:          "Simple string should count characters",
+		},
+		{
+			name: "array_single_block",
+			system: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": "Hello",
+				},
