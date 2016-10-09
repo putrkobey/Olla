@@ -29,34 +29,3 @@ import (
 func TestProxyRouting_NamedModelIgnoresContentType(t *testing.T) {
 	t.Parallel()
 
-	styledLog := &mockStyledLogger{}
-	profileFactory, err := profile.NewFactory("../../../config/profiles")
-	require.NoError(t, err)
-
-	inspectorFactory := inspector.NewFactory(profileFactory, styledLog)
-	bodyInspector, err := inspectorFactory.CreateBodyInspector()
-	require.NoError(t, err)
-	chain := inspectorFactory.CreateChain()
-	chain.AddInspector(inspectorFactory.CreatePathInspector())
-	chain.AddInspector(bodyInspector)
-
-	const body = `{"model":"nomic-embed-text:latest","input":"hi"}`
-	contentTypes := map[string]string{
-		"json":            constants.ContentTypeJSON,
-		"form-urlencoded": "application/x-www-form-urlencoded",
-		"text/plain":      "text/plain;charset=UTF-8",
-		"vnd.api+json":    "application/vnd.api+json",
-		"x-ndjson":        "application/x-ndjson",
-		"missing":         "",
-	}
-
-	for name, ct := range contentTypes {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			ctx := context.Background()
-			cfg := config.ModelRoutingStrategy{Type: "optimistic", Options: config.ModelRoutingStrategyOptions{FallbackBehavior: constants.FallbackBehaviorAll}}
-			unified := registry.NewUnifiedMemoryModelRegistry(styledLog, nil, &cfg, nil)
-
-			fleet := []fleetEndpoint{
-				{name: "ollama-has", typ: domain.ProfileOllama, modelsJSON: `{"models":[{"name":"nomic-embed-text:latest"}]}`},
