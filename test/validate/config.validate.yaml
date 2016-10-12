@@ -1,0 +1,88 @@
+# Olla validation harness configuration (/olla-validate skill).
+#
+# Points at seven ollamock instances (test/cmd/ollamock) so every provider
+# route, the unifier, sticky sessions and the Anthropic translator have live
+# mock backends. The model lists deliberately overlap (shared-model) and
+# diverge (per-instance uniques) so unification and model routing decisions
+# are both observable.
+#
+# One instance per endpoint: Olla keys endpoint identity on the URL, so two
+# endpoints sharing a URL silently collapse to one (last declared wins).
+#
+# Topology (one ollamock process per port, started by the skill):
+#   19431  mock-a  openai-compatible  models: test-model,shared-model
+#   19432  mock-b  openai-compatible  models: test-model,beta-model
+#   19433  mock-c  ollama             models: llama3.1:8b,shared-model
+#   19434  mock-d  lm-studio          models: phi-4,shared-model
+#   19435  mock-e  vllm               models: test-model,shared-model
+#   19436  mock-f  litellm            models: test-model,beta-model
+#   19437  mock-g  llamacpp           models: phi-4,shared-model
+
+server:
+  host: "127.0.0.1"
+  port: 41141
+  read_timeout: 20s
+  read_header_timeout: 10s
+  write_timeout: 0s
+  shutdown_timeout: 5s
+  request_logging: true
+  request_limits:
+    # 5MB so the limits agent can trip 413 with a ~6MB body without the
+    # harness paying for huge uploads elsewhere.
+    max_body_size: 5242880
+    max_header_size: 524288
+  rate_limits:
+    # Generous on purpose: rate-limit behaviour is exercised against the
+    # separate config.validate.limits.yaml instance, not this one.
+    global_requests_per_minute: 100000
+    per_ip_requests_per_minute: 50000
+    health_requests_per_minute: 100000
+    burst_size: 1000
+    cleanup_interval: 5m
+    trust_proxy_headers: false
+    trusted_proxy_cidrs: ["127.0.0.0/8"]
+
+proxy:
+  # The skill runs the full suite against the olla engine; the nightly pass
+  # swaps this to sherpa (maintenance mode) for a trimmed second run.
+  engine: "olla"
+  profile: "auto"
+  # least-connections spreads traffic across instances, which gives the
+  # affinity and diversity assertions something real to observe.
+  load_balancer: "least-connections"
+  # stream_buffer_size: 8192 # Unset: the engine default applies (Olla 64KiB, Sherpa 8KiB). Pinning this here silently defeated the 64KiB default.
+  connection_timeout: 10s
+  response_timeout: 60s
+  read_timeout: 60s
+  response_header_timeout: 10s
+  sticky_sessions:
+    enabled: true
+    idle_ttl_seconds: 600
+    max_sessions: 1000
+    key_sources: [session_header, prefix_hash]
+    prefix_hash_bytes: 512
+
+discovery:
+  type: "static"
+  refresh_interval: 10s
+  static:
+    endpoints:
+      # ── openai-compatible pair: failover + balancing target ─────────────
+      - url: "http://127.0.0.1:19431"
+        name: "mock-openai-a"
+        type: "openai-compatible"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+      - url: "http://127.0.0.1:19432"
+        name: "mock-openai-b"
+        type: "openai-compatible"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+
+      # ── ollama: native /api/* protocol ───────────────────────────────────
