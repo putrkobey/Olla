@@ -13,3 +13,19 @@ func (t *Translator) convertTools(anthropicTools []AnthropicTool) []map[string]i
 			"type": openAITypeFunction,
 			"function": map[string]interface{}{
 				"name":        tool.Name,
+				"description": tool.Description,
+				"parameters":  tool.InputSchema, // Direct mapping - both use JSON Schema
+			},
+		}
+		openaiTools = append(openaiTools, openaiTool)
+	}
+
+	return openaiTools
+}
+
+// convertToolChoice transforms Anthropic tool_choice to OpenAI format
+// Handles both string and object forms with semantic mapping:
+// - "auto" -> "auto" (let model decide)
+// - "any" -> "required" (force tool use)
+// - {"type": "tool", "name": "X"} -> {"type": "function", "function": {"name": "X"}}
+func (t *Translator) convertToolChoice(toolChoice interface{}) (interface{}, error) {
