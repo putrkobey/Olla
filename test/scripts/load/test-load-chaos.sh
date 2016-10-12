@@ -44,3 +44,27 @@ CHAOS_MODE=false
 if [[ "$*" == *"--chaos"* ]]; then
   CHAOS_MODE=true
 fi
+
+READ_BYTES=${READ_BYTES:-4096}  # Default read limit
+MODEL_NAME=${MODEL_NAME:-phi4:latest}
+PROVIDER="${PROVIDER:-ollama}"
+PROXY_PATH="/olla/${PROVIDER}/v1/chat/completions"
+TARGET=${TARGET_URL}${PROXY_PATH}
+
+start_time=$(date +%s)
+end_time=$((start_time + DURATION))
+
+function jitter_sleep() {
+  local min_delay=${1:-0.1}
+  local max_delay=${2:-0.5}
+  local jitter=$(awk -v min=$min_delay -v max=$max_delay 'BEGIN{srand(); print min + rand() * (max - min)}')
+  sleep "$jitter"
+}
+
+function worker() {
+  local wid=$1
+  while [ $(date +%s) -lt $end_time ]; do
+    question="$(date +%s) - Worker $wid asks: What is the capital of France?"
+    payload=$(jq -nc --arg q "$question" --arg m "$MODEL_NAME" '
+      {model: $m, messages: [{role: "user", content: $q}], stream: true, temperature: 0.2}
+    ')
