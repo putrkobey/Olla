@@ -32,3 +32,20 @@ func TestEndpoint_AuthHeaderValue_NotSerialised(t *testing.T) {
 		t.Errorf("AuthHeaderValue field name present in JSON output: %s", string(data))
 	}
 }
+
+func TestEndpoint_AuthFields_ZeroValueByDefault(t *testing.T) {
+	t.Parallel()
+
+	ep := &domain.Endpoint{Name: "plain"}
+
+	if ep.AuthHeaderName != "" {
+		t.Errorf("AuthHeaderName should be empty by default, got %q", ep.AuthHeaderName)
+	}
+	if ep.AuthHeaderValue != "" {
+		t.Errorf("AuthHeaderValue should be empty by default, got %q", ep.AuthHeaderValue)
+	}
+	if ep.Headers != nil {
+		t.Errorf("Headers should be nil by default, got %v", ep.Headers)
+	}
+}
+
