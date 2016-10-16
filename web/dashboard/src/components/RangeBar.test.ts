@@ -14,3 +14,19 @@ interface RangeBarProps {
   max?: number;
   globalMax?: number;
   label?: string;
+}
+
+let component: ReturnType<typeof mount> | undefined;
+
+afterEach(() => {
+  if (component) unmount(component);
+  document.body.innerHTML = '';
+});
+
+function render(props: RangeBarProps): void {
+  component = mount(RangeBar, { target: document.body, props });
+  flushSync();
+}
+
+describe('RangeBar', () => {
+  it('renders the numeric average, formatted, alongside the range', () => {
