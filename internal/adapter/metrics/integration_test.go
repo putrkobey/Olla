@@ -89,3 +89,48 @@ func TestIntegration_OllamaMetricsExtraction(t *testing.T) {
 	assert.Equal(t, int32(2000), metrics.TTFTMs)           // 2000000000 ns / 1000000 = 2000 ms
 	assert.InDelta(t, 112.6, metrics.TokensPerSecond, 0.1) // 290 / 2.575455 ≈ 112.6
 
+	// Verify timing conversions
+	assert.Equal(t, int32(2000), metrics.PromptMs)     // 2000000000 ns / 1000000
+	assert.Equal(t, int32(2575), metrics.GenerationMs) // 2575455000 ns / 1000000
+	assert.Equal(t, int32(5589), metrics.TotalMs)      // 5589157167 ns / 1000000
+	assert.Equal(t, int32(3013), metrics.ModelLoadMs)  // 3013701500 ns / 1000000
+}
+
+// TestIntegration_PerformanceRegression ensures the new implementation is fast
+func TestIntegration_PerformanceRegression(t *testing.T) {
+	// Skip in short mode
+	if testing.Short() {
+		t.Skip("Skipping performance test in short mode")
+	}
+
+	ollamaResponse := []byte(`{
+		"model": "llama2",
+		"done": true,
+		"eval_count": 290,
+		"eval_duration": 2575455000
+	}`)
+
+	profile := &mockProfile{
+		name: "ollama",
+		config: &domain.ProfileConfig{
+			Metrics: domain.MetricsConfig{
+				Extraction: domain.MetricsExtractionConfig{
+					Enabled: true,
+					Paths: map[string]string{
+						"output_tokens":    "$.eval_count",
+						"eval_duration_ns": "$.eval_duration",
+					},
+				},
+			},
+		},
+	}
+
+	factory := &mockProfileFactory{
+		profiles: map[string]*mockProfile{
+			"ollama": profile,
+		},
+	}
+
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	testLogger := logger.NewPlainStyledLogger(log)

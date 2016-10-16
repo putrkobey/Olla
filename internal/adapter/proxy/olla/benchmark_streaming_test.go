@@ -70,3 +70,39 @@ func BenchmarkStreamingLastChunk(b *testing.B) {
 						copy(state.lastChunkBuf[:], buffer[:n])
 						state.lastChunk = state.lastChunkBuf[:n]
 					} else {
+						state.lastChunk = make([]byte, n)
+						copy(state.lastChunk, buffer[:n])
+					}
+				}
+				w.Write(buffer[:n])
+			}
+		}
+	})
+
+	b.Run("PreAllocated_OversizedChunk", func(b *testing.B) {
+		buffer := make([]byte, 16384) // Larger buffer for this test
+		// 12KB chunk - exceeds pre-allocated buffer (rare case)
+		data := make([]byte, 12288)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+		w := httptest.NewRecorder()
+		state := &streamState{} // Allocate once outside the loop
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for range b.N {
+			resp := &http.Response{
+				Body: io.NopCloser(bytes.NewReader(data)),
+			}
+
+			n, err := resp.Body.Read(buffer)
+			if n > 0 {
+				if errors.Is(err, io.EOF) {
+					if n <= len(state.lastChunkBuf) {
+						copy(state.lastChunkBuf[:], buffer[:n])
+						state.lastChunk = state.lastChunkBuf[:n]
+					} else {
+						// Fallback allocation for oversized chunks
+						state.lastChunk = make([]byte, n)
