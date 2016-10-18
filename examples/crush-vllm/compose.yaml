@@ -1,0 +1,21 @@
+services:
+  # vLLM - High-performance GPU-optimised inference engine
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Cache directory for downloaded models
+      - vllm_cache:/root/.cache/huggingface
+    environment:
+      # HuggingFace settings
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}  # Optional: for gated models
+      # vLLM configuration
+      - VLLM_LOGGING_LEVEL=INFO
+    command:
+      # Model configuration
+      - "--model"
+      - "meta-llama/Meta-Llama-3.1-8B-Instruct"  # UPDATE: Change model here
+

@@ -1,0 +1,178 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/putrkobey/Olla/internal/adapter/converter"
+	"github.com/putrkobey/Olla/internal/adapter/registry"
+	"github.com/putrkobey/Olla/internal/adapter/registry/profile"
+	"github.com/putrkobey/Olla/internal/config"
+	"github.com/putrkobey/Olla/internal/core/constants"
+	"github.com/putrkobey/Olla/internal/core/domain"
+	"github.com/putrkobey/Olla/internal/logger"
+)
+
+// Mock repository for testing
+type mockRepository struct {
+	endpoints []*domain.Endpoint
+}
+
+func (m *mockRepository) GetAll(ctx context.Context) ([]*domain.Endpoint, error) {
+	return m.endpoints, nil
+}
+
+func (m *mockRepository) GetHealthy(ctx context.Context) ([]*domain.Endpoint, error) {
+	var healthy []*domain.Endpoint
+	for _, ep := range m.endpoints {
+		if ep.Status == domain.StatusHealthy {
+			healthy = append(healthy, ep)
+		}
+	}
+	return healthy, nil
+}
+
+func (m *mockRepository) GetRoutable(ctx context.Context) ([]*domain.Endpoint, error) {
+	return m.GetHealthy(ctx)
+}
+
+func (m *mockRepository) UpdateEndpoint(ctx context.Context, endpoint *domain.Endpoint) error {
+	return nil
+}
+
+func (m *mockRepository) LoadFromConfig(ctx context.Context, configs []config.EndpointConfig) error {
+	return nil
+}
+
+func (m *mockRepository) Exists(ctx context.Context, endpointURL *url.URL) bool {
+	for _, ep := range m.endpoints {
+		if ep.URL.String() == endpointURL.String() {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUnifiedModelsHandler_IncludeUnavailable(t *testing.T) {
+	// Setup logger
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	styledLogger := logger.NewPlainStyledLogger(log)
+
+	// Create test endpoints
+	healthyURL, _ := url.Parse("http://healthy:11434")
+	unhealthyURL, _ := url.Parse("http://unhealthy:11435")
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "healthy-endpoint",
+			URL:       healthyURL,
+			URLString: healthyURL.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "ollama",
+		},
+		{
+			Name:      "unhealthy-endpoint",
+			URL:       unhealthyURL,
+			URLString: unhealthyURL.String(),
+			Status:    domain.StatusUnhealthy,
+			Type:      "ollama",
+		},
+	}
+
+	// Create registry with test models
+	unifiedRegistry := registry.NewUnifiedMemoryModelRegistry(styledLogger, nil, nil, nil)
+	ctx := context.Background()
+
+	// Register models on both endpoints
+	models := []*domain.ModelInfo{
+		{Name: "llama3:latest"},
+		{Name: "phi:latest"},
+	}
+
+	// Register endpoints first
+	unifiedRegistry.RegisterEndpoint(endpoints[0])
+	unifiedRegistry.RegisterEndpoint(endpoints[1])
+
+	// Register models for both endpoints
+	err := unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[0], models)
+	require.NoError(t, err)
+	err = unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[1], models)
+	require.NoError(t, err)
+
+	// Wait for async unification (RegisterModels kicks off unifyModelsAsync in
+	// a goroutine per endpoint) to complete for BOTH endpoints. Polling on
+	// model count alone (len >= 2) is not sufficient: that can be satisfied
+	// after only the first endpoint's goroutine has merged in, before the
+	// second one adds its own SourceEndpoints entry - which is exactly what
+	// the assertions below (len(model.Olla.Availability) >= 2) depend on. Poll
+	// on availability/source-endpoint count directly instead.
+	require.Eventually(t, func() bool {
+		allModels, err := unifiedRegistry.GetUnifiedModels(ctx)
+		if err != nil || len(allModels) < 2 {
+			return false
+		}
+		for _, m := range allModels {
+			if len(m.SourceEndpoints) < 2 {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 10*time.Millisecond, "async unification did not merge both endpoints' availability")
+
+	// Verify models were registered
+	allModels, err := unifiedRegistry.GetUnifiedModels(ctx)
+	require.NoError(t, err)
+	t.Logf("Total unified models registered: %d", len(allModels))
+
+	// Create converter factory
+	converterFactory := converter.NewConverterFactory()
+
+	// Create application with mocks
+	app := &Application{
+		modelRegistry:    unifiedRegistry,
+		repository:       &mockRepository{endpoints: endpoints},
+		converterFactory: converterFactory,
+		logger:           styledLogger,
+	}
+
+	tests := []struct {
+		name               string
+		query              string
+		expectedModelCount int
+		description        string
+	}{
+		{
+			name:               "default_filters_unhealthy",
+			query:              "",
+			expectedModelCount: 2, // Both models, but only showing healthy endpoints
+			description:        "Default behavior shows models that have at least one healthy endpoint",
+		},
+		{
+			name:               "include_unavailable_false",
+			query:              "?include_unavailable=false",
+			expectedModelCount: 2, // Both models, but only showing healthy endpoints
+			description:        "Explicitly setting include_unavailable=false shows models with healthy endpoints",
+		},
+		{
+			name:               "include_unavailable_true",
+			query:              "?include_unavailable=true",
+			expectedModelCount: 2, // Models from both endpoints (but deduplicated)
+			description:        "Setting include_unavailable=true should show all models",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create request
+			req := httptest.NewRequest("GET", "/olla/models"+tt.query, nil)
+			w := httptest.NewRecorder()
+
