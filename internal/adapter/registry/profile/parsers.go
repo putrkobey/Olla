@@ -61,3 +61,67 @@ func (p *ollamaParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
 	models := make([]*domain.ModelInfo, 0, len(response.Models))
 	now := time.Now()
 
+	for _, ollamaModel := range response.Models {
+		if ollamaModel.Name == "" {
+			continue
+		}
+
+		modelInfo := &domain.ModelInfo{
+			Name:     ollamaModel.Name,
+			LastSeen: now,
+		}
+
+		if ollamaModel.Size != nil {
+			modelInfo.Size = *ollamaModel.Size
+		}
+
+		if ollamaModel.Description != nil {
+			modelInfo.Description = *ollamaModel.Description
+		}
+
+		if ollamaModel.Details != nil || ollamaModel.Digest != nil || ollamaModel.ModifiedAt != nil || len(ollamaModel.Capabilities) > 0 {
+			modelInfo.Details = createOllamaModelDetails(ollamaModel)
+		}
+
+		models = append(models, modelInfo)
+	}
+
+	return models, nil
+}
+
+func createOllamaModelDetails(ollamaModel OllamaModel) *domain.ModelDetails {
+	details := &domain.ModelDetails{}
+
+	// Newer Ollama releases report what a model can do. The kind is single-valued, so a model
+	// that lists vision is a vlm (it still generates text, so it keeps text-generation)
+	// and an embedding-only model is embeddings. A hybrid embedding+completion model
+	// stays untyped and keeps text-generation unless it also lists vision. Vision and
+	// tools are also declared as capabilities so they do not depend on the
+	// type_capabilities config; tools maps to function_calling, the tag
+	// extractRequiredCapabilities asks for. This replaces the earlier decision to leave
+	// both unmapped: model-less vision and tool requests are now steered to hosts whose
+	// models declare them, as they already were for backends that tag vision by name.
+	// Older Ollama reports nothing and stays untyped.
+	kind := ollamaModelKind(ollamaModel.Capabilities)
+	if kind != "" {
+		details.Type = &kind
+	}
+	// An embedder generates nothing, so a vision or tools entry beside "embedding" is not
+	// something a chat request should be steered by.
+	if kind != "embeddings" {
+		details.Capabilities = ollamaDeclaredCapabilities(ollamaModel.Capabilities)
+	}
+
+	if ollamaModel.Digest != nil {
+		details.Digest = ollamaModel.Digest
+	}
+
+	if ollamaModel.ModifiedAt != nil {
+		if parsedTime := util.ParseTime(*ollamaModel.ModifiedAt); parsedTime != nil {
+			details.ModifiedAt = parsedTime
+		}
+	}
+
+	if ollamaModel.Details != nil {
+		if ollamaModel.Details.ParameterSize != nil {
+			details.ParameterSize = ollamaModel.Details.ParameterSize
