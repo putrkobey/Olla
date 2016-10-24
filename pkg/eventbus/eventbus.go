@@ -109,3 +109,115 @@ func (eb *EventBus[T]) Subscribe(ctx context.Context) (<-chan T, func()) {
 
 // Publish sends an event to all active subscribers
 func (eb *EventBus[T]) Publish(event T) int {
+	if eb.isShutdown.Load() {
+		return 0
+	}
+
+	delivered := 0
+	now := time.Now().UnixNano()
+
+	eb.subscribers.Range(func(id string, sub *subscriber[T]) bool {
+		if !sub.isActive.Load() {
+			return true
+		}
+
+		// Double-check active status before sending to avoid race
+		if sub.isActive.Load() {
+			select {
+			case sub.ch <- event:
+				sub.lastActive.Store(now)
+				delivered++
+			default:
+				sub.dropped.Add(1)
+			}
+		}
+		return true
+	})
+
+	return delivered
+}
+
+// PublishAsync sends an event without blocking
+func (eb *EventBus[T]) PublishAsync(event T) {
+	if eb.isShutdown.Load() {
+		return
+	}
+	if eb.workerPool != nil {
+		eb.workerPool.PublishAsync(event)
+	}
+}
+
+// Drain blocks until every event queued via PublishAsync before this call
+// has been fully processed (delivered to or dropped by every subscriber).
+// See WorkerPool.Drain for the exact idle semantics and its call-order
+// contract with Shutdown. A no-op if the bus has no worker pool.
+func (eb *EventBus[T]) Drain() {
+	if eb.workerPool != nil {
+		eb.workerPool.Drain()
+	}
+}
+
+// Shutdown gracefully stops the event bus
+func (eb *EventBus[T]) Shutdown() {
+	if !eb.isShutdown.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Shutdown worker pool first
+	if eb.workerPool != nil {
+		eb.workerPool.Shutdown()
+	}
+
+	if eb.cleanupTicker != nil {
+		eb.cleanupTicker.Stop()
+		close(eb.stopCleanup)
+	}
+
+	// Mark all subscribers as inactive first
+	eb.subscribers.Range(func(id string, sub *subscriber[T]) bool {
+		sub.isActive.Store(false)
+		return true
+	})
+
+	// Clear subscribers map - channels will be GC'd when no longer referenced
+	// We don't close channels to avoid send-on-closed-channel panics
+	eb.subscribers.Clear()
+}
+
+// Stats returns overall event bus statistics
+func (eb *EventBus[T]) Stats() EventBusStats {
+	stats := EventBusStats{
+		IsShutdown: eb.isShutdown.Load(),
+	}
+	// QueueDropped is cumulative, worker-pool-level history rather than a
+	// function of current subscriber state, so report it even after
+	// shutdown - unlike TotalDropped/subscriber counts below, which only
+	// make sense while subscribers exist.
+	if eb.workerPool != nil {
+		stats.QueueDropped = eb.workerPool.Dropped()
+	}
+	if stats.IsShutdown {
+		return stats
+	}
+
+	eb.subscribers.Range(func(id string, sub *subscriber[T]) bool {
+		stats.TotalSubscribers++
+		if sub.isActive.Load() {
+			stats.ActiveSubscribers++
+		}
+		stats.TotalDropped += sub.dropped.Load()
+		return true
+	})
+
+	return stats
+}
+
+// EventBusStats provides aggregate metrics
+type EventBusStats struct {
+	TotalSubscribers  int
+	ActiveSubscribers int
+	TotalDropped      uint64
+	IsShutdown        bool
+	// QueueDropped counts events discarded before they reached a subscriber,
+	// because the worker pool's internal queue was full (see WorkerPool.dropped).
+	// This is distinct from TotalDropped, which counts events that reached a
