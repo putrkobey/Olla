@@ -41,18 +41,3 @@ func (a *Application) genericModelShowHandler(providerType string) http.HandlerF
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
-		}
-
-		var req struct {
-			Name string `json:"name"`
-		}
-
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request body", http.StatusBadRequest)
-			return
-		}
-
-		if req.Name == "" {
-			http.Error(w, "Model name is required", http.StatusBadRequest)
-			return
-		}

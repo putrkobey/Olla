@@ -60,3 +60,66 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 	resolvedModel := core.ResolvedModelName(ctx, endpoint, stats.Model)
 
 	// Snapshot config once for this request so all reads below are coherent even
+	// if UpdateConfig races concurrently.
+	cfg := s.configuration.Load()
+
+	// Check circuit breaker first. attempt is the probe correlation token when
+	// this call was admitted as a half-open probe (0 when the circuit was
+	// closed); it is threaded through to the recorder calls below so a late
+	// result from a superseded probe can't clobber the replacement's state.
+	cb := s.GetCircuitBreaker(endpoint.Name)
+	var attempt int64
+	if cb != nil {
+		var open bool
+		open, attempt = cb.IsOpen(HalfOpenStaleness)
+		if open {
+			rlog.Warn("Circuit breaker is open for endpoint", "endpoint", endpoint.Name)
+			// Wrap the typed sentinel so ExecuteWithRetry can recognise this as
+			// failover-eligible via errors.Is without falling into the generic
+			// connection-error path (which would demote persisted health).
+			err := fmt.Errorf("%w: endpoint %s", core.ErrCircuitBreakerOpen, endpoint.Name)
+			s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), err)
+			return err
+		}
+	}
+
+	// Build target URL using common function that respects preserve_path
+	targetURL := common.BuildTargetURL(r, endpoint, cfg.GetProxyPrefix())
+	stats.TargetUrl = targetURL.String()
+
+	// Log request dispatch after target URL is computed
+	ctxLogger := middleware.GetLogger(ctx)
+	if ctxLogger != nil {
+		ctxLogger.Info("Request dispatching",
+			"endpoint", endpoint.Name,
+			"target", stats.TargetUrl,
+			"model", stats.Model)
+	} else {
+		rlog.Info("Request dispatching", "endpoint", endpoint.Name, "target", stats.TargetUrl, "model", stats.Model)
+	}
+
+	// Get endpoint-specific connection pool and transport
+	pool := s.getOrCreateEndpointPool(endpoint.Name)
+	transport := pool.transport
+
+	// Rewrite model name in request body if this is an alias-resolved request
+	core.RewriteModelForAlias(ctx, r, endpoint)
+
+	// log at DEBUG when a model alias rewrite occurred so operators can correlate
+	// the alias name the client sent with the actual model dispatched to the backend
+	if resolvedModel != stats.Model {
+		rlog.Debug("Model alias rewritten for backend",
+			"alias", stats.Model,
+			"actual_model", resolvedModel,
+			"endpoint", endpoint.Name)
+	}
+
+	proxyReq, err := s.prepareProxyRequest(ctx, r, targetURL, endpoint, stats)
+	if err != nil {
+		if cb != nil {
+			cb.RecordFailure(attempt)
+		}
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), err)
+		return fmt.Errorf("failed to create proxy request: %w", err)
+	}
+
