@@ -1,0 +1,150 @@
+# LiteLLM unified gateway profile
+# Docs: https://litellm.ai/
+# Revised 17-08-2025
+# 17-08-2025 [TF]: Updated to match latest LiteLLM features and OpenAI compatibility 
+name: litellm
+version: "1.0"
+display_name: "LiteLLM"
+description: "Unified gateway to 100+ LLM providers with automatic fallbacks and load balancing"
+
+# Routing configuration
+routing:
+  prefixes:
+    - litellm
+    #- lite
+
+# API compatibility
+api:
+  openai_compatible: true
+  paths:
+    # Core OpenAI-compatible endpoints (always available)
+    - /                          # 0: root health check
+    - /health                    # 1: health check
+    - /v1/chat/completions       # 2: chat completions (primary)
+    - /v1/completions            # 3: text completions
+    - /v1/embeddings             # 4: embeddings
+    - /v1/models                 # 5: list models
+    # Alternative paths (some deployments)
+    - /chat/completions          # 6: chat completions (alt)
+    - /completions               # 7: text completions (alt)
+    - /embeddings                # 8: embeddings (alt)
+    - /models                    # 9: list models (alt)
+    # Health probes (Kubernetes deployments)
+    # Unsure if these are needed in proxy mode, but included for completeness
+    - /health/readiness          # 10: readiness probe
+    - /health/liveness           # 11: liveness probe
+    # /v1/responses needs LiteLLM 1.63.8+; older releases 404.
+    - /v1/responses # 12: OpenAI Responses API
+    - /v1/messages # 13: Anthropic Messages API (native proxy endpoint)
+    - /v1/messages/count_tokens # 14: Anthropic token count
+    # Note: Management endpoints (/key/*, /user/*, /team/*, /spend/*) 
+    # require database backend and are not available in basic proxy mode
+    
+  model_discovery_path: /v1/models
+  health_check_path: /health
+
+# Platform characteristics
+characteristics:
+  timeout: 5m  # Remote providers can be slow
+  max_concurrent_requests: 100  # LiteLLM handles high concurrency well
+  default_priority: 95  # High priority as a unified gateway
+  streaming_support: true
+  auth:
+    required: false     # optional but common in production deployments
+    types:
+      - bearer          # master key via Authorization: Bearer
+      - api_key         # some versions accept x-goog-api-key or custom header
+  
+# Detection hints for auto-discovery
+detection:
+  user_agent_patterns:
+    - "litellm/"
+  headers:
+    - "X-LiteLLM-Version"
+    - "X-LiteLLM-Provider"
+  path_indicators:
+    - "/v1/models"
+    - "/health"
+    - "/model/info"
+    - "/key/generate"
+  default_ports:
+    - 4000  # LiteLLM proxy default
+    - 8000  # Common alternative
+    - 8080  # Another common port
+
+# Model handling
+models:
+  name_format: "{{.Name}}"
+  # LiteLLM uses provider-prefixed model names
+  provider_prefixes:
+    - "openai/"
+    - "azure/"
+    - "bedrock/"
+    - "anthropic/"
+    - "cohere/"
+    - "together_ai/"
+    - "replicate/"
+    - "huggingface/"
+    - "vertex_ai/"
+    - "palm/"
+    - "gemini/"
+    - "groq/"
+    - "mistral/"
+    - "deepinfra/"
+    - "perplexity/"
+    - "anyscale/"
+    - "cloudflare/"
+    - "voyage/"
+    - "databricks/"
+    - "ai21/"
+    - "nlp_cloud/"
+    - "aleph_alpha/"
+    - "baseten/"
+    - "openrouter/"
+    - "custom/"  # Custom endpoints
+    
+  capability_patterns:
+    chat:
+      # OpenAI models
+      - "gpt-5*"
+      - "gpt-4*"
+      - "gpt-3.5*"
+      - "chatgpt*"
+      # Anthropic models
+      - "claude-*"
+      - "anthropic/*"
+      # Google models
+      - "gemini*"
+      - "palm*"
+      - "chat-bison*"
+      # Open models
+      - "llama*"
+      - "mistral*"
+      - "mixtral*"
+      - "vicuna*"
+      - "alpaca*"
+      - "wizardlm*"
+      - "mpt*"
+      - "falcon*"
+      - "starchat*"
+      # Cohere models
+      - "command*"
+      # Provider-prefixed
+      - "*/gpt-*"
+      - "*/claude-*"
+      - "*/llama*"
+      - "*/mistral*"
+      
+    embeddings:
+      - "*embedding*"
+      - "voyage-*"
+      - "embed-*"
+      - "text-embedding-*"
+      - "*/embedding*"
+      - "cohere/embed-*"
+      - "openai/text-embedding-*"
+      - "bedrock/amazon.titan-embed*"
+      
+    vision:
+      - "gpt-5-vision*"
+      - "gpt-5-turbo*"
