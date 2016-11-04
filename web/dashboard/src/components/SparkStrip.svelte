@@ -192,3 +192,100 @@
 
   // --- hover reading (progressive enhancement for pointer users) ---
   let chartEl: HTMLElement | null = $state(null);
+  let hoverIndex = $state<number | null>(null);
+
+  const hoverSample = $derived(hoverIndex !== null ? view[hoverIndex] ?? null : null);
+  const guidePct = $derived(
+    hoverIndex !== null && view.length >= 2 ? (hoverIndex / (view.length - 1)) * 100 : 0,
+  );
+  const tooltipPct = $derived(Math.max(15, Math.min(85, guidePct)));
+
+  function onPointerMove(e: PointerEvent): void {
+    if (!chartEl || view.length < 2) return;
+    const rect = chartEl.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const fraction = (e.clientX - rect.left) / rect.width;
+    hoverIndex = nearestSampleIndex(fraction, view.length);
+  }
+
+  function onPointerLeave(): void {
+    hoverIndex = null;
+  }
+</script>
+
+<div class="spark-strip">
+  <div
+    class="spark-chart"
+    bind:this={chartEl}
+    onpointermove={onPointerMove}
+    onpointerleave={onPointerLeave}
+    role="img"
+    aria-label={ariaLabel}
+  >
+    <svg class="spark-svg" viewBox="0 0 {W} {H}" preserveAspectRatio="none" aria-hidden="true">
+      {#if !warming}
+        {#each outages as o}
+          <rect class="spark-outage" x={o.x} y="0" width={o.width} height={H} />
+        {/each}
+        <path class="spark-area" d={reqAreaD} />
+        <path class="spark-edge" d={reqEdgeD} />
+        <path class="spark-line" d={connLineD} />
+        {#each outages as o}
+          <line class="spark-outage-edge" x1={o.downX} y1="0" x2={o.downX} y2={H} />
+          {#if o.recovered}
+            <line class="spark-outage-edge" x1={o.recoveryX} y1="0" x2={o.recoveryX} y2={H} />
+          {/if}
+        {/each}
+      {/if}
+    </svg>
+    {#if !warming}
+      <span class="spark-axis spark-axis-top">{maxReqLabel}</span>
+      <span class="spark-axis spark-axis-bottom">0</span>
+    {/if}
+    {#if hoverSample && view.length >= 2}
+      <div class="spark-guide" class:is-error={hoverSample.error} style="left: {guidePct}%"></div>
+      <div class="spark-tooltip" style="left: {tooltipPct}%">
+        {#if hoverSample.error}
+          connection lost · {fmtDuration(Date.now() - hoverSample.t)} ago
+        {:else}
+          {hoverSample.reqPerSec.toFixed(1)} req/s · {fmtInt(hoverSample.activeConnections)} conns · {fmtDuration(Date.now() - hoverSample.t)} ago
+        {/if}
+      </div>
+    {/if}
+    {#if warming}
+      <span class="spark-hint">gathering data</span>
+    {/if}
+  </div>
+  <!-- Rendered unconditionally (never behind {#if latest}) so the first
+       sample landing does not add a line and shift the header strip, which in
+       turn shifts every panel below it. Height stays constant because the
+       span is always a single nowrap line at a fixed line-height (see
+       .spark-readout) - placeholder or reading, never zero versus one line.
+       The em-dash placeholder matches the rest of the dashboard's no-data
+       convention. -->
+  <span class="spark-readout">
+    {#if latest}
+      {#if latest.error}
+        connection lost
+      {:else}
+        {latest.reqPerSec.toFixed(1)} req/s · {fmtInt(latest.activeConnections)} conns
+      {/if}
+    {:else}
+      &mdash;
+    {/if}
+  </span>
+</div>
+
+<style>
+  .spark-strip {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    padding: var(--space-3) var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .spark-chart {
+    position: relative;
+    width: 100%;
+    height: 88px;
