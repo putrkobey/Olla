@@ -100,3 +100,105 @@ func TestGetClientIP_EmptyTrustedCIDRs(t *testing.T) {
 
 func TestParseTrustedCIDRs_Valid(t *testing.T) {
 	cidrs := []string{
+		"192.168.0.0/16",
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"127.0.0.1/32",
+	}
+
+	networks, err := ParseTrustedCIDRs(cidrs)
+	if err != nil {
+		t.Fatalf("ParseTrustedCIDRs failed: %v", err)
+	}
+
+	if len(networks) != 4 {
+		t.Errorf("Expected 4 networks, got %d", len(networks))
+	}
+
+	// Test that 192.168.1.100 is in the first network
+	testIP := net.ParseIP("192.168.1.100")
+	if !networks[0].Contains(testIP) {
+		t.Error("192.168.1.100 should be in 192.168.0.0/16")
+	}
+}
+
+func TestParseTrustedCIDRs_Invalid(t *testing.T) {
+	cidrs := []string{
+		"192.168.0.0/16",
+		"invalid-cidr",
+		"10.0.0.0/8",
+	}
+
+	_, err := ParseTrustedCIDRs(cidrs)
+	if err == nil {
+		t.Error("Expected error for invalid CIDR")
+	}
+}
+
+func TestParseTrustedCIDRs_Empty(t *testing.T) {
+	networks, err := ParseTrustedCIDRs([]string{})
+	if err != nil {
+		t.Fatalf("ParseTrustedCIDRs failed with empty slice: %v", err)
+	}
+	if networks != nil {
+		t.Error("Expected nil for empty CIDR list")
+	}
+}
+
+func TestParseTrustedCIDRs_WithSpaces(t *testing.T) {
+	cidrs := []string{
+		" 192.168.0.0/16 ",
+		"  10.0.0.0/8",
+		"172.16.0.0/12  ",
+		"", // Empty string should be skipped
+	}
+
+	networks, err := ParseTrustedCIDRs(cidrs)
+	if err != nil {
+		t.Fatalf("ParseTrustedCIDRs failed: %v", err)
+	}
+
+	if len(networks) != 3 {
+		t.Errorf("Expected 3 networks (empty string skipped), got %d", len(networks))
+	}
+}
+
+func TestIsIPInTrustedCIDRs(t *testing.T) {
+	cidrs, _ := ParseTrustedCIDRs([]string{
+		"192.168.0.0/16",
+		"10.0.0.0/8",
+	})
+
+	testCases := []struct {
+		ip       string
+		expected bool
+	}{
+		{"192.168.0.1", true},
+		{"192.168.1.100", true},
+		{"192.168.255.255", true},
+		{"10.0.0.1", true},
+		{"10.255.255.255", true},
+		{"172.16.0.1", false},
+		{"203.0.113.1", false},
+		{"127.0.0.1", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.ip, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			result := isIPInTrustedCIDRs(ip, cidrs)
+			if result != tc.expected {
+				t.Errorf("IP %s: expected %v, got %v", tc.ip, tc.expected, result)
+			}
+		})
+	}
+}
+
+func TestGetSourceIP(t *testing.T) {
+	testCases := []struct {
+		remoteAddr string
+		expected   string
+	}{
+		{"192.168.1.100:12345", "192.168.1.100"},
+		{"10.0.0.1:80", "10.0.0.1"},
+		{"[::1]:8080", "::1"},
