@@ -45,3 +45,27 @@ func makeUserFriendlyError(err error, duration time.Duration, errorContext strin
 		if duration < 10*time.Second {
 			return fmt.Errorf("request cancelled after %.1fs - client disconnected early (LLM responses may take 30-60+ seconds)", duration.Seconds())
 		}
+		return fmt.Errorf("request cancelled after %.1fs - client disconnected during processing", duration.Seconds())
+
+	case errors.Is(err, context.DeadlineExceeded):
+		if responseTimeout > 0 {
+			return fmt.Errorf("request timeout after %.1fs - server timeout of %.1fs exceeded (LLM model taking longer than expected)",
+				duration.Seconds(), responseTimeout.Seconds())
+		}
+		return fmt.Errorf("request timeout after %.1fs - server timeout exceeded (LLM response took too long)", duration.Seconds())
+
+	case errors.Is(err, io.EOF):
+		if errorContext == "streaming" {
+			if duration < 5*time.Second {
+				return fmt.Errorf("AI backend closed connection after %.1fs - response ended prematurely", duration.Seconds())
+			}
+			return fmt.Errorf("AI backend closed connection after %.1fs - response stream ended unexpectedly", duration.Seconds())
+		}
+		return fmt.Errorf("connection closed after %.1fs - AI backend ended communication unexpectedly", duration.Seconds())
+	}
+
+	// Network connection errors
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return fmt.Errorf("network timeout after %.1fs - unable to connect to LLM backend (check backend availability)", duration.Seconds())
