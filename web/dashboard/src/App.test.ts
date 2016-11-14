@@ -39,3 +39,17 @@ describe('App navigation authority', () => {
     navigation.set('endpoints');
     flushSync();
 
+    // The panel actually rendered...
+    expect(document.getElementById('panel-endpoints')).not.toBeNull();
+    expect(document.getElementById('panel-overview')).toBeNull();
+    // ...and the tab bar agrees, rather than still announcing Overview.
+    expect(document.getElementById('tab-endpoints')!.getAttribute('aria-selected')).toBe('true');
+    expect(document.getElementById('tab-overview')!.getAttribute('aria-selected')).toBe('false');
+    expect(document.getElementById('tab-endpoints')!.getAttribute('tabindex')).toBe('0');
+    expect(document.getElementById('tab-overview')!.getAttribute('tabindex')).toBe('-1');
+  });
+
+  it('arrow-key navigation continues from the correct tab after a programmatic jump', () => {
+    component = mount(App, { target: document.body });
+    flushSync();
+
