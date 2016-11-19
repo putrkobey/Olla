@@ -25,3 +25,12 @@ describe('Header clock', () => {
     component = mount(Header, { target: document.body });
     flushSync();
 
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+
+    const before = document.querySelector('.clock')?.textContent;
+
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2030-06-15T10:20:30Z'));
+    // Simulates the scheduler firing the clock job - this is the only
+    // legitimate way `now` moves; Header must react to it via getNow(),
+    // not its own timer.
