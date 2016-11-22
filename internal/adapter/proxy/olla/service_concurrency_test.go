@@ -1,0 +1,64 @@
+package olla
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/puzpuzpuz/xsync/v4"
+	"github.com/putrkobey/Olla/internal/adapter/proxy/config"
+	"github.com/putrkobey/Olla/internal/adapter/proxy/core"
+)
+
+// TestUpdateConfig_ConcurrentReadWrite verifies that concurrent UpdateConfig calls
+// and configuration reads do not produce a data race. The race detector catches
+// torn pointer reads, so this test is only meaningful under -race.
+func TestUpdateConfig_ConcurrentReadWrite(t *testing.T) {
+	t.Parallel()
+
+	s := &Service{
+		BaseProxyComponents: &core.BaseProxyComponents{
+			Logger: createTestLogger(),
+		},
+		endpointPools:   *xsync.NewMap[string, *connectionPool](),
+		circuitBreakers: *xsync.NewMap[string, *circuitBreaker](),
+	}
+	initial := &Configuration{}
+	initial.ReadTimeout = 10 * time.Second
+	initial.ResponseTimeout = 20 * time.Second
+	s.configuration.Store(initial)
+
+	const (
+		writers = 4
+		readers = 8
+		iters   = 500
+	)
+
+	var wg sync.WaitGroup
+
+	// Writers: repeatedly swap in a new config
+	for w := range writers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := range iters {
+				cfg := &Configuration{}
+				// Alternate between two timeout values so readers can verify
+				// they always see a valid (non-zero) value, never a partial write.
+				if (id+i)%2 == 0 {
+					cfg.ReadTimeout = 10 * time.Second
+					cfg.ResponseTimeout = 20 * time.Second
+				} else {
+					cfg.ReadTimeout = 30 * time.Second
+					cfg.ResponseTimeout = 60 * time.Second
+				}
+				s.UpdateConfig(cfg)
+			}
+		}(w)
+	}
+
+	// Readers: load the config and assert it is coherent (both fields set together)
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()

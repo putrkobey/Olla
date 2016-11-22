@@ -106,3 +106,39 @@ func BenchmarkStreamingLastChunk(b *testing.B) {
 					} else {
 						// Fallback allocation for oversized chunks
 						state.lastChunk = make([]byte, n)
+						copy(state.lastChunk, buffer[:n])
+					}
+				}
+				w.Write(buffer[:n])
+			}
+		}
+	})
+
+	// Comparison: Old allocation pattern (for reference)
+	b.Run("OldAllocation_SmallChunk", func(b *testing.B) {
+		buffer := make([]byte, 8192)
+		data := []byte(`{"choices":[{"delta":{"content":"test"},"finish_reason":"stop"}]}`)
+		w := httptest.NewRecorder()
+
+		// Create a mock state without pre-allocated buffer (simulating old code)
+		type oldStreamState struct {
+			lastChunk []byte
+		}
+		state := &oldStreamState{}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for range b.N {
+			resp := &http.Response{
+				Body: io.NopCloser(bytes.NewReader(data)),
+			}
+
+			n, err := resp.Body.Read(buffer)
+			if n > 0 {
+				if errors.Is(err, io.EOF) {
+					// Old pattern: always allocate
+					state.lastChunk = make([]byte, n)
+					copy(state.lastChunk, buffer[:n])
+				}
+				w.Write(buffer[:n])

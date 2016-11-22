@@ -26,3 +26,31 @@ find_latest_results() {
 }
 
 # Main execution
+main() {
+    print_header "Test Results Viewer"
+    
+    # Find latest results
+    local results_dir=$(find_latest_results)
+    if [[ -z "$results_dir" ]]; then
+        print_color "$RED" "No test results found!"
+        exit 1
+    fi
+    
+    print_color "$CYAN" "Latest test results: $results_dir"
+    echo ""
+    
+    # Show test run info if exists
+    if [[ -f "$results_dir/test-run-info.txt" ]]; then
+        print_section "Test Run Info"
+        cat "$results_dir/test-run-info.txt"
+        echo ""
+    fi
+    
+    # Show summary if exists
+    if [[ -f "$results_dir/summary.txt" ]]; then
+        print_section "Test Summary"
+        cat "$results_dir/summary.txt"
+        echo ""
+    fi
+    
+    # Show all test combinations
