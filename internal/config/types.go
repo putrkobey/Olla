@@ -1,0 +1,298 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/putrkobey/Olla/internal/core/domain"
+)
+
+// Config holds all configuration for the application
+type Config struct {
+
+	// ModelAliases maps a virtual model name (alias) to a list of actual model names
+	// that backends may know. When a request arrives with an alias model name, olla
+	// resolves it to all configured actual model names, finds endpoints that serve any
+	// of them, and rewrites the model name in the request to match the selected backend.
+	// Example:
+	//   model_aliases:
+	//     gpt-oss-120b:
+	//       - gpt-oss:120b
+	//       - gpt-oss-120b-MLX
+	//       - gguf_gpt_oss_120b.gguf
+	ModelAliases  map[string][]string `yaml:"model_aliases,omitempty"`
+	Logging       LoggingConfig       `yaml:"logging"`
+	Filename      string              `yaml:"-"`
+	UnknownKeys   []UnknownKey        `yaml:"-"` // keys in the file that nothing reads
+	Dashboard     DashboardConfig     `yaml:"dashboard"`
+	Translators   TranslatorsConfig   `yaml:"translators"`
+	ModelRegistry ModelRegistryConfig `yaml:"model_registry"`
+	Discovery     DiscoveryConfig     `yaml:"discovery"`
+	Server        ServerConfig        `yaml:"server"`
+	Proxy         ProxyConfig         `yaml:"proxy"`
+	Engineering   EngineeringConfig   `yaml:"engineering"`
+}
+
+// CorsConfig controls browser cross-origin access to the Olla API.
+// This matters when a browser-based client (OpenWebUI, a custom dashboard, etc.)
+// calls Olla from a different origin. Non-browser clients (curl, SDKs, other
+// services) ignore CORS headers entirely, so enabling this has no effect on them.
+//
+// Security note: combining AllowCredentials=true with AllowedOrigins=["*"] is
+// forbidden by the CORS spec — the browser will reject the response. Validate()
+// enforces this at startup rather than letting it silently break at runtime.
+//
+// ExposedHeaders is intentionally left empty here; the middleware phase will
+// automatically expose the full X-Olla-* response header set.
+type CorsConfig struct {
+	AllowedOrigins   []string `yaml:"allowed_origins"`
+	AllowedMethods   []string `yaml:"allowed_methods"`
+	AllowedHeaders   []string `yaml:"allowed_headers"`
+	ExposedHeaders   []string `yaml:"exposed_headers"`
+	MaxAge           int      `yaml:"max_age"`
+	Enabled          bool     `yaml:"enabled"`
+	AllowCredentials bool     `yaml:"allow_credentials"`
+}
+
+// ServerConfig holds HTTP server configuration
+type ServerConfig struct {
+	Host              string              `yaml:"host"`
+	Cors              CorsConfig          `yaml:"cors"`
+	RateLimits        ServerRateLimits    `yaml:"rate_limits"`
+	RequestLimits     ServerRequestLimits `yaml:"request_limits"`
+	Port              int                 `yaml:"port"`
+	ReadTimeout       time.Duration       `yaml:"read_timeout"`
+	ReadHeaderTimeout time.Duration       `yaml:"read_header_timeout"`
+	WriteTimeout      time.Duration       `yaml:"write_timeout"`
+	IdleTimeout       time.Duration       `yaml:"idle_timeout"`
+	ShutdownTimeout   time.Duration       `yaml:"shutdown_timeout"`
+	RequestLogging    bool                `yaml:"request_logging"`
+}
+
+// Validate checks CORS configuration for spec-violating combinations that would
+// silently break browser clients at runtime rather than failing loudly at startup.
+func (c *CorsConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	// rs/cors treats an empty AllowedOrigins list as allow-all, which is the
+	// opposite of what an operator expects when they write allowed_origins: [].
+	// Require an explicit ["*"] to opt into allow-all so the intent is unambiguous.
+	if len(c.AllowedOrigins) == 0 {
+		return errors.New("cors: allowed_origins must not be empty when cors is enabled; set [\"*\"] to allow all origins explicitly")
+	}
+	if c.MaxAge < 0 {
+		return fmt.Errorf("cors.max_age must be non-negative, got %d", c.MaxAge)
+	}
+	// The CORS spec forbids Access-Control-Allow-Origin: * when credentials are in play.
+	// Browsers will refuse the response, so this is a startup error rather than a warning.
+	if c.AllowCredentials {
+		for _, origin := range c.AllowedOrigins {
+			if origin == "*" {
+				return errors.New("cors: allow_credentials=true is incompatible with allowed_origins=[\"*\"]; list explicit origins instead")
+			}
+		}
+	}
+	return nil
+}
+
+// AccessPolicyConfig is a network-layer allow rule shared by the dashboard's
+// gated zones. A request must pass both checks; there is no auth behind them,
+// so network restriction is the only control.
+type AccessPolicyConfig struct {
+	// AllowedCIDRs is matched against the TCP-layer source from r.RemoteAddr
+	// only. Proxy headers (X-Forwarded-For, X-Real-IP) are never consulted,
+	// under any configuration: Olla's listener legitimately binds 0.0.0.0 and
+	// trusting those headers without a separate trust mechanism would let any
+	// client spoof past the gate. Required, non-empty, when the zone using
+	// this policy is active.
+	AllowedCIDRs []string `yaml:"allowed_cidrs"`
+
+	// AllowedHosts is matched against r.Host with the :port suffix stripped
+	// and the comparison case-insensitive. May be empty: any Host that parses
+	// as an IP literal is always accepted, so an operator browsing
+	// via http://192.168.1.10:40114/internal/ui/ needs no entry here. List
+	// only the non-IP hostnames you want to allow (e.g. a LAN mDNS name).
+	AllowedHosts []string `yaml:"allowed_hosts"`
+
+	// allowedCIDRsParsed is populated by Validate so the hot request path
+	// never re-parses. Validate must run once at startup before any handler
+	// wrapped by this policy accepts a request.
+	allowedCIDRsParsed []*net.IPNet
+}
+
+// DashboardConfig controls the embedded read-only admin dashboard, served from
+// the existing HTTP listener at /internal/ui/.
+type DashboardConfig struct {
+	// AccessPolicy gates /internal/ui/* unconditionally whenever Enabled is
+	// true. GateInternalAPI exists for forward compatibility but is inert on
+	// this branch (see GateInternalAPI).
+	AccessPolicy AccessPolicyConfig `yaml:"access_policy"`
+
+	// Enabled controls whether /internal/ui/* routes are registered at all.
+	// The embedded assets are always compiled into the binary; this only
+	// governs whether they are ever served.
+	Enabled bool `yaml:"enabled"`
+
+	// GateInternalAPI is reserved for a later change that opts the rest of
+	// /internal/* (and /version) into the same AccessPolicy. It is INERT for
+	// now: setting it true has no effect. Defaults to false because
+	// defaulting it on would silently break existing deployments that scrape
+	// /internal/metrics or poll /internal/health from hosts the policy would
+	// reject. The field ships now so that later change needs no config migration.
+	GateInternalAPI bool `yaml:"gate_internal_api"`
+}
+
+// ParsedCIDRs returns the CIDR nets populated by AccessPolicyConfig.Validate.
+// Returns nil if Validate has not run, which the dashboard registration helper
+// treats as deny-all rather than silently allowing everything.
+func (c *DashboardConfig) ParsedCIDRs() []*net.IPNet {
+	return c.AccessPolicy.allowedCIDRsParsed
+}
+
+// Validate parses the access policy's CIDRs so the request path doesn't have
+// to. No-op when the dashboard is disabled, so an explicit off switch validates
+// clean without forcing the operator to also populate the allowlists.
+//
+// GateInternalAPI is deliberately inert for now (the wrapping that would
+// extend AccessPolicy to the rest of /internal/* isn't implemented yet), so a
+// startup slog.Warn fires when it is set true. Without the warning an operator
+// who sets the flag sees silent acceptance, assumes the gate is active, and
+// is surprised when /internal/* stays open. The field itself is kept so that
+// later change needs no config migration.
+func (c *DashboardConfig) Validate() error {
+	if c.GateInternalAPI {
+		slog.Warn("dashboard.gate_internal_api is set but inert on this build; /internal/* is NOT gated by the dashboard access policy",
+			"gate_internal_api", true,
+			"reason", "wrapping is not yet wired; treating the flag as a no-op to preserve existing monitoring scrapes")
+	}
+	if !c.Enabled {
+		return nil
+	}
+	if err := c.AccessPolicy.Validate("dashboard"); err != nil {
+		return fmt.Errorf("dashboard config invalid: %w", err)
+	}
+	return nil
+}
+
+// ValidateAccessPolicy checks the access policy's CIDRs parse and stashes the
+// parsed nets on the struct for the hot path. zone names the calling config in
+// errors so the operator can tell which section has the bad entry.
+func (c *AccessPolicyConfig) Validate(zone string) error {
+	if len(c.AllowedCIDRs) == 0 {
+		return fmt.Errorf("%s: access_policy.allowed_cidrs must not be empty", zone)
+	}
+	parsed := make([]*net.IPNet, 0, len(c.AllowedCIDRs))
+	for _, raw := range c.AllowedCIDRs {
+		_, network, err := net.ParseCIDR(raw)
+		if err != nil {
+			return fmt.Errorf("%s: invalid access_policy.allowed_cidrs entry %q: %w", zone, raw, err)
+		}
+		parsed = append(parsed, network)
+	}
+	c.allowedCIDRsParsed = parsed
+	return nil
+}
+
+// GetAddress returns the server address in host:port format
+func (s *ServerConfig) GetAddress() string {
+	return fmt.Sprintf("%s:%d", s.Host, s.Port)
+}
+
+// ServerRequestLimits defines request size and validation limits
+type ServerRequestLimits struct {
+	MaxBodySize   int64 `yaml:"max_body_size"`
+	MaxHeaderSize int64 `yaml:"max_header_size"`
+}
+
+// ServerRateLimits defines rate limiting configuration
+type ServerRateLimits struct {
+	TrustedProxyCIDRs       []string      `yaml:"trusted_proxy_cidrs"`
+	TrustedProxyCIDRsParsed []*net.IPNet  // to avoid parsing every time :D
+	GlobalRequestsPerMinute int           `yaml:"global_requests_per_minute"`
+	PerIPRequestsPerMinute  int           `yaml:"per_ip_requests_per_minute"`
+	BurstSize               int           `yaml:"burst_size"`
+	HealthRequestsPerMinute int           `yaml:"health_requests_per_minute"`
+	CleanupInterval         time.Duration `yaml:"cleanup_interval"`
+	TrustProxyHeaders       bool          `yaml:"trust_proxy_headers"`
+}
+
+// StickySessionConfig controls KV-cache affinity routing.
+// When enabled, the balancer wrapper remembers which backend handled a conversation
+// and routes subsequent turns to the same backend, maximising KV-cache reuse.
+type StickySessionConfig struct {
+	// KeySources lists the ordered cascade of strategies used to identify a conversation.
+	// The first match wins: session_header, prefix_hash, auth_header, ip.
+	KeySources     []string `yaml:"key_sources"`
+	MaxSessions    uint64   `yaml:"max_sessions"`
+	IdleTTLSeconds int      `yaml:"idle_ttl_seconds"`
+	// PrefixHashBytes is how many leading bytes of the messages field to hash.
+	// Larger values increase hash uniqueness at the cost of slightly more CPU per request.
+	PrefixHashBytes int  `yaml:"prefix_hash_bytes"`
+	Enabled         bool `yaml:"enabled"`
+}
+
+// ProxyConfig holds proxy-specific configuration
+type ProxyConfig struct {
+	ProfileFilter         *domain.FilterConfig `yaml:"profile_filter,omitempty"`
+	Engine                string               `yaml:"engine"`
+	LoadBalancer          string               `yaml:"load_balancer"`
+	Profile               string               `yaml:"profile"`
+	StickySessions        StickySessionConfig  `yaml:"sticky_sessions"`
+	ConnectionTimeout     time.Duration        `yaml:"connection_timeout"`
+	ConnectionKeepAlive   time.Duration        `yaml:"connection_keep_alive"`
+	ResponseTimeout       time.Duration        `yaml:"response_timeout"`
+	ReadTimeout           time.Duration        `yaml:"read_timeout"`
+	ResponseHeaderTimeout time.Duration        `yaml:"response_header_timeout"`
+	TLSHandshakeTimeout   time.Duration        `yaml:"tls_handshake_timeout"`
+	RetryBackoff          time.Duration        `yaml:"retry_backoff"` // Deprecated: unused, set proxy.retry instead. TODO: Removal: v0.1.0
+	StreamBufferSize      int                  `yaml:"stream_buffer_size"`
+	MaxRetries            int                  `yaml:"max_retries"` // Deprecated: unused, set proxy.retry instead. TODO: Removal: v0.1.0
+	Retry                 RetryConfig          `yaml:"retry"`
+}
+
+// RetryConfig controls failover between endpoints for a single request. Only
+// connection failures fail over; timeouts and HTTP error statuses do not.
+type RetryConfig struct {
+	MaxAttempts   int  `yaml:"max_attempts"`   // 0 = every eligible endpoint once
+	Enabled       bool `yaml:"enabled"`        // false = one attempt, no failover
+	NonIdempotent bool `yaml:"non_idempotent"` // allow POST/PATCH/DELETE to fail over after a connection failure
+}
+
+// DiscoveryConfig holds service discovery configuration
+type DiscoveryConfig struct {
+	Type            string                `yaml:"type"` // Only "static" is implemented
+	Static          StaticDiscoveryConfig `yaml:"static"`
+	RefreshInterval time.Duration         `yaml:"refresh_interval"`
+	ModelDiscovery  ModelDiscoveryConfig  `yaml:"model_discovery"`
+}
+
+// ModelDiscoveryConfig holds model discvery specific settings
+type ModelDiscoveryConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	Interval          time.Duration `yaml:"interval"`
+	Timeout           time.Duration `yaml:"timeout"`
+	ConcurrentWorkers int           `yaml:"concurrent_workers"`
+	RetryAttempts     int           `yaml:"retry_attempts"`
+	RetryBackoff      time.Duration `yaml:"retry_backoff"`
+}
+
+// StaticDiscoveryConfig holds static endpoint configuration
+type StaticDiscoveryConfig struct {
+	Endpoints []EndpointConfig `yaml:"endpoints"`
+}
+
+// AuthConfig holds per-endpoint outbound authentication configuration.
+// Inline credential and _file variants are mutually exclusive; validation
+// (fatal startup error on conflict) is enforced in P3.
+type AuthConfig struct {
+	// header overrides the default header name for api_key auth (default X-Api-Key).
+	Header       string `yaml:"header,omitempty"`
+	Token        string `yaml:"token,omitempty"`
+	TokenFile    string `yaml:"token_file,omitempty"`
