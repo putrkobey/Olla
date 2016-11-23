@@ -141,3 +141,291 @@ func TestIsIdempotent(t *testing.T) {
 		})
 	}
 }
+
+// TestResponseStartedWriter_TracksWrites verifies that the sentinel wrapper sets
+// started=true on both WriteHeader and Write calls.
+func TestResponseStartedWriter_TracksWrites(t *testing.T) {
+	t.Parallel()
+
+	t.Run("WriteHeader sets started", func(t *testing.T) {
+		t.Parallel()
+		rw := &ResponseStartedWriter{ResponseWriter: httptest.NewRecorder()}
+		assert.False(t, rw.started)
+		rw.WriteHeader(http.StatusOK)
+		assert.True(t, rw.started)
+	})
+
+	t.Run("Write sets started", func(t *testing.T) {
+		t.Parallel()
+		rw := &ResponseStartedWriter{ResponseWriter: httptest.NewRecorder()}
+		assert.False(t, rw.started)
+		_, _ = rw.Write([]byte("hello"))
+		assert.True(t, rw.started)
+	})
+
+	t.Run("neither called: not started", func(t *testing.T) {
+		t.Parallel()
+		rw := &ResponseStartedWriter{ResponseWriter: httptest.NewRecorder()}
+		assert.False(t, rw.started)
+	})
+}
+
+// TestRetry_POSTWithBytesWritten_NoRetry is the critical correctness test.
+// An httptest backend writes 100 bytes then RSTs. ExecuteWithRetry must NOT
+// retry to a second endpoint because the response has already started.
+func TestRetry_POSTWithBytesWritten_NoRetry(t *testing.T) {
+	t.Parallel()
+
+	attemptsHit := 0
+
+	// Backend: write 100 bytes then close the connection abruptly.
+	// We hijack the connection to send a TCP RST after the body begins.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 100))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Hijack and close to simulate a mid-stream RST.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			return
+		}
+		conn, _, _ := hj.Hijack()
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+
+	h := newTestRetryHandler(t)
+	ep1 := namedEndpoint("ep1")
+	ep2 := namedEndpoint("ep2")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ep *domain.Endpoint, s *ports.RequestStats) error {
+		attemptsHit++
+		// Simulate: write the headers + bytes, then return a connection error.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 100))
+		return &connectionResetError{}
+	}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req, []*domain.Endpoint{ep1, ep2},
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	// Error expected; the stream failed.
+	require.Error(t, err)
+	// Critically: only ONE attempt. Retrying would double-bill the user.
+	assert.Equal(t, 1, attemptsHit, "must not retry POST after response bytes flushed to client")
+}
+
+// TestRetry_POSTBeforeBytesWritten_DoesRetry confirms that a connection error
+// before any bytes are written still triggers failover, even for POST.
+func TestRetry_POSTBeforeBytesWritten_DoesRetry(t *testing.T) {
+	t.Parallel()
+
+	attemptsHit := 0
+
+	h := newTestRetryHandler(t)
+	ep1 := namedEndpoint("ep1")
+	ep2 := namedEndpoint("ep2")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ep *domain.Endpoint, s *ports.RequestStats) error {
+		attemptsHit++
+		if attemptsHit == 1 {
+			// First attempt: connection error before writing anything.
+			return &connectionResetError{}
+		}
+		// Second attempt: success.
+		w.WriteHeader(http.StatusOK)
+		return nil
+	}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req, []*domain.Endpoint{ep1, ep2},
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, attemptsHit, "POST should retry when no bytes have been written yet")
+}
+
+// TestRetry_GETMidStreamRST_NoRetry pins the replay fix: once bytes have reached
+// the client a GET must not be replayed either, or the client receives the first
+// backend's partial output followed by the second backend's full response.
+func TestRetry_GETMidStreamRST_NoRetry(t *testing.T) {
+	t.Parallel()
+
+	attemptsHit := 0
+
+	h := newTestRetryHandler(t)
+	ep1 := namedEndpoint("ep1")
+	ep2 := namedEndpoint("ep2")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ep *domain.Endpoint, s *ports.RequestStats) error {
+		attemptsHit++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		return &connectionResetError{}
+	}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req, []*domain.Endpoint{ep1, ep2},
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	require.Error(t, err)
+	assert.Equal(t, 1, attemptsHit, "GET must not be replayed once response bytes were written")
+	assert.Equal(t, "partial", w.Body.String(), "client must see only the first attempt's bytes")
+}
+
+// TestRetry_ConnectionErrorThenCBOpen_ReportsMixedFailure covers the CB-open
+// mislabelling bug: buildFinalError used to classify total exhaustion purely
+// off lastErr, so a genuine connection error on an earlier endpoint got
+// silently swallowed by a CB-open rejection on the last one. The final error
+// must mention both failure classes, not just whichever happened last.
+func TestRetry_ConnectionErrorThenCBOpen_ReportsMixedFailure(t *testing.T) {
+	t.Parallel()
+
+	h := newTestRetryHandler(t)
+	ep1 := namedEndpoint("ep1")
+	ep2 := namedEndpoint("ep2")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	attemptsHit := 0
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ep *domain.Endpoint, s *ports.RequestStats) error {
+		attemptsHit++
+		if attemptsHit == 1 {
+			// ep1: a real network failure.
+			return &connectionResetError{}
+		}
+		// ep2: the breaker is open, not a network problem.
+		return ErrCircuitBreakerOpen
+	}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req, []*domain.Endpoint{ep1, ep2},
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	require.Error(t, err)
+	assert.Equal(t, 2, attemptsHit)
+	assert.ErrorIs(t, err, ErrCircuitBreakerOpen, "must still chain to the sentinel for errors.Is callers")
+	msg := err.Error()
+	assert.Contains(t, msg, "connection failure", "must not hide the earlier connection error")
+	assert.Contains(t, msg, "circuit breaker open", "must still surface the CB-open rejection")
+}
+
+// TestRetry_AllEndpointsCBOpen_StillReportsCBOpen guards against a regression
+// in the other direction: when every endpoint is CB-open and none failed on
+// the network, the message must stay exactly "circuit breaker open", not the
+// mixed-failure wording that would misleadingly imply a connection error.
+func TestRetry_AllEndpointsCBOpen_StillReportsCBOpen(t *testing.T) {
+	t.Parallel()
+
+	h := newTestRetryHandler(t)
+	ep1 := namedEndpoint("ep1")
+	ep2 := namedEndpoint("ep2")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	attemptsHit := 0
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ep *domain.Endpoint, s *ports.RequestStats) error {
+		attemptsHit++
+		return ErrCircuitBreakerOpen
+	}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req, []*domain.Endpoint{ep1, ep2},
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	require.Error(t, err)
+	assert.Equal(t, 2, attemptsHit)
+	assert.ErrorIs(t, err, ErrCircuitBreakerOpen)
+	msg := err.Error()
+	assert.Contains(t, msg, "circuit breaker open")
+	assert.NotContains(t, msg, "connection failure", "no connection error occurred, must not claim one did")
+}
+
+// TestResponseStartedWriter_Unwrap verifies that Flush works through the wrapper via
+// http.NewResponseController. Without Unwrap(), the controller cannot reach the
+// underlying flusher and SSE streams stall silently.
+func TestResponseStartedWriter_Unwrap(t *testing.T) {
+	t.Parallel()
+
+	inner := httptest.NewRecorder()
+	rw := &ResponseStartedWriter{ResponseWriter: inner}
+
+	rc := http.NewResponseController(rw)
+	if err := rc.Flush(); err != nil {
+		t.Errorf("Flush() via ResponseController on wrapped writer = %v, want nil", err)
+	}
+}
+
+// flushRecordingWriter wraps httptest.ResponseRecorder and records whether
+// Flush was called, so tests can prove a flush actually reached the
+// underlying writer rather than just observing the tracker's own state.
+type flushRecordingWriter struct {
+	*httptest.ResponseRecorder
+	flushed bool
+}
+
+func (w *flushRecordingWriter) Flush() {
+	w.flushed = true
+	w.ResponseRecorder.Flush()
+}
+
+// TestResponseStartedWriter_BareFlush_MarksStarted is the repro for the
+// CodeRabbit finding: http.NewResponseController(tracker).Flush() used to walk
+// straight past the wrapper via Unwrap() to the underlying writer's Flush,
+// leaving tracker.Started() false even though bytes were flushed to the
+// client. Before the fix this assertion failed (started_after_bare_flush was
+// false); FlushError/Flush now mark started before delegating, closing the gap.
+func TestResponseStartedWriter_BareFlush_MarksStarted(t *testing.T) {
+	t.Parallel()
+
+	inner := &flushRecordingWriter{ResponseRecorder: httptest.NewRecorder()}
+	tracker := NewResponseStartedWriter(inner)
+
+	require.False(t, tracker.Started(), "sanity: not started before any write or flush")
+
+	rc := http.NewResponseController(tracker)
+	require.NoError(t, rc.Flush())
+
+	assert.True(t, tracker.Started(), "started_after_bare_flush must be true: a flush commits the response")
+	assert.True(t, inner.flushed, "the underlying writer's Flush must actually have been invoked")
+	assert.True(t, inner.ResponseRecorder.Flushed, "httptest.ResponseRecorder.Flushed must be true through the wrapper")
+}
+
+// TestResponseStartedWriter_FlushError_NotSupported confirms FlushError
+// surfaces http.ErrNotSupported (matching stdlib ResponseController
+// convention) rather than panicking or silently swallowing the failure, when
+// nothing in the chain supports flushing. It must also leave Started() false:
+// an unsupported flush commits nothing, so handleProxyError must still be
+// free to write an error response (CodeRabbit PRRT_kwDOOvLJ9s6XdGod).
+type nonFlushingWriter struct {
+	http.ResponseWriter
+}
+
+func TestResponseStartedWriter_FlushError_NotSupported(t *testing.T) {
+	t.Parallel()
+
+	// httptest.ResponseRecorder implements Flush, so wrap it in a type that
+	// only exposes the plain ResponseWriter methods to hide it.
+	inner := &nonFlushingWriter{ResponseWriter: httptest.NewRecorder()}
+	tracker := NewResponseStartedWriter(inner)
+
+	err := tracker.FlushError()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, http.ErrNotSupported)
+	assert.False(t, tracker.Started(), "an unsupported flush commits nothing, so started must stay false")
+}
+
