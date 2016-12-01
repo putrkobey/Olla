@@ -19,3 +19,24 @@ services:
       - "--model"
       - "meta-llama/Meta-Llama-3.1-8B-Instruct"  # UPDATE: Change model here
 
+      # Performance tuning
+      - "--max-model-len"
+      - "8192"                           # Context window size
+      - "--gpu-memory-utilization"
+      - "0.9"                            # Use 90% of GPU memory
+      - "--max-num-seqs"
+      - "256"                            # Max concurrent sequences
+
+      # API server configuration
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+
+      # Optimisations
+      - "--enable-prefix-caching"        # Enable prompt caching for repeated prompts
+      - "--disable-log-requests"         # Reduce logging overhead
+
+      # Optional: Tensor parallelism for multi-GPU (uncomment if you have multiple GPUs)
+      # - "--tensor-parallel-size"
+      # - "2"                            # Number of GPUs to use

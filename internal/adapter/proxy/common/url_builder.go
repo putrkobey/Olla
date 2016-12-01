@@ -21,27 +21,3 @@ import (
 func BuildTargetURL(r *http.Request, endpoint *domain.Endpoint, proxyPrefix string) *url.URL {
 	targetPath := util.StripPrefix(r.URL.Path, proxyPrefix)
 	// A per-endpoint path is already the backend's own path: it carries no proxy prefix, and
-	// it replaces whatever path the request holds because that path was chosen for the fleet.
-	if paths, ok := r.Context().Value(constants.ContextEndpointPathMapKey).(map[string]string); ok {
-		if p, ok := paths[endpoint.GetURLString()]; ok && p != "" {
-			targetPath = p
-		}
-	}
-	if targetPath == "" {
-		targetPath = "/"
-	}
-
-	// preserve_path mode: ensure we don't let an absolute request path discard the endpoint prefix.
-	if endpoint.PreservePath && endpoint.URL.Path != "" && endpoint.URL.Path != "/" {
-		rel := strings.TrimPrefix(targetPath, "/") // avoid path.Join swallowing the base
-		joined := path.Join(endpoint.URL.Path, rel)
-
-		u := *endpoint.URL
-		u.Path = joined
-		u.RawQuery = r.URL.RawQuery
-		u.Fragment = ""
-		return &u
-	}
-
-	// Non-preserve mode: guard against traversal, including perbent-encoded dot segments.
-	// We accept that this also normalises repeated slashes.
