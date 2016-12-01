@@ -32,37 +32,3 @@ const EP_PREFIX = 'ep-';
 // fragment (percent-encoding, stray slashes, a copied URL truncated mid-key)
 // degrades to a panel-only route instead of masquerading as a target.
 const KEY_RE = /^[0-9a-z]+$/;
-
-// Parse the location hash into a route. Tolerant: any unrecognised value
-// falls back to overview so a stale or typo'd shared link never blanks the
-// whole dashboard.
-export function parseHash(hash: string): Route {
-  const h = hash.replace(/^#/, '').trim();
-  if (!h) return { panel: 'overview' };
-  const slash = h.indexOf('/');
-  const head = slash === -1 ? h : h.slice(0, slash);
-  const tail = slash === -1 ? '' : h.slice(slash + 1);
-  if (!SECTIONS.includes(head as Section)) return { panel: 'overview' };
-  const panel = head as Section;
-  if (panel === 'endpoints' && tail.startsWith(EP_PREFIX)) {
-    const key = tail.slice(EP_PREFIX.length);
-    if (KEY_RE.test(key)) return { panel, endpointKey: key };
-  }
-  return { panel };
-}
-
-// Serialise a route to the hash fragment (no leading '#').
-export function serializeRoute(r: Route): string {
-  if (r.panel === 'endpoints' && r.endpointKey) {
-    return `endpoints/${EP_PREFIX}${r.endpointKey}`;
-  }
-  return r.panel;
-}
-
-export function routeToHash(r: Route): string {
-  return `#${serializeRoute(r)}`;
-}
-
-export function currentRoute(): Route {
-  return parseHash(typeof location !== 'undefined' ? location.hash : '');
-}
