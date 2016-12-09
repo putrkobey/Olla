@@ -15,11 +15,3 @@ func TestOllamaDefaultTagName(t *testing.T) {
 		ok   bool
 	}{
 		{"all-minilm", "all-minilm:latest", true},
-		{"all-minilm:latest", "", false},
-		{"qwen2.5:0.5b", "", false},
-		{"library/foo", "library/foo:latest", true},
-		{"registry.example.com:5000/foo", "registry.example.com:5000/foo:latest", true},
-		{"registry.example.com:5000/foo:7b", "", false},
-		{"", "", false},
-		{"foo:", "", false},
-	}
