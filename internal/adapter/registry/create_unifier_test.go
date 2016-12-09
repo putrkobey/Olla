@@ -18,13 +18,3 @@ func TestCreateUnifier_UsesCallerFallbackAndLogsOnce(t *testing.T) {
 
 	cfg := unifier.DefaultConfig()
 	for name, create := range map[string]func() (ports.ModelUnifier, error){
-		"factory error": func() (ports.ModelUnifier, error) { return nil, errors.New("boom") },
-		"nil unifier":   func() (ports.ModelUnifier, error) { return nil, nil },
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			var buf bytes.Buffer
-			log := logger.NewPlainStyledLogger(slog.New(slog.NewTextHandler(&buf, nil)))
-
-			def := createUnifier(log, create, func() ports.ModelUnifier { return unifier.NewDefaultUnifierWithConfig(cfg) })
-			require.IsType(t, &unifier.DefaultUnifier{}, def)
