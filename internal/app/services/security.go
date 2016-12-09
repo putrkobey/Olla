@@ -44,3 +44,26 @@ func (s *SecurityService) Start(ctx context.Context) error {
 	// Factory requires full config structure for historical reasons
 	tempConfig := &config.Config{
 		Server: *s.serverConfig,
+	}
+
+	if s.statsService != nil {
+		collector, err := s.statsService.GetCollector()
+		if err != nil {
+			return fmt.Errorf("failed to get stats collector: %w", err)
+		}
+		s.statsCollector = collector
+	}
+
+	s.services, s.adapters = security.NewSecurityServices(tempConfig, s.statsCollector, s.logger)
+
+	s.logger.Info("Security services initialised",
+		"globalRateLimit", s.serverConfig.RateLimits.GlobalRequestsPerMinute,
+		"perIPRateLimit", s.serverConfig.RateLimits.PerIPRequestsPerMinute,
+		"maxBodySize", s.serverConfig.RequestLimits.MaxBodySize)
+
+	return nil
+}
+
+// Stop gracefully shuts down security components
+func (s *SecurityService) Stop(ctx context.Context) error {
+	s.logger.Info(" Stopping security service")

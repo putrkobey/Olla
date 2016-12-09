@@ -29,3 +29,14 @@ const (
 	RoutingReasonAllHealthyAfterDiscovery = "all_healthy_after_discovery"
 
 	// Discovery-specific scenarios
+	RoutingReasonDiscoveryFailedNoFallback     = "discovery_failed_no_fallback"
+	RoutingReasonDiscoveryFailedCompatibleOnly = "discovery_failed_compatible_only"
+	RoutingReasonDiscoveryFailedAllFallback    = "discovery_failed_all_fallback"
+	RoutingReasonDiscoveryErrorFallback        = "discovery_error_fallback"
+	RoutingReasonDiscoveryError                = "discovery_error"
+)
+
+// RoutingStrategyCapability names the routing decision made by capability filtering, which
+// runs for requests that name no model and so has no configured strategy behind it.
+const RoutingStrategyCapability = "capability"
+
