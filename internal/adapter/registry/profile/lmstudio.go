@@ -7,7 +7,3 @@ package profile
 type LMStudioResponse struct {
 	Object string          `json:"object"`
 	Data   []LMStudioModel `json:"data"`
-}
-
-// LMStudioModel represents a model in LM Studio's response
-type LMStudioModel struct {
