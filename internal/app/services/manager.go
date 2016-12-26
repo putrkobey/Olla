@@ -92,3 +92,50 @@ func (sm *ServiceManager) resolveDependencies() ([]string, error) {
 		if degree == 0 {
 			queue = append(queue, name)
 		}
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		order = append(order, current)
+
+		for _, dep := range dependencies[current] {
+			inDegree[dep]--
+			if inDegree[dep] == 0 {
+				queue = append(queue, dep)
+			}
+		}
+	}
+
+	if len(order) != len(sm.services) {
+		return nil, errors.New("circular dependency detected")
+	}
+
+	// Reverse to ensure dependencies start before dependants
+	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+		order[i], order[j] = order[j], order[i]
+	}
+
+	return order, nil
+}
+
+// Start orchestrates service initialisation in dependency order. If any service fails
+// to start, all previously started services are stopped in reverse order to maintain
+// system consistency. This ensures no partial startup states persist.
+func (sm *ServiceManager) Start(ctx context.Context) error {
+	order, err := sm.resolveDependencies()
+	if err != nil {
+		return fmt.Errorf("failed to resolve dependencies: %w", err)
+	}
+
+	sm.mu.Lock()
+	sm.startOrder = order
+	sm.mu.Unlock()
+
+	sm.logger.Debug("Starting services", "count", len(order))
+
+	started := make([]string, 0, len(order))
+	for _, name := range order {
+		sm.mu.RLock()
+		service, ok := sm.services[name]
+		sm.mu.RUnlock()
