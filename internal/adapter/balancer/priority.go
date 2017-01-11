@@ -44,3 +44,27 @@ func (p *PrioritySelector) Select(ctx context.Context, endpoints []*domain.Endpo
 	if len(routable) == 0 {
 		return nil, errors.New("no routable endpoints available")
 	}
+
+	// Sort by priority (highest first)
+	sort.Slice(routable, func(i, j int) bool {
+		return routable[i].Priority > routable[j].Priority
+	})
+
+	// Get the highest priority tier
+	highestPriority := routable[0].Priority
+	// Pre-allocate with capacity for all routable endpoints (worst case all have same priority)
+	highestPriorityEndpoints := make([]*domain.Endpoint, 0, len(routable))
+
+	for _, endpoint := range routable {
+		if endpoint.Priority == highestPriority {
+			highestPriorityEndpoints = append(highestPriorityEndpoints, endpoint)
+		} else {
+			break // Since sorted, we can break early
+		}
+	}
+
+	// If only one endpoint at highest priority, return it
+	if len(highestPriorityEndpoints) == 1 {
+		return highestPriorityEndpoints[0], nil
+	}
+
