@@ -50,3 +50,55 @@ func (s *Service) streamResponseWithTimeout(clientCtx, upstreamCtx context.Conte
 
 	// Create combined context for cancellation
 	combinedCtx, cancel := s.createCombinedContext(clientCtx, upstreamCtx)
+	defer cancel()
+
+	// Use http.ResponseController for modern flush handling (Go 1.20+)
+	// Provides better error handling and cleaner API than type assertion
+	rc := http.NewResponseController(w)
+
+	for {
+		result, err := s.performTimedRead(combinedCtx, resp.Body, buffer, readTimeout, state, rlog)
+		if err != nil {
+			return state.totalBytes, state.lastChunkBuffer.Bytes(), err
+		}
+
+		if result == nil {
+			// Context cancelled during read
+			return state.totalBytes, state.lastChunkBuffer.Bytes(), s.handleContextCancellation(clientCtx, upstreamCtx, state, rlog)
+		}
+
+		// Process read result
+		done, err := s.processReadResult(result, w, buffer, rc, state, rlog)
+		if done || err != nil {
+			return state.totalBytes, state.lastChunkBuffer.Bytes(), err
+		}
+	}
+}
+
+// getReadTimeout returns the configured read timeout or default
+func (s *Service) getReadTimeout() time.Duration {
+	readTimeout := s.configuration.GetReadTimeout()
+	if readTimeout == 0 {
+		readTimeout = config.DefaultReadTimeout
+	}
+	return readTimeout
+}
+
+// createCombinedContext creates a context that cancels when either client or upstream context is done
+func (s *Service) createCombinedContext(clientCtx, upstreamCtx context.Context) (context.Context, context.CancelFunc) {
+	combinedCtx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		select {
+		case <-clientCtx.Done():
+			cancel()
+		case <-upstreamCtx.Done():
+			cancel()
+		case <-combinedCtx.Done():
+			return // Exit when combined context is cancelled
+		}
+	}()
+
+	return combinedCtx, cancel
+}
+
