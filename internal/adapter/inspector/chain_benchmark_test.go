@@ -69,39 +69,3 @@ func BenchmarkChain_WithAndWithoutBodyInspector(b *testing.B) {
 				b.Fatal(err)
 			}
 			if profile.ModelName != "llama3.1:8b" {
-				b.Fatal("Expected model name to be extracted")
-			}
-		}
-	})
-}
-
-// Benchmark the overhead of model extraction in isolation
-func BenchmarkBodyInspector_Overhead(b *testing.B) {
-	ctx := context.Background()
-	logCfg := &logger.Config{Level: "error", PrettyLogs: false}
-	log, _, err := logger.New(logCfg)
-	require.NoError(b, err)
-	styledLog := &mockStyledLogger{underlying: log}
-
-	// Create profile factory
-	profileFactory, err := profile.NewFactoryWithDefaults()
-	require.NoError(b, err)
-
-	factory := NewFactory(profileFactory, styledLog)
-
-	// Small request body
-	smallBody := `{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}`
-
-	// Medium request body
-	mediumBody := `{"model": "llama3.1:8b", "messages": [{"role": "user", "content": "This is a longer message with more content to parse through. It simulates a more realistic user query that might be sent to an LLM."}]}`
-
-	// Large request body with multiple messages
-	largeMessages := make([]string, 10)
-	for i := range largeMessages {
-		largeMessages[i] = `{"role": "user", "content": "This is message ` + string(rune(i+'0')) + ` in a multi-turn conversation"}`
-	}
-	largeBody := `{"model": "claude-3-opus", "messages": [` + bytes.NewBufferString(largeMessages[0]).String()
-	var largeBodySb103 strings.Builder
-	for i := 1; i < len(largeMessages); i++ {
-		largeBodySb103.WriteString("," + largeMessages[i])
-	}

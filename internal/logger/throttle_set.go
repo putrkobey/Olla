@@ -7,13 +7,3 @@ import "sync"
 // (a later rejection through that same throttle) or Flush, so without a Flush
 // the tail of a flood that stops just before shutdown is never reported.
 //
-// Both methods are safe on a nil set, which lets tests and library callers that
-// have no shutdown path pass nil.
-type ThrottleSet struct {
-	throttles []*Throttle
-	mu        sync.Mutex
-}
-
-// Track registers t and returns it, so construction and registration read as one step.
-func (s *ThrottleSet) Track(t *Throttle) *Throttle {
-	if s == nil || t == nil {
