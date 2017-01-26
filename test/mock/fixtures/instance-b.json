@@ -1,0 +1,7 @@
+{
+  "fixtures": [
+    {
+      "match": {},
+      "response": {
+        "content": "BACKEND:instance-b — synthetic response for sticky session affinity testing."
+      },
