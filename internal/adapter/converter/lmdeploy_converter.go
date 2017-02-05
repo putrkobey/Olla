@@ -47,28 +47,3 @@ func (c *LMDeployConverter) ConvertToFormat(models []*domain.UnifiedModel, filte
 		Object: "list",
 		Data:   data,
 	}, nil
-}
-
-func (c *LMDeployConverter) convertModel(model *domain.UnifiedModel) *profile.LMDeployModel {
-	now := time.Now().Unix()
-
-	modelID := c.FindNativeName(model)
-	if modelID == "" {
-		if len(model.Aliases) > 0 {
-			modelID = model.Aliases[0].Name
-		} else {
-			modelID = model.ID
-		}
-	}
-
-	m := &profile.LMDeployModel{
-		ID:      modelID,
-		Object:  "model",
-		Created: now,
-		OwnedBy: c.determineOwner(modelID),
-	}
-
-	// LMDeploy does not expose max_model_len on the wire; omit it here too.
-
-	// Generate standard permissions mirroring the LMDeploy default.
-	m.Permission = []profile.LMDeployModelPermission{

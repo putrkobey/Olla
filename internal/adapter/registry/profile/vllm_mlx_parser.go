@@ -34,15 +34,3 @@ func (p *vllmMLXParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
 			Name:     model.ID,
 			LastSeen: now,
 		}
-
-		details := &domain.ModelDetails{}
-
-		if model.Created > 0 {
-			createdTime := time.Unix(model.Created, 0)
-			details.ModifiedAt = &createdTime
-		}
-
-		// "vllm-mlx" and "vllm" are default owned_by values with no meaningful attribution.
-		if model.OwnedBy != "" && model.OwnedBy != "vllm-mlx" && model.OwnedBy != constants.ProviderTypeVLLM {
-			details.Publisher = &model.OwnedBy
-		}
