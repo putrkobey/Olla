@@ -7,3 +7,22 @@ type LMDeployResponse struct {
 	Object string          `json:"object"`
 	Data   []LMDeployModel `json:"data"`
 }
+
+// LMDeployModel represents a single model entry in the LMDeploy /v1/models response.
+// Key difference from vLLM: no max_model_len field. Key difference from vLLM/SGLang:
+// owned_by defaults to "lmdeploy" (not "vllm" or "sglang").
+type LMDeployModel struct {
+	Root       *string                   `json:"root,omitempty"`
+	Parent     *string                   `json:"parent,omitempty"`
+	ID         string                    `json:"id"`
+	Object     string                    `json:"object"`
+	OwnedBy    string                    `json:"owned_by"`
+	Permission []LMDeployModelPermission `json:"permission,omitempty"`
+	Created    int64                     `json:"created"`
+}
+
+// LMDeployModelPermission mirrors the OpenAI permission shape that LMDeploy exposes.
+type LMDeployModelPermission struct {
+	Group              *string `json:"group"`
+	ID                 string  `json:"id"`
+	Object             string  `json:"object"`
