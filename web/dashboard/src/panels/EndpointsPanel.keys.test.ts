@@ -16,39 +16,3 @@ let component: ReturnType<typeof mount> | undefined;
 afterEach(() => {
   if (component) unmount(component);
   document.body.innerHTML = '';
-});
-
-function jsonResponse(body: unknown) {
-  return {
-    status: 200,
-    ok: true,
-    headers: { get: () => null },
-    json: async () => body,
-  };
-}
-
-async function refreshWithEndpoints(endpointList: Record<string, unknown>[]) {
-  global.fetch = vi.fn(async () =>
-    jsonResponse({
-      endpoints: endpointList,
-      total_count: endpointList.length,
-      healthy_count: endpointList.length,
-      routable_count: endpointList.length,
-    })
-  );
-  endpoints.refresh();
-  const lastName = endpointList[endpointList.length - 1].name;
-  await vi.waitFor(() =>
-    expect(endpoints.data?.endpoints?.[endpointList.length - 1]?.name).toBe(lastName)
-  );
-  flushSync();
-}
-
-function endpointNamed(name: string) {
-  return {
-    name,
-    type: 'ollama',
-    status: 'healthy',
-    priority: 100,
-    success_rate: '99.0%',
-    request_count: 10,
