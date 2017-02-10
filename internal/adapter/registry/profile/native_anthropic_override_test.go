@@ -33,3 +33,20 @@ func TestShippedProfiles_NativeAnthropicDefaults(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			loader := NewProfileLoader(shippedProfilesDir)
+			require.NoError(t, loader.LoadProfiles())
+			p, ok := loader.GetProfile(tc.name)
+			require.True(t, ok)
+
+			support := p.GetConfig().API.AnthropicSupport
+			require.NotNil(t, support)
+			assert.True(t, support.Enabled)
+			assert.Equal(t, "/v1/messages", support.MessagesPath)
+			assert.Equal(t, tc.minVersion, support.MinVersion)
+			assert.Equal(t, tc.limitations, support.Limitations)
+		})
+	}
+}
+
+func TestShippedProfiles_NativeAnthropicLocalOverrideDisables(t *testing.T) {

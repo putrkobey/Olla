@@ -37,3 +37,42 @@ func (s *spyProxyService) GetStats(_ context.Context) (ports.ProxyStats, error) 
 
 func (s *spyProxyService) UpdateConfig(_ ports.ProxyConfiguration) {}
 
+// Cleanup satisfies the optional cleanupable interface.
+func (s *spyProxyService) Cleanup() {
+	s.cleanupCalls.Add(1)
+}
+
+// TestProxyServiceWrapper_Stop_CallsCleanup asserts that Stop invokes the proxy
+// engine's Cleanup when the engine implements cleanupable.
+func TestProxyServiceWrapper_Stop_CallsCleanup(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyProxyService{}
+	w := &ProxyServiceWrapper{
+		logger:       newTestLogger(),
+		proxyService: spy,
+	}
+
+	if err := w.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop returned unexpected error: %v", err)
+	}
+	if got := spy.cleanupCalls.Load(); got != 1 {
+		t.Errorf("Cleanup called %d times, want 1", got)
+	}
+}
+
+// TestProxyServiceWrapper_Stop_DoubleCallDoesNotPanic asserts that calling Stop
+// twice does not panic. Engine-level idempotency (sync.Once) is exercised
+// separately in the olla service tests.
+func TestProxyServiceWrapper_Stop_DoubleCallDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	spy := &spyProxyService{}
+	w := &ProxyServiceWrapper{
+		logger:       newTestLogger(),
+		proxyService: spy,
+	}
+
+	for range 2 {
+		if err := w.Stop(context.Background()); err != nil {
+			t.Fatalf("Stop returned error: %v", err)
