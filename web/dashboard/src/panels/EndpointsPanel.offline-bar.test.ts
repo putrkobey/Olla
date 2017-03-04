@@ -24,3 +24,57 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
+function jsonResponse(body: unknown) {
+  return {
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    json: async () => body,
+  };
+}
+
+async function refreshWith(endpoint: Record<string, unknown>) {
+  global.fetch = vi.fn(async () =>
+    jsonResponse({
+      endpoints: [endpoint],
+      total_count: 1,
+      healthy_count: 0,
+      routable_count: 0,
+    })
+  );
+  endpoints.refresh();
+  await vi.waitFor(() => expect(endpoints.data?.endpoints?.[0]?.name).toBe(endpoint.name));
+  flushSync();
+}
+
+// Tests assert existence via toBeTruthy before touching attributes; the
+// non-null assertions here just encode that the DOM is populated by the time
+// they run.
+const pctCell = () => document.querySelector('.pct-cell')!;
+const pctFill = () => pctCell().querySelector('.fill')!;
+
+describe('EndpointsPanel success bar is gated on endpoint status', () => {
+  it('mutes an offline endpoint with traffic but keeps its historical figure', async () => {
+    component = mount(EndpointsPanel, { target: document.body });
+    flushSync();
+
+    await refreshWith({
+      name: 'ollama-down',
+      url: 'http://ollama-down:11434',
+      type: 'ollama',
+      status: 'offline',
+      priority: 100,
+      // Lifetime counters make the unguarded bar paint green at 100%.
+      success_rate: '100.0%',
+      request_count: 500,
+      model_count: 1,
+      avg_latency_ms: 20,
+      min_latency_ms: 5,
+      max_latency_ms: 40,
+    });
+
+    const fill = pctFill();
+    expect(fill).toBeTruthy();
+    // Not the green bucket - a dead backend must not paint confident health.
+    expect(fill.getAttribute('style')).not.toContain('green');
+    // But the real figure survives: this endpoint has history, unlike one
