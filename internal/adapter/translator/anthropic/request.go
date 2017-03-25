@@ -81,3 +81,86 @@ func (t *Translator) TransformRequest(ctx context.Context, r *http.Request) (*tr
 		if anthropicReq.ToolChoice != nil {
 			openaiToolChoice, tcErr := t.convertToolChoice(anthropicReq.ToolChoice)
 			if tcErr != nil {
+				return nil, fmt.Errorf("failed to convert tool_choice: %w", tcErr)
+			}
+			openaiReq["tool_choice"] = openaiToolChoice
+		}
+	}
+
+	t.logger.Debug("Transformed Anthropic request to OpenAI",
+		"model", anthropicReq.Model,
+		"message_count", len(anthropicReq.Messages),
+		"has_tools", len(anthropicReq.Tools) > 0,
+		"streaming", anthropicReq.Stream)
+
+	return &translator.TransformedRequest{
+		OpenAIRequest: openaiReq,
+		OriginalBody:  body,
+		ModelName:     anthropicReq.Model,
+		IsStreaming:   anthropicReq.Stream,
+		TargetPath:    openAIChatCompletionsPath,
+		Metadata: map[string]interface{}{
+			"format": "anthropic",
+		},
+	}, nil
+}
+
+// convert messages + inject system prompt if present
+func (t *Translator) convertMessages(anthropicMessages []AnthropicMessage, systemPrompt interface{}) ([]map[string]interface{}, error) {
+	openaiMessages := make([]map[string]interface{}, 0, len(anthropicMessages)+1)
+
+	// openai wants system as first message, can be string or content blocks
+	if systemPrompt != nil {
+		systemContent := t.convertSystemPrompt(systemPrompt)
+		if systemContent != nil {
+			openaiMessages = append(openaiMessages, map[string]interface{}{
+				"role":    "system",
+				"content": systemContent,
+			})
+		}
+	}
+
+	for _, msg := range anthropicMessages {
+		converted, err := t.convertSingleMessage(msg)
+		if err != nil {
+			return nil, err
+		}
+		openaiMessages = append(openaiMessages, converted...)
+	}
+
+	return openaiMessages, nil
+}
+
+// convert single message, might produce multiple openai messages (eg user + tool results)
+func (t *Translator) convertSingleMessage(msg AnthropicMessage) ([]map[string]interface{}, error) {
+	result := make([]map[string]interface{}, 0, 2)
+
+	if contentStr, ok := msg.Content.(string); ok {
+		if contentStr != "" {
+			result = append(result, map[string]interface{}{
+				"role":    msg.Role,
+				"content": contentStr,
+			})
+		}
+		return result, nil
+	}
+
+	// anthropic uses content blocks for rich messages
+	contentBlocks, ok := msg.Content.([]interface{})
+	if !ok {
+		if contentMap, ok := msg.Content.(map[string]interface{}); ok {
+			contentBlocks = []interface{}{contentMap}
+		} else {
+			return nil, fmt.Errorf("invalid content type: %T", msg.Content)
+		}
+	}
+
+	// user msgs can have text + tool results, assistant msgs have text + tool uses
+	if msg.Role == "user" {
+		userMsg, toolMsgs := t.convertUserMessage(contentBlocks)
+		// tool messages must immediately follow the assistant tool_calls message;
+		// OpenAI-compatible backends reject any other role between them.
+		result = append(result, toolMsgs...)
+		if userMsg != nil {
+			result = append(result, userMsg)
+		}
