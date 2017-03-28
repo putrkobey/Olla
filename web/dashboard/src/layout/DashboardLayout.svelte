@@ -8,3 +8,8 @@
   let { children }: { children: Snippet<[]> } = $props();
 </script>
 
+<header class="site-header">
+  <Header />
+  <StatusStrip />
+  <SparkStrip />
+  <NavTabs />

@@ -138,3 +138,74 @@ func TestExtractor_ExtractMetrics_OllamaResponse(t *testing.T) {
 		"model":                "llama2:latest",
 		"created_at":           "2024-01-01T00:00:00Z",
 		"response":             "Hello, world!",
+		"done":                 true,
+		"context":              []int{1, 2, 3},
+		"total_duration":       5000000000, // 5 seconds in nanoseconds
+		"load_duration":        1000000000, // 1 second
+		"prompt_eval_count":    10,
+		"prompt_eval_duration": 500000000, // 500ms in nanoseconds
+		"eval_count":           20,
+		"eval_duration":        2000000000, // 2 seconds in nanoseconds
+	}
+
+	responseBytes, err := json.Marshal(ollamaResponse)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	metrics := extractor.ExtractMetrics(ctx, responseBytes, nil, "ollama")
+	require.NotNil(t, metrics)
+
+	assert.Equal(t, int32(10), metrics.InputTokens)
+	assert.Equal(t, int32(20), metrics.OutputTokens)
+	assert.Equal(t, int32(30), metrics.TotalTokens)
+	assert.Equal(t, "llama2:latest", metrics.Model)
+	assert.True(t, metrics.IsComplete)
+
+	// Check calculated values
+	assert.Equal(t, float32(10.0), metrics.TokensPerSecond) // 20 tokens / 2 seconds
+	assert.Equal(t, int32(500), metrics.TTFTMs)             // 500ms
+	assert.Equal(t, int32(5000), metrics.TotalMs)           // 5000ms
+}
+
+func TestExtractor_ExtractMetrics_InvalidJSON(t *testing.T) {
+	factory := &mockProfileFactory{
+		profiles: map[string]*mockProfile{
+			"test": {
+				name: "test",
+				config: &domain.ProfileConfig{
+					Metrics: domain.MetricsConfig{
+						Extraction: domain.MetricsExtractionConfig{
+							Enabled: true,
+							Paths: map[string]string{
+								"tokens": "$.tokens",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	testLogger := logger.NewPlainStyledLogger(log)
+	extractor, err := NewExtractor(factory, testLogger)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Test with invalid JSON - should return empty metrics but not nil
+	metrics := extractor.ExtractMetrics(ctx, []byte("not json"), nil, "test")
+	assert.NotNil(t, metrics)
+	// Check that all values are zero/empty
+	assert.Equal(t, int32(0), metrics.InputTokens)
+	assert.Equal(t, int32(0), metrics.OutputTokens)
+}
+
+func TestExtractor_ExtractFromChunk(t *testing.T) {
+	profile := &mockProfile{
+		name: "chunk",
+		config: &domain.ProfileConfig{
+			Metrics: domain.MetricsConfig{
+				Extraction: domain.MetricsExtractionConfig{
+					Enabled: true,
