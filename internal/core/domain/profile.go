@@ -31,3 +31,20 @@ type PlatformProfile interface {
 	// IsOpenAPICompatible indicates if this platform supports OpenIA-compatible endpoints
 	IsOpenAPICompatible() bool
 	// GetRequestParsingRules returns rules for extracting model names from requests
+	GetRequestParsingRules() RequestParsingRules
+	// GetModelResponseFormat returns the expected json response structure for model discovery
+	GetModelResponseFormat() ModelResponseFormat
+	// GetDetectionHints returns hints for auto-detection for this platform
+	GetDetectionHints() DetectionHints
+	// ParseModelsResponse parses platform-specific JSON response into an ModelInfo slice
+	ParseModelsResponse(data []byte) ([]*ModelInfo, error)
+	// GetPaths returns all the paths that this profile allows the proxy to request from
+	GetPaths() []string
+	// GetPath returns the path at the specified index
+	GetPath(index int) string
+}
+
+// RequestParsingRules defines how to extract model names from different request types
+type RequestParsingRules struct {
+	ChatCompletionsPath string // /v1/chat/completions
+	CompletionsPath     string // /v1/completions

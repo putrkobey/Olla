@@ -2,3 +2,8 @@
   "global": {
     "nosec": false
   },
+  "rules": {
+    "G101": {
+      "skip_files": [
+        "internal/core/constants/content.go"
+      ]
