@@ -163,3 +163,86 @@ func TestModelRoutingIntegration(t *testing.T) {
 			},
 			expectedStatus: http.StatusServiceUnavailable,
 			setupSelector: func() *mockEndpointSelector {
+				return &mockEndpointSelector{
+					selectFunc: func(ctx context.Context, endpoints []*domain.Endpoint) (*domain.Endpoint, error) {
+						// Should receive no endpoints since mistral is only on unhealthy endpoint
+						if len(endpoints) != 0 {
+							t.Errorf("Expected 0 endpoints, got %d", len(endpoints))
+						}
+						return nil, nil
+					},
+				}
+			},
+			description: "Should not route to unhealthy endpoints even if model available",
+		},
+		{
+			name: "Non-existent model",
+			requestBody: map[string]interface{}{
+				"model":  "gpt-4",
+				"prompt": "Hello",
+			},
+			expectedStatus: http.StatusOK,
+			setupSelector: func() *mockEndpointSelector {
+				return &mockEndpointSelector{
+					selectFunc: func(ctx context.Context, endpoints []*domain.Endpoint) (*domain.Endpoint, error) {
+						// Should receive all healthy endpoints as fallback
+						if len(endpoints) != 2 {
+							t.Errorf("Expected 2 healthy endpoints as fallback, got %d", len(endpoints))
+						}
+						return endpoints[0], nil
+					},
+				}
+			},
+			description: "Should fallback to all healthy endpoints for unknown models",
+		},
+		{
+			name: "Request without model field",
+			requestBody: map[string]interface{}{
+				"prompt": "Hello",
+			},
+			expectedStatus: http.StatusOK,
+			setupSelector: func() *mockEndpointSelector {
+				return &mockEndpointSelector{
+					selectFunc: func(ctx context.Context, endpoints []*domain.Endpoint) (*domain.Endpoint, error) {
+						// Should receive all healthy endpoints
+						if len(endpoints) != 2 {
+							t.Errorf("Expected 2 healthy endpoints, got %d", len(endpoints))
+						}
+						return endpoints[0], nil
+					},
+				}
+			},
+			description: "Should use all healthy endpoints when no model specified",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create request
+			body, _ := json.Marshal(tt.requestBody)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+
+			// Create response recorder
+			rr := httptest.NewRecorder()
+
+			// Create proxy handler with model routing logic
+			selector := tt.setupSelector()
+
+			// Simple handler that simulates the model routing logic
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Read and parse request body
+				var requestData map[string]interface{}
+				if r.Body != nil {
+					decoder := json.NewDecoder(r.Body)
+					decoder.Decode(&requestData)
+				}
+
+				// Extract model name
+				modelName, _ := requestData["model"].(string)
+
+				// Get healthy endpoints for model
+				var filteredEndpoints []*domain.Endpoint
+				if modelName != "" {
+					healthyForModel, _ := unifiedRegistry.GetHealthyEndpointsForModel(ctx, modelName, &mockEndpointRepository{endpoints: endpoints})
+					if len(healthyForModel) > 0 {
