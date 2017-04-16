@@ -116,3 +116,62 @@ func TestCircuitBreaker_HalfOpen_SuccessCloses(t *testing.T) {
 	}
 }
 
+// TestCircuitBreaker_HalfOpen_StaleProbeReleased is the regression test for
+// F2: a hung probe that never calls RecordSuccess/RecordFailure used to wedge
+// the endpoint indefinitely, since lastAttempt only ever got reset by one of
+// those two calls. Backdates lastAttempt past HalfOpenStaleness directly
+// (rather than sleeping in the test) to simulate a probe that has been
+// in-flight too long without resolving.
+func TestCircuitBreaker_HalfOpen_StaleProbeReleased(t *testing.T) {
+	cb := openCircuitBreaker(1000)
+
+	if open, _ := cb.IsOpen(HalfOpenStaleness); open {
+		t.Fatal("expected the first call to admit a half-open probe")
+	}
+	if open, _ := cb.IsOpen(HalfOpenStaleness); !open {
+		t.Fatal("a fresh in-flight probe must still block a second one")
+	}
+
+	// Simulate the first probe hanging well past the staleness window without
+	// ever resolving.
+	cb.SetLastAttemptNanos(time.Now().Add(-HalfOpenStaleness - time.Millisecond).UnixNano())
+
+	if open, _ := cb.IsOpen(HalfOpenStaleness); open {
+		t.Fatal("a stale, never-resolved probe must not wedge the endpoint - a further probe should be admitted")
+	}
+
+	// The handover must re-stamp lastAttempt to now, not leave it stuck in the
+	// past - otherwise every subsequent caller keeps reading a stale timestamp
+	// and gets admitted too, defeating the single-flight gate entirely.
+	if open, _ := cb.IsOpen(HalfOpenStaleness); !open {
+		t.Fatal("the replacement probe just admitted must block the very next caller")
+	}
+}
+
+// TestCircuitBreaker_HalfOpen_StaleProbeReleased_ConcurrentHandover races many
+// goroutines against the same stale window to prove the last->now CAS handover
+// admits exactly one replacement probe, not all of them. Before the fix, every
+// goroutine that observed the stale window read the same never-updated
+// lastAttempt and was admitted, regardless of how many arrived.
+func TestCircuitBreaker_HalfOpen_StaleProbeReleased_ConcurrentHandover(t *testing.T) {
+	const goroutines = 200
+	cb := openCircuitBreaker(1000)
+
+	// Win the initial half-open slot and immediately backdate it past the
+	// staleness window, so every goroutine below races the handover CAS.
+	if open, _ := cb.IsOpen(HalfOpenStaleness); open {
+		t.Fatal("expected the first call to admit a half-open probe")
+	}
+	cb.SetLastAttemptNanos(time.Now().Add(-HalfOpenStaleness - time.Millisecond).UnixNano())
+
+	var admitted int64
+	var ready sync.WaitGroup
+	var start sync.WaitGroup
+	var done sync.WaitGroup
+
+	ready.Add(goroutines)
+	start.Add(1)
+	done.Add(goroutines)
+
+	for range goroutines {
+		go func() {

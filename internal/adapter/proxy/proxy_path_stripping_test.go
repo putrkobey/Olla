@@ -261,3 +261,91 @@ func TestProxyPathStrippingDoubleStrippingPrevention(t *testing.T) {
 
 // TestProxyPathStrippingWithProviderContext tests that proxy uses its own configured prefix
 // and ignores context values (defensive behavior)
+func TestProxyPathStrippingWithProviderContext(t *testing.T) {
+	testCases := []struct {
+		name              string
+		handlerPrefix     string // What handler puts in context (ignored)
+		proxyConfigPrefix string // What proxy is configured with
+		requestPath       string
+		expectedPath      string
+	}{
+		{
+			name:              "handler_and_proxy_same_prefix",
+			handlerPrefix:     constants.ContextRoutePrefixKey, // "/olla"
+			proxyConfigPrefix: "/olla",
+			requestPath:       "/olla/api/chat",
+			expectedPath:      "/api/chat",
+		},
+		{
+			name:              "handler_provider_proxy_prefix",
+			handlerPrefix:     "/olla/proxy/openai",
+			proxyConfigPrefix: "/olla",
+			requestPath:       "/olla/proxy/openai/v1/chat",
+			expectedPath:      "/proxy/openai/v1/chat", // Only strips configured prefix
+		},
+		{
+			name:              "mismatched_prefixes",
+			handlerPrefix:     "/custom",
+			proxyConfigPrefix: "/olla",
+			requestPath:       "/olla/api/chat",
+			expectedPath:      "/api/chat", // Strips based on proxy config, ignores context
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create upstream
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Received-Path", r.URL.Path)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			// Create Olla proxy with configured prefix
+			config := &olla.Configuration{}
+			config.ProxyPrefix = tc.proxyConfigPrefix
+			proxy, err := olla.NewService(
+				&mockDiscoveryService{},
+				&mockEndpointSelector{},
+				config,
+				createTestStatsCollector(),
+				nil,
+				createTestLogger(),
+			)
+			if err != nil {
+				t.Fatalf("Failed to create proxy: %v", err)
+			}
+
+			// Create request with handler context
+			req := httptest.NewRequest("GET", tc.requestPath, nil)
+			ctx := context.WithValue(req.Context(), tc.proxyConfigPrefix, tc.handlerPrefix)
+			req = req.WithContext(ctx)
+
+			// Execute
+			w := httptest.NewRecorder()
+			endpoint := createTestEndpoint("test", upstream.URL, domain.StatusHealthy)
+			stats := &ports.RequestStats{RequestID: "test", StartTime: time.Now()}
+
+			err = proxy.ProxyRequestToEndpoints(
+				req.Context(), w, req,
+				[]*domain.Endpoint{endpoint},
+				stats, createTestLogger(),
+			)
+			if err != nil {
+				t.Fatalf("Proxy request failed: %v", err)
+			}
+
+			// Verify
+			receivedPath := w.Header().Get("X-Received-Path")
+			if receivedPath != tc.expectedPath {
+				t.Errorf("Path stripping failed\n"+
+					"Handler prefix in context: %s\n"+
+					"Proxy configured prefix: %s\n"+
+					"Request path: %s\n"+
+					"Expected: %s\n"+
+					"Got: %s",
+					tc.handlerPrefix, tc.proxyConfigPrefix, tc.requestPath,
+					tc.expectedPath, receivedPath)
+			}
+		})
+	}
