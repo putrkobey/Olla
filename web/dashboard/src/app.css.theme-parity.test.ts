@@ -20,25 +20,3 @@ const appCss = readFileSync(
 // drift creeps back in unnoticed.
 
 /** Extracts the `--name: value` custom property declarations from a single
- * `selector { ... }` block in a stylesheet's raw source. Values are captured
- * too: name-only parity would still pass if a block declared the property with
- * the wrong theme's value, which is the very failure being guarded against. */
-function customPropsInBlock(css: string, selector: string): Map<string, string> {
-  const selectorIndex = css.indexOf(selector);
-  if (selectorIndex === -1) {
-    throw new Error(`selector not found in app.css: ${selector}`);
-  }
-  const openBrace = css.indexOf('{', selectorIndex);
-  const closeBrace = css.indexOf('}', openBrace);
-  const body = css.slice(openBrace + 1, closeBrace);
-
-  const props = new Map<string, string>();
-  // The final declaration in a block may omit its semicolon, so stop at either
-  // a semicolon or the end of the body rather than requiring one.
-  for (const match of body.matchAll(/(--[a-zA-Z0-9-]+)\s*:\s*([^;]+)(?:;|$)/g)) {
-    props.set(match[1], match[2].trim());
-  }
-  return props;
-}
-
-describe('app.css theme block parity', () => {
