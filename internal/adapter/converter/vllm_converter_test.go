@@ -126,3 +126,68 @@ func TestVLLMConverter_ConvertToFormat(t *testing.T) {
 		require.True(t, ok)
 		assert.Len(t, response.Data, 1)
 
+		// Should use first alias when no vLLM native name exists
+		model := response.Data[0]
+		assert.Equal(t, "phi4:latest", model.ID)
+		assert.Equal(t, "vllm", model.OwnedBy) // Default owner when no org in name
+		assert.Nil(t, model.MaxModelLen)       // No context length specified
+	})
+
+	t.Run("filters work correctly with vLLM format", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID:            "tinyllama/1.1b:chat-v1.0",
+				Family:        "tinyllama",
+				Variant:       "1.1b",
+				ParameterSize: "1.1b",
+				Aliases: []domain.AliasEntry{
+					{Name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0", Source: "vllm"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
+				},
+			},
+			{
+				ID:            "llama/3.1:8b",
+				Family:        "llama",
+				Variant:       "3.1",
+				ParameterSize: "8b",
+				Aliases: []domain.AliasEntry{
+					{Name: "meta-llama/Meta-Llama-3.1-8B-Instruct", Source: "vllm"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "meta-llama/Meta-Llama-3.1-8B-Instruct"},
+				},
+			},
+		}
+
+		filters := ports.ModelFilters{
+			Family: "llama",
+		}
+
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(VLLMModelResponse)
+		require.True(t, ok)
+		assert.Len(t, response.Data, 1)
+		assert.Equal(t, "meta-llama/Meta-Llama-3.1-8B-Instruct", response.Data[0].ID)
+	})
+
+	t.Run("generates consistent permissions for all models", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID: "test/model",
+				Aliases: []domain.AliasEntry{
+					{Name: "org/test-model", Source: "vllm"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "org/test-model"},
+				},
+			},
+		}
+
+		result, err := converter.ConvertToFormat(models, ports.ModelFilters{})
+		require.NoError(t, err)
+
+		response := result.(VLLMModelResponse)

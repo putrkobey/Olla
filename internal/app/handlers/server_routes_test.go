@@ -25,30 +25,3 @@ import (
 func TestMountDashboard_Disabled_DoesNotConstructHandler(t *testing.T) {
 	orig := dashboardHandlerFactory
 	t.Cleanup(func() { dashboardHandlerFactory = orig })
-
-	called := false
-	dashboardHandlerFactory = func() http.Handler {
-		called = true
-		return http.NotFoundHandler()
-	}
-
-	reg := router.NewRouteRegistry(&mockStyledLogger{})
-	app := &Application{
-		Config:        &config.Config{Dashboard: config.DashboardConfig{Enabled: false}},
-		logger:        &mockStyledLogger{},
-		routeRegistry: reg,
-	}
-	app.mountDashboard()
-
-	if called {
-		t.Fatal("dashboard handler factory must not be invoked when the dashboard is disabled")
-	}
-	if _, exists := reg.GetRoutes()[dashboard.DashboardRoute]; exists {
-		t.Fatal("disabled dashboard must not register /internal/ui/")
-	}
-}
-
-// TestMountDashboard_Enabled_ConstructsHandler is the positive counterpart:
-// an enabled dashboard does invoke the factory exactly once and mounts the
-// route, so the guard above isn't trivially satisfied by mountDashboard's
-// enabled branch never running at all.
