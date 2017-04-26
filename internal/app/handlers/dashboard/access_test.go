@@ -239,3 +239,124 @@ func TestAccessMiddleware_NilParsedCIDRsDeniesAll(t *testing.T) {
 	// fires on a programming error.
 	reached := false
 	h := AccessMiddleware(config.DashboardConfig{Enabled: true}, nil, reachedHandler(&reached))
+
+	rec := doRequest(t, h, "127.0.0.1:54321", "localhost", "", "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("nil parsed CIDRs must deny-all, got %d", rec.Code)
+	}
+}
+
+func TestRegisterRoutes_DisabledLeavesMuxEmpty(t *testing.T) {
+	t.Parallel()
+
+	reg := router.NewRouteRegistry(stubLogger{})
+	registered := RegisterRoutes(reg, config.DashboardConfig{Enabled: false}, nil, http.NotFoundHandler(), nil)
+	if registered {
+		t.Fatal("RegisterRoutes must report false when disabled")
+	}
+	if len(reg.GetRoutes()) != 0 {
+		t.Fatalf("no routes should be registered when disabled, got %v", reg.GetRoutes())
+	}
+}
+
+func TestRegisterRoutes_EnabledMountsDashboardSubtree(t *testing.T) {
+	t.Parallel()
+
+	reg := router.NewRouteRegistry(stubLogger{})
+	registered := RegisterRoutes(reg, loopbackConfig(), nil, reachedHandler(boolPtr(t)), nil)
+	if !registered {
+		t.Fatal("RegisterRoutes must report true when enabled")
+	}
+	routes := reg.GetRoutes()
+	info, ok := routes[DashboardRoute]
+	if !ok {
+		t.Fatalf("expected route %q registered, got %v", DashboardRoute, routes)
+	}
+	if info.Method != http.MethodGet {
+		t.Fatalf("dashboard must be GET-only, got %q", info.Method)
+	}
+}
+
+// TestSlashlessDashboardRoute_DisallowedClientGets403 is the regression test
+// for the redirect-bypasses-policy gap: without an explicit registration for
+// the exact "/internal/ui" path, Go's ServeMux answers it with its own
+// redirect before AccessMiddleware ever runs, so a disallowed client got a
+// 307 (revealing the mount exists) instead of the self-diagnosing 403 every
+// other dashboard path returns. A disallowed client hitting the slashless
+// path now gets the same 403 as any other dashboard path.
+func TestSlashlessDashboardRoute_DisallowedClientGets403(t *testing.T) {
+	t.Parallel()
+
+	reg := router.NewRouteRegistry(stubLogger{})
+	if !RegisterRoutes(reg, loopbackConfig(), nil, http.NotFoundHandler(), nil) {
+		t.Fatal("RegisterRoutes must report true when enabled")
+	}
+
+	mux := http.NewServeMux()
+	reg.WireUp(mux)
+
+	req := httptest.NewRequest(http.MethodGet, SlashlessDashboardRoute, nil)
+	req.RemoteAddr = "203.0.113.9:54321"
+	req.Host = "evil.example"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("disallowed client on %s: status=%d, want 403 (got a redirect instead of the policy check)", SlashlessDashboardRoute, rec.Code)
+	}
+}
+
+// TestSlashlessDashboardRoute_AllowedClientRedirects confirms the positive
+// path: a client the access policy approves still gets the expected redirect
+// to the canonical trailing-slash route, with the same security headers as
+// every other dashboard response.
+func TestSlashlessDashboardRoute_AllowedClientRedirects(t *testing.T) {
+	t.Parallel()
+
+	reg := router.NewRouteRegistry(stubLogger{})
+	if !RegisterRoutes(reg, loopbackConfig(), nil, http.NotFoundHandler(), nil) {
+		t.Fatal("RegisterRoutes must report true when enabled")
+	}
+
+	mux := http.NewServeMux()
+	reg.WireUp(mux)
+
+	req := httptest.NewRequest(http.MethodGet, SlashlessDashboardRoute, nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Host = "localhost"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("allowed client on %s: status=%d, want 307", SlashlessDashboardRoute, rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != DashboardRoute {
+		t.Errorf("redirect Location=%q, want %q", loc, DashboardRoute)
+	}
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("slashless redirect must carry the standard dashboard security headers")
+	}
+}
+
+// TestRegisterRoutes_DoesNotTouchOtherRoutes is the regression test for a
+// prior prototype's documented defect: that branch modified the
+// registry's wiring logic and removed size-limit enforcement from every
+// non-proxy route as a side effect of mounting the dashboard. This test wires
+// a representative set of existing non-proxy routes alongside the dashboard and
+// asserts each one still behaves byte-identically when the dashboard is
+// enabled: same status, body still produced by the original handler, and no
+// dashboard access check applied to them (a non-loopback RemoteAddr that the
+// dashboard would 403 still reaches the underlying handler).
+func TestRegisterRoutes_DoesNotTouchOtherRoutes(t *testing.T) {
+	t.Parallel()
+
+	reg := router.NewRouteRegistry(stubLogger{})
+
+	mark := map[string]string{}
+	add := func(route, marker string) {
+		mark[route] = marker
+		reg.RegisterWithMethod(route, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(marker))
+		}), marker, http.MethodGet)
+	}
