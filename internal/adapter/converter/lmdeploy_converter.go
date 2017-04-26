@@ -22,28 +22,3 @@ type LMDeployConverter struct {
 }
 
 // NewLMDeployConverter creates a new LMDeploy format converter.
-func NewLMDeployConverter() ports.ModelResponseConverter {
-	return &LMDeployConverter{
-		BaseConverter: NewBaseConverter(constants.ProviderTypeLMDeploy),
-	}
-}
-
-func (c *LMDeployConverter) GetFormatName() string {
-	return constants.ProviderTypeLMDeploy
-}
-
-func (c *LMDeployConverter) ConvertToFormat(models []*domain.UnifiedModel, filters ports.ModelFilters) (interface{}, error) {
-	filtered := filterModels(models, filters)
-
-	data := make([]profile.LMDeployModel, 0, len(filtered))
-	for _, model := range filtered {
-		m := c.convertModel(model)
-		if m != nil {
-			data = append(data, *m)
-		}
-	}
-
-	return profile.LMDeployResponse{
-		Object: "list",
-		Data:   data,
-	}, nil
