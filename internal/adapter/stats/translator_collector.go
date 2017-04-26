@@ -69,39 +69,3 @@ func (tc *TranslatorCollector) Record(event ports.TranslatorRequestEvent) {
 		data.streamingRequests.Inc()
 	} else {
 		data.nonStreamingRequests.Inc()
-	}
-
-	// Update fallback reason (only when mode is translation)
-	if event.Mode == constants.TranslatorModeTranslation {
-		switch event.FallbackReason {
-		case constants.FallbackReasonNone:
-			// No fallback occurred, nothing to track
-		case constants.FallbackReasonNoCompatibleEndpoints:
-			data.fallbackNoCompatibleEndpoints.Inc()
-		case constants.FallbackReasonTranslatorDoesNotSupportPassthrough:
-			data.fallbackTranslatorDoesNotSupportPassthrough.Inc()
-		case constants.FallbackReasonCannotPassthrough:
-			data.fallbackCannotPassthrough.Inc()
-		}
-	}
-}
-
-// GetStats returns aggregated statistics for all translators
-func (tc *TranslatorCollector) GetStats() map[string]ports.TranslatorStats {
-	result := make(map[string]ports.TranslatorStats)
-
-	tc.translators.Range(func(name string, data *translatorData) bool {
-		total := data.totalRequests.Value()
-		successful := data.successfulRequests.Value()
-		totalLatency := data.totalLatency.Value()
-
-		var avgLatency int64
-		if successful > 0 {
-			avgLatency = totalLatency / successful
-		}
-
-		result[name] = ports.TranslatorStats{
-			TranslatorName:                              name,
-			TotalRequests:                               total,
-			SuccessfulRequests:                          successful,
-			FailedRequests:                              data.failedRequests.Value(),
