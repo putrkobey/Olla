@@ -13,3 +13,10 @@ func MatchesGlob(s, pattern string) bool {
 	case pattern == "*":
 		return true
 	case strings.Contains(pattern, "*"):
+		// for patterns like "*llava*" or "llava*" or "*llava"
+		switch {
+		case strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*"):
+			// *text* - contains
+			core := strings.Trim(pattern, "*")
+			return strings.Contains(s, core)
+		case strings.HasPrefix(pattern, "*"):
