@@ -81,3 +81,86 @@ func TestExecuteWithRetry_CBOpen_FailoverWithoutDemotion(t *testing.T) {
 			return cbOpenErr(ep.Name)
 		}
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("served-by-endpoint-b"))
+		return nil
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req,
+		[]*domain.Endpoint{endpointA, endpointB},
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	require.NoError(t, err, "CB-open on A must fail over to B and succeed")
+	require.Len(t, attempts, 2, "both endpoints must be attempted in order")
+	assert.Equal(t, []string{"endpoint-a", "endpoint-b"}, attempts)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "served-by-endpoint-b", w.Body.String(), "response must be served by B")
+
+	// State-effect assertion: the CB-open path removes A from the candidate
+	// list only. If it had demoted A, UpdateEndpointStatus would capture it.
+	assert.Nil(t, ds.updatedEndpoint,
+		"CB-open must not mutate persisted endpoint health")
+}
+
+// ---- AC-2 (FR-2, FR-4): total exhaustion yields a clean error, no demotion --
+
+// TestExecuteWithRetry_AllCBOpen_CleanExhaustionError proves that when every
+// candidate rejects with CB-open, the surfaced error wraps the sentinel, names
+// breaker state (not a phantom connection failure), and demotes nothing.
+func TestExecuteWithRetry_AllCBOpen_CleanExhaustionError(t *testing.T) {
+	t.Parallel()
+
+	ds := &testDiscoveryService{}
+	h := newCapturingRetryHandler(t, ds)
+
+	endpoints := []*domain.Endpoint{
+		namedEndpoint("ep-1"),
+		namedEndpoint("ep-2"),
+		namedEndpoint("ep-3"),
+	}
+
+	var attempts int
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, ep *domain.Endpoint, s *ports.RequestStats) error {
+		attempts++
+		return cbOpenErr(ep.Name)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	w := httptest.NewRecorder()
+	stats := &ports.RequestStats{}
+
+	err := h.ExecuteWithRetry(context.Background(), w, req, endpoints,
+		&roundRobinSelector{}, stats, proxyFunc)
+
+	require.Error(t, err, "total CB-open exhaustion must surface an error")
+	assert.ErrorIs(t, err, ErrCircuitBreakerOpen,
+		"exhaustion error must unwrap to the CB-open sentinel")
+
+	msg := err.Error()
+	assert.Contains(t, msg, "circuit breaker open",
+		"message should name breaker state as the cause")
+	assert.NotContains(t, msg, "connection errors",
+		"must not mislabel breaker exhaustion as a connection failure")
+
+	assert.Equal(t, len(endpoints), attempts, "every candidate must have been tried exactly once")
+	assert.Nil(t, ds.updatedEndpoint,
+		"no endpoint may be health-demoted on CB-open exhaustion")
+}
+
+// ---- AC-3 (existing guard, regression): POST + started holds on CB-open ----
+
+// TestExecuteWithRetry_CBOpen_POSTResponseStarted_NoRetry proves the
+// non-idempotent "response already started" guard holds on the CB-open path:
+// once bytes have reached the client on a POST, no further endpoint is tried
+// even though CB-open is otherwise failover-eligible, and the partial response
+// stands. This mirrors TestRetry_POSTWithBytesWritten_NoRetry but exercises the
+// CB-open branch instead of the connection-error branch.
+func TestExecuteWithRetry_CBOpen_POSTResponseStarted_NoRetry(t *testing.T) {
+	t.Parallel()
+
+	ds := &testDiscoveryService{}
+	h := newCapturingRetryHandler(t, ds)
+

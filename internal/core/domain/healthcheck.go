@@ -17,10 +17,3 @@ type HealthCheckResult struct {
 }
 
 type HealthCheckErrorType int
-
-const (
-	ErrorTypeNone HealthCheckErrorType = iota
-	ErrorTypeNetwork
-	ErrorTypeTimeout
-	ErrorTypeHTTPError
-	ErrorTypeCircuitOpen
