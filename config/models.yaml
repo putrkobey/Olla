@@ -1,0 +1,198 @@
+# Olla Model Unification Configuration
+# This configuration file defines how to unify model names, families, and capabilities
+# across different LLM providers and formats.
+version: "1.0"
+model_extraction:
+  family_patterns:
+    - pattern: "^(mistral|mixtral)[-_]?(.+)"
+      family_group: 1
+      variant_group: 2
+      description: "Mistral and Mixtral models"
+      
+    - pattern: '^(llama|gemma|phi|qwen)[-_]?(\d+(?:\.\d+)?)'
+      family_group: 1
+      variant_group: 2
+      description: "Common families with version numbers"
+
+    - pattern: '^[^/]+/(phi|llama|gemma|qwen|mistral|glm|granite|nemotron|exaone|kimi|minimax|hunyuan|olmo|internlm|smollm)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Models with publisher prefix"
+
+    - pattern: '^(codellama|starcoder|vicuna|falcon|yi)[-_]?(\d+[bB]?)'
+      family_group: 1
+      variant_group: 2
+      description: "Code and specialised models"
+      
+    - pattern: '^(gpt-oss)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "OpenAI open-weight gpt-oss models"
+
+    - pattern: '^(gpt)(?:[-_.:]?(2|j|neox))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "GPT variants"
+
+    - pattern: "^(deepseek)(?:[-_.:](.+))?(?:$|[^a-zA-Z])"
+      family_group: 1
+      variant_group: 2
+      description: "DeepSeek models"
+
+    - pattern: '^(devstral|magistral|codestral|ministral)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Mistral AI code/agent/edge variants (Devstral, Magistral, Codestral, Ministral)"
+
+    - pattern: '^(glm)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "GLM models (Zhipu / Z.ai)"
+
+    - pattern: '^(kimi)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Kimi models (Moonshot AI)"
+
+    - pattern: '^(granite)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "IBM Granite models"
+
+    - pattern: '^(nemotron)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "NVIDIA Nemotron models"
+
+    - pattern: '^(exaone)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "LG AI EXAONE models"
+
+    - pattern: '^(hunyuan)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Tencent Hunyuan models"
+
+    - pattern: '^(minimax)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "MiniMax models"
+
+    - pattern: '^(seed-oss)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "ByteDance Seed-OSS models"
+
+    - pattern: '^(olmo)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Allen Institute for AI OLMo models"
+
+    - pattern: '^(internlm)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Shanghai AI Lab InternLM models"
+
+    - pattern: '^(smollm)(?:[-_.:]?(\d+(?:\.\d+)?))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Hugging Face SmolLM models"
+
+    # Command-R is genuinely locally runnable (GGUF exists) but CC-BY-NC
+    # licensed - non-commercial only. Olla doesn't gate on licence, this is
+    # just so a future reader isn't surprised.
+    - pattern: '^(command-r)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "Cohere Command-R models (CC-BY-NC licence - non-commercial only)"
+
+    - pattern: '^(?:[^/]+/)?(forge)(?:[-_.:](.+))?(?:$|[^a-zA-Z])'
+      family_group: 1
+      variant_group: 2
+      description: "TensorFoundry Forge models"
+
+  # Maps architecture names to model families
+  architecture_mappings:
+    phi3: phi
+    "phi3.5": phi
+    phi4: phi
+    llama: llama
+    llama2: llama
+    llama3: llama
+    "llama3.1": llama
+    "llama3.2": llama
+    "llama3.3": llama
+    llama4: llama
+    gemma: gemma
+    gemma2: gemma
+    gemma3: gemma
+    gemma4: gemma
+    mistral: mistral
+    mixtral: mixtral
+    qwen: qwen
+    qwen2: qwen
+    "qwen2.5": qwen
+    qwen3: qwen
+    "qwen3.5": qwen
+    "qwen3.6": qwen
+    deepseek: deepseek
+    yi: yi
+    starcoder: starcoder
+    codellama: codellama
+    vicuna: vicuna
+    falcon: falcon
+    gpt2: gpt2
+    gptj: gptj
+    gptneox: gptneox
+    bloom: bloom
+    opt: opt
+    mpt: mpt
+    glm4: glm
+    glm5: glm
+    glm4moe: glm
+    glm: glm
+    granite: granite
+    granitemoe: granite
+    granitehybrid: granite
+    exaone: exaone
+    exaone4: exaone
+    kimi: kimi
+    nemotron: nemotron
+    hunyuan: hunyuan
+    minimax: minimax
+    "seed-oss": "seed-oss"
+    seed_oss: "seed-oss"
+    olmo: olmo
+    olmo2: olmo
+    internlm: internlm
+    internlm2: internlm
+    internlm3: internlm
+    smollm: smollm
+    smollm2: smollm
+    smollm3: smollm
+    "command-r": "command-r"
+
+  # Normalises family name variations
+  family_aliases:
+    llama3: llama
+    "llama3.2": llama
+    "llama3.3": llama
+    llama4: llama
+    gemma2: gemma
+    gemma3: gemma
+    phi3: phi
+    "phi3.5": phi
+    phi4: phi
+    qwen2: qwen
+    "qwen2.5": qwen
+    qwen3: qwen
+    deepseek2: deepseek
+    deepseek3: deepseek
+    deepseek4: deepseek
+    devstral: mistral
+    "qwen3.5": qwen
+    gemma4: gemma
+    glm4: glm
+    glm4moe: glm
+    granitemoe: granite
