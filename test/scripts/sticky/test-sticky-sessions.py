@@ -176,3 +176,361 @@ class StickySessionTester:
         ep_map: Dict[str, BackendInfo] = {}
         for ep in endpoints:
             name = ep.get("name", "unknown")
+            btype = ep.get("type", "unknown")
+            status = ep.get("status", "unknown")
+            bi = BackendInfo(name, btype, status)
+            ep_map[name] = bi
+            self.backends.append(bi)
+
+        if not self.backends:
+            self.pcolor(RED, "[FAIL] No endpoints discovered")
+            return False
+
+        self.pcolor(GREEN, f"[OK] Found {len(self.backends)} endpoint(s)")
+
+        # Fetch models
+        self.pcolor(YELLOW, "Discovering models...")
+        try:
+            r = requests.get(f"{self.base_url}/internal/status/models", timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+            recent = data.get("recent_models", [])
+        except Exception as e:
+            self.pcolor(RED, f"[FAIL] Model discovery failed: {e}")
+            return False
+
+        # Build URL → endpoint name reverse map
+        url_to_name: Dict[str, str] = {}
+        for ep in endpoints:
+            url = ep.get("url", "")
+            name = ep.get("name", "")
+            if url and name:
+                url_to_name[url.rstrip("/")] = name
+
+        type_to_backends: Dict[str, List[str]] = {}
+        for ep in endpoints:
+            btype = ep.get("type", "")
+            name = ep.get("name", "")
+            if btype and name:
+                type_to_backends.setdefault(btype, []).append(name)
+
+        for m in recent:
+            model_name = m.get("name", "")
+            model_endpoints = m.get("endpoints", [])
+            model_type = m.get("type", "")
+            matched = False
+
+            for ep_url in model_endpoints:
+                ep_name = url_to_name.get(ep_url.rstrip("/"))
+                if ep_name and ep_name in ep_map:
+                    ep_map[ep_name].models.append(model_name)
+                    matched = True
+
+            if not matched and model_type and model_type in type_to_backends:
+                for ep_name in type_to_backends[model_type]:
+                    if ep_name in ep_map:
+                        ep_map[ep_name].models.append(model_name)
+
+        # Select one non-embedding model per backend
+        for bi in self.backends:
+            if self.forced_model:
+                bi.selected_model = self.forced_model
+            else:
+                candidates = [m for m in bi.models if "embed" not in m.lower()]
+                if candidates:
+                    bi.selected_model = candidates[0]
+
+        self._print_discovery_summary()
+        return True
+
+    def _print_discovery_summary(self):
+        print()
+        self.pcolor(WHITE, "Configuration Summary")
+        self.pcolor(PURPLE, "-" * 72)
+        header = f"  {'Backend':<20} {'Type':<18} {'Status':<10} {'Model'}"
+        self.pcolor(GREY, header)
+        self.pcolor(GREY, f"  {'-'*20} {'-'*18} {'-'*10} {'-'*24}")
+
+        for bi in self.backends:
+            status_c = GREEN if bi.status == "healthy" else RED
+            status_str = f"{status_c}{bi.status:<10}{RESET}"
+            model_str = bi.selected_model or "(none)"
+            print(f"  {bi.name:<20} {bi.backend_type:<18} {status_str} {model_str}")
+
+    def _testable(self) -> List[BackendInfo]:
+        return [b for b in self.backends if b.status == "healthy" and b.selected_model]
+
+    # ── Feature detection ────────────────────────────────────────────────
+
+    def detect_sticky_enabled(self, model: str) -> bool:
+        """
+        Make one probe request and inspect X-Olla-Sticky-Session.
+        Returns True if sticky sessions are active, False if disabled.
+        """
+        self.pcolor(YELLOW, "\nDetecting sticky session status...")
+        r = self._post(self._chat_body(model))
+        if r is None or r.status_code != 200:
+            self.pcolor(RED, "  [FAIL] Probe request failed — cannot detect feature status")
+            return False
+
+        val = r.headers.get("X-Olla-Sticky-Session", "")
+        if val == "disabled":
+            self.pcolor(YELLOW, (
+                "  [WARN] Sticky sessions are disabled in Olla config.\n"
+                "         Affinity tests will be skipped.\n"
+                "         To enable, add to config.yaml under proxy:\n"
+                "           sticky_sessions:\n"
+                "             enabled: true"
+            ))
+            self.sticky_enabled = False
+            return False
+
+        if val in VALID_STICKY_RESULTS:
+            self.pcolor(GREEN, f"  [OK] Sticky sessions active (probe returned: {val})")
+            self.sticky_enabled = True
+            return True
+
+        # Header absent — old binary or feature not built
+        self.pcolor(YELLOW, f"  [WARN] X-Olla-Sticky-Session header absent (value: '{val}')")
+        self.sticky_enabled = False
+        return False
+
+    # ── Test Sections ────────────────────────────────────────────────────
+
+    def run_header_validation(self, model: str):
+        """
+        Basic header presence and value validation — runs regardless of whether
+        sticky sessions are enabled, because the 'disabled' value is also valid.
+        """
+        print()
+        self.pcolor(WHITE, "Header Validation")
+        self.pcolor(PURPLE, "=" * 72)
+
+        self._test_sticky_header_present(model)
+        self._test_key_source_valid(model)
+
+    def run_affinity_tests(self, model: str):
+        """Core affinity tests — only meaningful when sticky sessions are enabled."""
+        print()
+        self.pcolor(WHITE, "Affinity Tests")
+        self.pcolor(PURPLE, "=" * 72)
+
+        if not self.sticky_enabled:
+            self.pcolor(GREY, "  Skipped — sticky sessions are disabled")
+            return
+
+        self._test_session_id_miss_then_hit(model)
+        self._test_session_id_echoed(model)
+        self._test_prefix_hash_hit(model)
+        self._test_sessions_independent(model)
+
+    def run_multi_backend_tests(self):
+        """
+        Tests that only make sense when multiple healthy backends are available,
+        e.g. verifying that different session IDs can land on different backends.
+        Skipped silently when only one backend is present.
+        """
+        testable = self._testable()
+        if len(testable) < 2:
+            return
+
+        print()
+        self.pcolor(WHITE, "Multi-Backend Tests")
+        self.pcolor(PURPLE, "=" * 72)
+
+        if not self.sticky_enabled:
+            self.pcolor(GREY, "  Skipped — sticky sessions are disabled")
+            return
+
+        self._test_different_sessions_may_use_different_backends(testable)
+
+    # ── Individual Tests ─────────────────────────────────────────────────
+
+    def _test_sticky_header_present(self, model: str):
+        label = "header/sticky-session-present"
+        self.pcolor(YELLOW, "  X-Olla-Sticky-Session present:  ", end="")
+
+        r = self._post(self._chat_body(model))
+        if r is None:
+            print(f"{RED}[FAIL]{RESET}")
+            self.record(label, False, "request failed")
+            return
+
+        val = r.headers.get("X-Olla-Sticky-Session", "")
+        ok = val in VALID_STICKY_RESULTS
+        status_str = f"{GREEN}[PASS]{RESET}" if ok else f"{RED}[FAIL]{RESET}"
+        detail = f"  value='{val}'" if ok else f"  got '{val}', expected one of {VALID_STICKY_RESULTS}"
+        print(f"{status_str}{GREY}{detail}{RESET}")
+        self.record(label, ok, detail.strip())
+
+    def _test_key_source_valid(self, model: str):
+        label = "header/key-source-valid"
+        self.pcolor(YELLOW, "  X-Olla-Sticky-Key-Source valid: ", end="")
+
+        r = self._post(self._chat_body(model))
+        if r is None:
+            print(f"{RED}[FAIL]{RESET}")
+            self.record(label, False, "request failed")
+            return
+
+        sticky_val = r.headers.get("X-Olla-Sticky-Session", "")
+        source_val = r.headers.get("X-Olla-Sticky-Key-Source", "")
+
+        # When disabled, source header is absent — that is correct behaviour.
+        if sticky_val == "disabled":
+            print(f"{GREEN}[PASS]{RESET}{GREY}  (disabled — source header absent as expected){RESET}")
+            self.record(label, True, "disabled")
+            return
+
+        ok = source_val in VALID_KEY_SOURCES
+        status_str = f"{GREEN}[PASS]{RESET}" if ok else f"{RED}[FAIL]{RESET}"
+        detail = f"  source='{source_val}'" if ok else f"  got '{source_val}', expected one of {VALID_KEY_SOURCES}"
+        print(f"{status_str}{GREY}{detail}{RESET}")
+        self.record(label, ok, detail.strip())
+
+    def _test_session_id_miss_then_hit(self, model: str):
+        label = "affinity/session-id-miss-then-hit"
+        self.pcolor(YELLOW, "  Session ID: miss → hit:         ", end="")
+
+        session_id = f"test-sticky-{int(time.time())}"
+        headers = self._chat_headers(session_id)
+        body = self._chat_body(model, system=LONG_SYSTEM_PROMPT)
+
+        r1 = self._post(body, headers)
+        if r1 is None or r1.status_code != 200:
+            print(f"{RED}[FAIL]{RESET}{GREY}  turn-1 request failed{RESET}")
+            self.record(label, False, "turn-1 failed")
+            return
+
+        r2 = self._post(body, headers)
+        if r2 is None or r2.status_code != 200:
+            print(f"{RED}[FAIL]{RESET}{GREY}  turn-2 request failed{RESET}")
+            self.record(label, False, "turn-2 failed")
+            return
+
+        t1_sticky = r1.headers.get("X-Olla-Sticky-Session", "")
+        t2_sticky = r2.headers.get("X-Olla-Sticky-Session", "")
+        t1_ep = r1.headers.get("X-Olla-Endpoint", "")
+        t2_ep = r2.headers.get("X-Olla-Endpoint", "")
+
+        notes = []
+        ok = True
+
+        if t1_sticky != "miss":
+            ok = False
+            notes.append(f"turn-1 expected 'miss', got '{t1_sticky}'")
+        if t2_sticky != "hit":
+            ok = False
+            notes.append(f"turn-2 expected 'hit', got '{t2_sticky}'")
+        if t1_ep and t2_ep and t1_ep != t2_ep:
+            ok = False
+            notes.append(f"endpoint changed: {t1_ep} → {t2_ep}")
+
+        status_str = f"{GREEN}[PASS]{RESET}" if ok else f"{RED}[FAIL]{RESET}"
+        detail = f"  {' | '.join(notes)}" if notes else f"  endpoint={t1_ep or 'n/a'}"
+        print(f"{status_str}{GREY}{detail}{RESET}")
+        self.record(label, ok, "; ".join(notes))
+
+    def _test_session_id_echoed(self, model: str):
+        label = "affinity/session-id-echoed"
+        self.pcolor(YELLOW, "  Session ID echoed in response:  ", end="")
+
+        session_id = f"echo-test-{int(time.time())}"
+        r = self._post(
+            self._chat_body(model),
+            self._chat_headers(session_id),
+        )
+        if r is None or r.status_code != 200:
+            print(f"{RED}[FAIL]{RESET}")
+            self.record(label, False, "request failed")
+            return
+
+        echoed = r.headers.get("X-Olla-Session-ID", "")
+        ok = echoed == session_id
+        status_str = f"{GREEN}[PASS]{RESET}" if ok else f"{RED}[FAIL]{RESET}"
+        detail = f"  echoed='{echoed}'" if ok else f"  expected '{session_id}', got '{echoed}'"
+        print(f"{status_str}{GREY}{detail}{RESET}")
+        self.record(label, ok, detail.strip())
+
+    def _test_prefix_hash_hit(self, model: str):
+        label = "affinity/prefix-hash-hit"
+        self.pcolor(YELLOW, "  Prefix hash: same prompt → hit: ", end="")
+
+        # No session header — key must come from prefix hash.
+        body = self._chat_body(model, system=LONG_SYSTEM_PROMPT)
+
+        r1 = self._post(body)
+        if r1 is None or r1.status_code != 200:
+            print(f"{RED}[FAIL]{RESET}{GREY}  turn-1 failed{RESET}")
+            self.record(label, False, "turn-1 failed")
+            return
+
+        r2 = self._post(body)
+        if r2 is None or r2.status_code != 200:
+            print(f"{RED}[FAIL]{RESET}{GREY}  turn-2 failed{RESET}")
+            self.record(label, False, "turn-2 failed")
+            return
+
+        t1_source = r1.headers.get("X-Olla-Sticky-Key-Source", "")
+        t2_sticky = r2.headers.get("X-Olla-Sticky-Session", "")
+        t1_ep = r1.headers.get("X-Olla-Endpoint", "")
+        t2_ep = r2.headers.get("X-Olla-Endpoint", "")
+
+        notes = []
+        ok = True
+
+        if t1_source not in ("prefix_hash", "auth_header"):
+            # auth_header is also acceptable when Authorization header is present
+            notes.append(f"turn-1 source='{t1_source}' (expected prefix_hash or auth_header)")
+        if t2_sticky != "hit":
+            ok = False
+            notes.append(f"turn-2 expected 'hit', got '{t2_sticky}'")
+        if t1_ep and t2_ep and t1_ep != t2_ep:
+            ok = False
+            notes.append(f"endpoint changed: {t1_ep} → {t2_ep}")
+
+        status_str = f"{GREEN}[PASS]{RESET}" if ok else f"{RED}[FAIL]{RESET}"
+        detail = f"  {' | '.join(notes)}" if notes else f"  source={t1_source} endpoint={t1_ep or 'n/a'}"
+        print(f"{status_str}{GREY}{detail}{RESET}")
+        self.record(label, ok, "; ".join(notes))
+
+    def _test_sessions_independent(self, model: str):
+        label = "affinity/sessions-independent"
+        self.pcolor(YELLOW, "  Two sessions pin independently: ", end="")
+
+        ts = int(time.time())
+        sid_a = f"session-alpha-{ts}"
+        sid_b = f"session-beta-{ts}"
+        body = self._chat_body(model, system=LONG_SYSTEM_PROMPT)
+
+        # Pin each session with a first (miss) request, then confirm second is a hit.
+        ra1 = self._post(body, self._chat_headers(sid_a))
+        rb1 = self._post(body, self._chat_headers(sid_b))
+        ra2 = self._post(body, self._chat_headers(sid_a))
+        rb2 = self._post(body, self._chat_headers(sid_b))
+
+        responses = [ra1, rb1, ra2, rb2]
+        if any(r is None or r.status_code != 200 for r in responses):
+            print(f"{RED}[FAIL]{RESET}{GREY}  one or more requests failed{RESET}")
+            self.record(label, False, "request failed")
+            return
+
+        a2_sticky = ra2.headers.get("X-Olla-Sticky-Session", "")  # type: ignore[union-attr]
+        b2_sticky = rb2.headers.get("X-Olla-Sticky-Session", "")  # type: ignore[union-attr]
+
+        notes = []
+        ok = True
+
+        if a2_sticky != "hit":
+            ok = False
+            notes.append(f"session-A turn-2 expected 'hit', got '{a2_sticky}'")
+        if b2_sticky != "hit":
+            ok = False
+            notes.append(f"session-B turn-2 expected 'hit', got '{b2_sticky}'")
+
+        status_str = f"{GREEN}[PASS]{RESET}" if ok else f"{RED}[FAIL]{RESET}"
+        detail = f"  {' | '.join(notes)}" if notes else "  both sessions independently pinned"
+        print(f"{status_str}{GREY}{detail}{RESET}")
+        self.record(label, ok, "; ".join(notes))
+
+    def _test_different_sessions_may_use_different_backends(self, testable: List[BackendInfo]):
