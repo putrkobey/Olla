@@ -126,3 +126,132 @@ func benchmarkSmallPayload(b *testing.B, suite ProxyTestSuite) {
 	requestBody := `{"query": "benchmark test", "limit": 10}`
 
 	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("POST", "/api/query", requestBody)
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// benchmarkLargePayload tests performance with large payloads
+func benchmarkLargePayload(b *testing.B, suite ProxyTestSuite) {
+	// 100KB response
+	largeData := strings.Repeat("data", 25000)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(largeData))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("GET", "/api/large", "")
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// benchmarkStreamingResponse tests streaming performance
+func benchmarkStreamingResponse(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeText)
+		w.WriteHeader(http.StatusOK)
+
+		flusher := w.(http.Flusher)
+		for i := range 10 {
+			fmt.Fprintf(w, "chunk %d\n", i)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("GET", "/api/stream", "")
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// benchmarkConcurrentRequests tests performance under concurrent load
+func benchmarkConcurrentRequests(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+			w := httptest.NewRecorder()
+
+			err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+			if err != nil {
+				b.Fatalf("Request failed: %v", err)
+			}
+		}
+	})
+}
+
+// benchmarkHighThroughput tests maximum throughput capabilities
+func benchmarkHighThroughput(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Minimal processing time
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()

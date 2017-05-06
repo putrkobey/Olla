@@ -1,0 +1,53 @@
+package handlers
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/putrkobey/Olla/internal/core/constants"
+)
+
+// ollamaModelsHandler returns models from all healthy ollama instances
+// endpoint: GET /olla/ollama/api/tags
+func (a *Application) ollamaModelsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	models, err := a.getProviderModels(ctx, "ollama")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response, err := a.convertModelsToProviderFormat(models, "ollama")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// ollamaModelShowHandler handles model detail requests.
+// endpoint: POST /olla/ollama/api/show
+//
+// aggregating model details across instances presents challenges:
+// - modelfiles may differ between instances
+// - version conflicts need resolution
+// - parameter reconciliation is non-trivial
+func (a *Application) ollamaModelShowHandler(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "model show not supported in multi-instance proxy", http.StatusNotImplemented)
+}
+
+// ollamaOpenAIModelsHandler returns models in openai-compatible format.
+// ollama experimental compatibility layer for openai clients
+// endpoint: GET /olla/ollama/v1/models
+func (a *Application) ollamaOpenAIModelsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	models, err := a.getProviderModels(ctx, "ollama")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
