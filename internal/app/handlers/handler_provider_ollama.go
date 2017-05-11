@@ -33,21 +33,3 @@ func (a *Application) ollamaModelsHandler(w http.ResponseWriter, r *http.Request
 // endpoint: POST /olla/ollama/api/show
 //
 // aggregating model details across instances presents challenges:
-// - modelfiles may differ between instances
-// - version conflicts need resolution
-// - parameter reconciliation is non-trivial
-func (a *Application) ollamaModelShowHandler(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "model show not supported in multi-instance proxy", http.StatusNotImplemented)
-}
-
-// ollamaOpenAIModelsHandler returns models in openai-compatible format.
-// ollama experimental compatibility layer for openai clients
-// endpoint: GET /olla/ollama/v1/models
-func (a *Application) ollamaOpenAIModelsHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	models, err := a.getProviderModels(ctx, "ollama")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
