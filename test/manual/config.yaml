@@ -1,0 +1,21 @@
+## Olla Integration Test Configuration
+## Points at mock backends on localhost.
+
+server:
+  host: "127.0.0.1"
+  port: 40114
+  read_timeout: 10s
+  write_timeout: 0s
+  shutdown_timeout: 5s
+  request_logging: true
+  request_limits:
+    max_body_size: 10485760
+    max_header_size: 524288
+  rate_limits:
+    global_requests_per_minute: 1000
+    per_ip_requests_per_minute: 200
+    health_requests_per_minute: 1000
+    burst_size: 50
+    cleanup_interval: 5m
+    trust_proxy_headers: false
+    trusted_proxy_cidrs: ["127.0.0.0/8"]
