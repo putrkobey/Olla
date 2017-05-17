@@ -17,3 +17,22 @@ type ProviderMetrics struct {
 	TotalMs      int32 `json:"total_ms,omitempty"`      // Total generation time
 	ModelLoadMs  int32 `json:"model_load_ms,omitempty"` // Model loading time (cold starts)
 	PromptMs     int32 `json:"prompt_ms,omitempty"`     // Prompt processing time
+	GenerationMs int32 `json:"generation_ms,omitempty"` // Token generation time
+
+	// Throughput metrics
+	TokensPerSecond float32 `json:"tokens_per_sec,omitempty"`
+
+	IsComplete bool `json:"is_complete,omitempty"`
+}
+
+// MetricsExtractionConfig defines how to extract metrics from provider responses
+type MetricsExtractionConfig struct {
+
+	// JSONPath expressions for extracting raw values
+	Paths map[string]string `yaml:"paths"`
+
+	// Simple math expressions for calculated metrics
+	Calculations map[string]string `yaml:"calculations"`
+
+	// Header names to extract values from
+	Headers map[string]string `yaml:"headers,omitempty"`
