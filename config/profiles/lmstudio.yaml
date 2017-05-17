@@ -1,0 +1,83 @@
+# LM Studio inference platform profile
+name: lm-studio
+version: "1.0"
+display_name: "LM Studio"
+description: "LM Studio local inference server"
+
+# Routing configuration - support all variations
+routing:
+  prefixes:
+    - lmstudio
+    - lm-studio
+    - lm_studio
+
+# API compatibility
+api:
+  openai_compatible: true
+
+  # Anthropic Messages API support (v0.4.1+)
+  # Added specifically for Claude Code integration, enabling native Anthropic API support
+  # without requiring translation middleware
+  anthropic_support:
+    enabled: true
+    messages_path: /v1/messages
+    token_count: false
+    min_version: "0.4.1"
+
+  paths:
+    - /v1/models          # 0: health check & models
+    - /v1/chat/completions # 1: chat completions
+    - /v1/completions     # 2: completions
+    - /v1/embeddings      # 3: embeddings
+    - /api/v0/models      # 4: legacy models endpoint
+    # /v1/responses needs LM Studio 0.3.29+, /v1/messages 0.4.1+; older releases 404.
+    - /v1/responses # 5: OpenAI Responses API
+    - /v1/messages # 6: Anthropic Messages API
+  model_discovery_path: /api/v0/models
+  health_check_path: /v1/models
+
+# Platform characteristics
+characteristics:
+  timeout: 3m
+  max_concurrent_requests: 1  # Metadata only, not enforced by Olla
+  default_priority: 90
+  streaming_support: true
+
+# Detection hints for auto-discovery
+detection:
+  path_indicators:
+    - "/v1/models"
+    - "/api/v0/models"
+  default_ports:
+    - 1234
+
+# Model handling
+models:
+  name_format: "{{.Name}}"
+  capability_patterns:
+    chat:
+      - "*"  # All models support chat in LM Studio
+  # Context window detection patterns
+  context_patterns:
+    - pattern: "*-32k*"
+      context: 32768
+    - pattern: "*-16k*"
+      context: 16384
+    - pattern: "*-8k*"
+      context: 8192
+    - pattern: "*:32k*"
+      context: 32768
+    - pattern: "*:16k*"
+      context: 16384
+    - pattern: "*:8k*"
+      context: 8192
+    - pattern: "llama3*"
+      context: 8192
+    - pattern: "llama-3*"
+      context: 8192
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "lmstudio"
