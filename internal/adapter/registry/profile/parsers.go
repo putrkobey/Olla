@@ -125,3 +125,131 @@ func createOllamaModelDetails(ollamaModel OllamaModel) *domain.ModelDetails {
 	if ollamaModel.Details != nil {
 		if ollamaModel.Details.ParameterSize != nil {
 			details.ParameterSize = ollamaModel.Details.ParameterSize
+		}
+		if ollamaModel.Details.QuantizationLevel != nil {
+			details.QuantizationLevel = ollamaModel.Details.QuantizationLevel
+		}
+		if ollamaModel.Details.Family != nil {
+			details.Family = ollamaModel.Details.Family
+		}
+		if ollamaModel.Details.Format != nil {
+			details.Format = ollamaModel.Details.Format
+		}
+		if ollamaModel.Details.ParentModel != nil {
+			details.ParentModel = ollamaModel.Details.ParentModel
+		}
+		if len(ollamaModel.Details.Families) > 0 {
+			details.Families = ollamaModel.Details.Families
+		}
+	}
+	return details
+}
+
+// ollamaModelKind maps Ollama's capabilities onto a model kind, or "" when they
+// say nothing the kind vocabulary can hold.
+func ollamaModelKind(capabilities []string) string {
+	var embedding, completion, vision bool
+	for _, c := range capabilities {
+		switch c {
+		case "embedding":
+			embedding = true
+		case "completion":
+			completion = true
+		case "vision":
+			vision = true
+		}
+	}
+	switch {
+	case embedding && !completion:
+		return "embeddings"
+	case vision:
+		return "vlm"
+	}
+	return ""
+}
+
+// ollamaDeclaredCapabilities returns the Ollama capabilities that have an Olla
+// counterpart, in Olla's vocabulary: vision, and tools as function_calling.
+func ollamaDeclaredCapabilities(capabilities []string) []string {
+	var declared []string
+	for _, c := range capabilities {
+		switch c {
+		case "vision":
+			declared = append(declared, "vision")
+		case "tools":
+			declared = append(declared, "function_calling")
+		}
+	}
+	return declared
+}
+
+type lmStudioParser struct{}
+
+func (p *lmStudioParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
+	if len(data) == 0 {
+		return make([]*domain.ModelInfo, 0), nil
+	}
+
+	var response LMStudioResponse
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse LM Studio response: %w", err)
+	}
+
+	models := make([]*domain.ModelInfo, 0, len(response.Data))
+	now := time.Now()
+
+	for _, model := range response.Data {
+		if model.ID == "" {
+			continue
+		}
+
+		modelInfo := &domain.ModelInfo{
+			Name:     model.ID,
+			Type:     model.Object, // "model" from the response
+			LastSeen: now,
+		}
+
+		// Extract any available metadata from the model
+		details := &domain.ModelDetails{}
+		hasDetails := false
+
+		if model.Type != nil {
+			details.Type = model.Type
+			hasDetails = true
+		}
+
+		if model.Publisher != nil {
+			details.Publisher = model.Publisher
+			details.ParentModel = model.Publisher // lmstudio quirk
+			hasDetails = true
+		}
+
+		if model.Quantization != nil {
+			details.QuantizationLevel = model.Quantization
+			hasDetails = true
+		}
+
+		if model.Arch != nil {
+			details.Family = model.Arch
+			// Also populate Families array for compatibility
+			details.Families = []string{*model.Arch}
+			hasDetails = true
+		}
+
+		if model.CompatibilityType != nil {
+			details.Format = model.CompatibilityType // another lmstudio quirk
+			hasDetails = true
+		}
+
+		if model.State != nil {
+			details.State = model.State
+			hasDetails = true
+		}
+
+		if model.MaxContextLength != nil {
+			details.MaxContextLength = model.MaxContextLength
+			hasDetails = true
+		}
+
+		if hasDetails {
+			modelInfo.Details = details

@@ -203,3 +203,72 @@ curl http://localhost:40114/olla/proxy/v1/chat/completions \
 # List all models across backends
 curl http://localhost:40114/olla/proxy/v1/models
 ```
+
+#### Anthropic Messages API
+
+You can use `/olla/anthropic`
+
+```bash
+# Chat completion (passthrough for supported backends, translated for others)
+curl http://localhost:40114/olla/anthropic/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: not-needed" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model": "llama3.2", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Streaming
+curl http://localhost:40114/olla/anthropic/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: not-needed" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{"model": "llama3.2", "max_tokens": 100, "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+```
+
+#### Provider-Specific Endpoints
+
+Use provider specific patterns (Eg. `/olla/ollama`)
+
+```bash
+# Target a specific backend type directly
+curl http://localhost:40114/olla/ollama/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama3.2", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}'
+
+# Other providers: /olla/vllm/, /olla/vllm-mlx/, /olla/lm-studio/, /olla/llamacpp/, etc.
+```
+
+## Examples
+
+We've also got ready-to-use Docker Compose setups for common scenarios:
+
+### Common Architectures
+
+- **Home Lab**: Olla → Multiple Ollama (or OpenAI Compatible - eg. vLLM) instances across your machines
+- **Hybrid Cloud**: Olla → Local endpoints + LiteLLM → Cloud APIs (OpenAI, Anthropic, Bedrock, etc.)
+- **Enterprise**: Olla → GPUStack cluster + vLLM servers + LiteLLM (cloud overflow)
+- **Development**: Olla → Local + Shared team endpoints + LiteLLM (API access)
+
+See [integration patterns](https://thushan.github.io/olla/compare/integration-patterns/) for detailed architectures.
+
+For a robust enterprise setup, consider [TensorFoundry FoundryOS](https://tensorfoundry.io/products/foundryos).
+
+### 🌐 **OpenWebUI Integration**
+
+Complete setup with [OpenWebUI](https://github.com/open-webui/open-webui) + Olla load balancing multiple [Ollama instances](https://thushan.github.io/olla/integrations/frontend/openwebui/) or unify all [OpenAI compatible models](https://thushan.github.io/olla/integrations/frontend/openwebui-openai/).
+
+- **See**: [`examples/ollama-openwebui/`](examples/ollama-openwebui/)
+- **Services**: OpenWebUI (web UI) + Olla (proxy/load balancer)  
+- **Use Case**: Web interface with intelligent load balancing across multiple Ollama servers with Olla
+- **Quick Start**: 
+  ```bash
+  cd examples/ollama-openwebui
+  # Edit olla.yaml to configure your Ollama endpoints
+  docker compose up -d
+  # Access OpenWebUI at http://localhost:3000
+  ```
+
+You can learn more about [OpenWebUI Ollama with Olla](https://thushan.github.io/olla/integrations/frontend/openwebui/) or see [OpenWebUI OpenAI with Olla](https://thushan.github.io/olla/integrations/frontend/openwebui-openai/).
+
+### 🤖 **Anthropic Message API / CLI Tools - Claude Code, OpenCode, Crush**
+
+Olla's Anthropic Messages API support (v0.0.20+) is **enabled by default**, allowing you to use CLI tools like Claude Code with local AI models on your machine via `/olla/anthropic`. It operates in two modes depending on your backend:
