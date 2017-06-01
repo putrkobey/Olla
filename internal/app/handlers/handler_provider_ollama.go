@@ -15,21 +15,3 @@ func (a *Application) ollamaModelsHandler(w http.ResponseWriter, r *http.Request
 	models, err := a.getProviderModels(ctx, "ollama")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	response, err := a.convertModelsToProviderFormat(models, "ollama")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
-}
-
-// ollamaModelShowHandler handles model detail requests.
-// endpoint: POST /olla/ollama/api/show
-//
-// aggregating model details across instances presents challenges:

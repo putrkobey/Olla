@@ -49,3 +49,107 @@ func applicationWithStaticRouteTable(t *testing.T, dash config.DashboardConfig) 
 	t.Helper()
 	reg := router.NewRouteRegistry(&mockStyledLogger{})
 	app := &Application{
+		Config: &config.Config{
+			Dashboard: dash,
+		},
+		logger:        &mockStyledLogger{},
+		routeRegistry: reg,
+	}
+	app.registerRoutes()
+	return app, reg
+}
+
+// TestFullRouteTable_DashboardMiddlewareStaysScoped is the full route table
+// loop proving the dashboard access middleware stays scoped to /internal/ui/
+// and does not silently attach to any other route. It enumerates every route
+// the production registration path emits, replaces each non-dashboard handler
+// with a per-route marker, then probes every route with a non-loopback
+// RemoteAddr + non-allowed Host. Any non-dashboard route that returns the
+// dashboard's signature 403 has had the access middleware leak onto it.
+func TestFullRouteTable_DashboardMiddlewareStaysScoped(t *testing.T) {
+	t.Parallel()
+
+	_, reg := applicationWithStaticRouteTable(t, enabledDashboardCfg(t))
+
+	// Replace every non-dashboard handler with a marker so leaks surface as a
+	// body mismatch rather than a nil-handler panic. The dashboard subtree is
+	// left untouched so the access middleware stays in place for it.
+	mark := map[string]string{}
+	for route := range reg.GetRoutes() {
+		if strings.HasPrefix(route, dashboard.DashboardRoute) {
+			continue
+		}
+		mark[route] = "MARK:" + route
+		r := route
+		reg.GetRoutes()[r] = router.RouteInfo{
+			Handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("MARK:" + r))
+			},
+			Description: "marker",
+			Method:      http.MethodGet,
+			Order:       reg.GetRoutes()[r].Order,
+		}
+	}
+
+	mux := http.NewServeMux()
+	reg.WireUp(mux)
+
+	// Every non-dashboard route must reach its own marker unchanged when
+	// probed with a RemoteAddr/Host the dashboard middleware would reject.
+	// A 403 here means the access gate leaked onto that route.
+	for route, want := range mark {
+		req := httptest.NewRequest(http.MethodGet, route, nil)
+		req.RemoteAddr = "203.0.113.9:54321"
+		req.Host = "evil.example"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status=%d, want 200 (dashboard middleware leaked?)", route, rec.Code)
+			continue
+		}
+		if rec.Body.String() != want {
+			t.Errorf("%s: body=%q, want %q", route, rec.Body.String(), want)
+		}
+	}
+
+	// The dashboard subtree itself must still be gated: a non-loopback probe
+	// gets 403 with the self-diagnosing body, proving the policy is live on
+	// /internal/ui/ even though it leaked nowhere else.
+	dashReq := httptest.NewRequest(http.MethodGet, dashboard.DashboardRoute, nil)
+	dashReq.RemoteAddr = "203.0.113.9:54321"
+	dashReq.Host = "evil.example"
+	dashRec := httptest.NewRecorder()
+	mux.ServeHTTP(dashRec, dashReq)
+	if dashRec.Code != http.StatusForbidden {
+		t.Errorf("dashboard must be gated for non-loopback: got %d, want 403", dashRec.Code)
+	}
+}
+
+// TestDashboardRoute_ReachableFromLoopback confirms a loopback request gets
+// through the access gate. The embedded dist carries only the .gitkeep
+// sentinel in this checkout (no `make build-web` ran), so the underlying
+// handler serves the not-built 503 - we assert the request reached the
+// dashboard handler (not 403) rather than the asset body.
+func TestDashboardRoute_ReachableFromLoopback(t *testing.T) {
+	t.Parallel()
+
+	_, reg := applicationWithStaticRouteTable(t, enabledDashboardCfg(t))
+
+	mux := http.NewServeMux()
+	reg.WireUp(mux)
+
+	req := httptest.NewRequest(http.MethodGet, dashboard.DashboardRoute, nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Host = "localhost"
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusForbidden {
+		t.Fatalf("loopback request was gated: %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	// 503 (not built) is the expected response when the dist carries only the
+	// sentinel; what matters is that the access middleware let it through.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Logf("loopback dashboard response: status=%d (503 expected when dist is sentinel-only)", rec.Code)
+	}
