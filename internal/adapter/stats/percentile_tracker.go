@@ -103,3 +103,55 @@ func (rs *ReservoirSampler) Count() int64 {
 func (rs *ReservoirSampler) Reset() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
+	rs.samples = rs.samples[:0] // Keep capacity, clear length
+	rs.count = 0
+}
+
+// SimpleStatsTracker tracks basic statistics without storing individual samples
+// This is the most memory-efficient option when percentiles aren't critical
+type SimpleStatsTracker struct {
+	count   int64
+	sum     int64
+	min     int64
+	max     int64
+	sumOfSq int64 // For standard deviation calculation if needed
+	mu      sync.Mutex
+}
+
+// NewSimpleStatsTracker creates a new simple statistics tracker
+func NewSimpleStatsTracker() *SimpleStatsTracker {
+	return &SimpleStatsTracker{
+		min: -1, // Sentinel value for uninitialized
+	}
+}
+
+// Add adds a new value to the tracker
+func (st *SimpleStatsTracker) Add(value int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	st.count++
+	st.sum += value
+	st.sumOfSq += value * value
+
+	if st.min == -1 || value < st.min {
+		st.min = value
+	}
+	if value > st.max {
+		st.max = value
+	}
+}
+
+// GetPercentiles returns approximated percentiles based on min/max/average
+// This is less accurate but uses minimal memory
+func (st *SimpleStatsTracker) GetPercentiles() (p50, p95, p99 int64) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.count == 0 {
+		return 0, 0, 0
+	}
+
+	avg := st.sum / st.count
+
+	// Simple approximation: use average for p50, interpolate for p95/p99

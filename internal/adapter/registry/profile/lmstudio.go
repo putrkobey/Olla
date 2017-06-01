@@ -7,3 +7,12 @@ package profile
 type LMStudioResponse struct {
 	Object string          `json:"object"`
 	Data   []LMStudioModel `json:"data"`
+}
+
+// LMStudioModel represents a model in LM Studio's response
+type LMStudioModel struct {
+	Type              *string `json:"type,omitempty"`
+	Publisher         *string `json:"publisher,omitempty"`
+	Arch              *string `json:"arch,omitempty"`
+	CompatibilityType *string `json:"compatibility_type,omitempty"`
+	Quantization      *string `json:"quantization,omitempty"`
