@@ -16,3 +16,21 @@ let component: ReturnType<typeof mount> | undefined;
 afterEach(() => {
   if (component) unmount(component);
   document.body.innerHTML = '';
+});
+
+function jsonResponse(body: unknown) {
+  return {
+    status: 200,
+    ok: true,
+    headers: { get: () => null },
+    json: async () => body,
+  };
+}
+
+async function refreshWithEndpoints(endpointList: Record<string, unknown>[]) {
+  global.fetch = vi.fn(async () =>
+    jsonResponse({
+      endpoints: endpointList,
+      total_count: endpointList.length,
+      healthy_count: endpointList.length,
+      routable_count: endpointList.length,
