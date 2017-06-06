@@ -2,13 +2,3 @@
 .venv/
 venv/
 
-# MkDocs build output
-site/
-
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-
-# IDE files
-.vscode/
