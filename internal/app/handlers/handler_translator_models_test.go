@@ -183,3 +183,65 @@ func TestTranslatorModelsHandler_EmptyRegistry(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
+
+	// Verify data field exists and is empty
+	data, ok := response["data"].([]interface{})
+	if !ok {
+		t.Fatal("expected data field to be array")
+	}
+
+	if len(data) != 0 {
+		t.Errorf("expected 0 models, got %d", len(data))
+	}
+}
+
+func TestTranslatorModelsHandler_ResponseFormat(t *testing.T) {
+	// Create test application with a single model
+	mockReg := &mockTranslatorRegistry{
+		models: []*domain.UnifiedModel{
+			{
+				ID: "test/model:v1",
+				Aliases: []domain.AliasEntry{
+					{Name: "test-model-v1", Source: "test"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{EndpointURL: "http://localhost:8080"},
+				},
+			},
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		modelRegistry:    mockReg,
+		discoveryService: &mockDiscoveryService{},
+		repository:       &mockEndpointRepository{},
+	}
+
+	// Create Anthropic translator with test config
+	testConfig := config.AnthropicTranslatorConfig{
+		Enabled:        true,
+		MaxMessageSize: 10 << 20, // 10MB
+	}
+	trans, err := anthropic.NewTranslator(app.logger, testConfig)
+	if err != nil {
+		t.Fatalf("failed to create translator: %v", err)
+	}
+
+	// Create request
+	req := httptest.NewRequest(http.MethodGet, "/olla/anthropic/v1/models", nil)
+	w := httptest.NewRecorder()
+
+	// Call handler
+	handler := app.translatorModelsHandler(trans)
+	handler(w, req)
+
+	// Verify response
+	var response map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Verify the Anthropic GET /v1/models wire format.
+	data, ok := response["data"].([]interface{})
+	if !ok {
