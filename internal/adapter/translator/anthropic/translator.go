@@ -80,3 +80,85 @@ func (t *Translator) GetAPIPath() string {
 	return "/olla/anthropic/v1/messages"
 }
 
+// TranslationTargetPath implements translator.TargetPathProvider: the OpenAI
+// path an Anthropic request is translated onto when it cannot be passed through.
+func (t *Translator) TranslationTargetPath() string {
+	return openAIChatCompletionsPath
+}
+
+// MaxBodySize implements BodySizeLimiter so the handler can apply the
+// translator's configured limit when reading the request body, rather
+// than hardcoding a value.
+func (t *Translator) MaxBodySize() int64 {
+	return t.maxMessageSize
+}
+
+// getSessionID extracts the session ID from the request using a fallback chain.
+// this ensures we always have a valid session id for request tracking:
+// 1. try the configured session header (for custom session management)
+// 2. if there's none, fall back to X-Request-ID (standard request correlation)
+// 3. if that's still no go we, use default constant
+// the chain exists because different callers may use different correlation mechanisms.
+func (t *Translator) getSessionID(r *http.Request) string {
+	const HeaderRequestId = "X-Request-ID"
+
+	sessionID := r.Header.Get(t.inspector.GetSessionHeader())
+	if sessionID == "" {
+		sessionID = r.Header.Get(HeaderRequestId)
+		if sessionID == "" {
+			sessionID = defaultSessionID
+		}
+	}
+
+	return sessionID
+}
+
+// forEachSystemContentBlock iterates over system prompt content blocks regardless of input format.
+// This is a convenience wrapper around the standalone forEachSystemBlock function.
+// See forEachSystemBlock in token_count.go for the implementation details.
+func (t *Translator) forEachSystemContentBlock(system interface{}, fn func(block ContentBlock) error) error {
+	return forEachSystemBlock(system, fn)
+}
+
+// WriteError implements ErrorWriter interface for Anthropic-specific error formatting
+// Formats errors according to Anthropic's error schema
+// See: https://docs.anthropic.com/claude/reference/errors
+func (t *Translator) WriteError(w http.ResponseWriter, err error, statusCode int) {
+	t.logger.Error("Anthropic request failed",
+		"error", err.Error(),
+		"status", statusCode)
+	t.WriteErrorQuiet(w, err, statusCode)
+}
+
+// WriteErrorQuiet writes the same error response as WriteError without the ERROR log line,
+// for rejections the caller already reports through a sampled log.
+func (t *Translator) WriteErrorQuiet(w http.ResponseWriter, err error, statusCode int) {
+	// Map HTTP status codes to Anthropic error types.
+	// overloaded_error is reserved for Anthropic's own infrastructure being overloaded;
+	// a generic backend 503 is an api_error per litellm and bifrost conventions.
+	// timeout_error maps to 504/408 as defined by litellm and the Anthropic error taxonomy.
+	errorType := "api_error"
+	switch statusCode {
+	case http.StatusBadRequest:
+		errorType = "invalid_request_error"
+	case http.StatusUnauthorized:
+		errorType = "authentication_error"
+	case http.StatusForbidden:
+		errorType = "permission_error"
+	case http.StatusNotFound:
+		errorType = "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		// Anthropic error taxonomy: oversized request body maps to request_too_large.
+		errorType = "request_too_large"
+	case http.StatusTooManyRequests:
+		errorType = "rate_limit_error"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		errorType = "timeout_error"
+	}
+
+	// Anthropic error format
+	errorResp := map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    errorType,
+			"message": err.Error(),
