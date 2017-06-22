@@ -40,3 +40,24 @@ services:
       # Optional: Tensor parallelism for multi-GPU (uncomment if you have multiple GPUs)
       # - "--tensor-parallel-size"
       # - "2"                            # Number of GPUs to use
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1                   # Number of GPUs (or 'all' for all GPUs)
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s                 # Give vLLM time to load model
+
+  # Olla - Proxy and load balancer with API translation
+  olla:
+    image: ghcr.io/putrkobey/Olla:latest
+    container_name: olla
+    restart: unless-stopped
+    ports:
+      - "40114:40114"
