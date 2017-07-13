@@ -99,3 +99,104 @@ describe('SparkStrip', () => {
     expect(document.querySelector('.spark-hint')).toBeNull();
     const area = document.querySelector('.spark-area') as SVGPathElement | null;
     const line = document.querySelector('.spark-line') as SVGPathElement | null;
+    expect(area).toBeTruthy();
+    expect(line).toBeTruthy();
+    expect(area!.getAttribute('d')).toMatch(/^M 0 /);
+    expect(line!.getAttribute('d')).toMatch(/^M 0 /);
+  });
+
+  it('reflects the latest sample in the aria-label and the readout', () => {
+    render({
+      samples: [
+        makeSample({ reqPerSec: 1, activeConnections: 2 }),
+        makeSample({ reqPerSec: 2.4, activeConnections: 3 }),
+      ],
+    });
+    const chart = document.querySelector('.spark-chart') as HTMLElement;
+    expect(chart.getAttribute('aria-label')).toContain('2.4 requests per second');
+    expect(chart.getAttribute('aria-label')).toContain('3 active connections');
+    expect(document.body.textContent).toContain('2.4 req/s');
+    expect(document.body.textContent).toContain('3 conns');
+  });
+
+  it('renders a placeholder readout (not omitted) when no samples exist yet, to avoid header layout shift', () => {
+    render({ samples: [] });
+    const readout = document.querySelector('.spark-readout');
+    expect(readout).toBeTruthy();
+    expect(readout!.textContent).not.toContain('req/s');
+    expect(readout!.textContent?.trim()).toBe('—');
+  });
+
+  it('renders the req/s y-axis ceiling label and a 0 baseline', () => {
+    render({
+      samples: [
+        makeSample({ reqPerSec: 1, activeConnections: 2 }),
+        makeSample({ reqPerSec: 5.0, activeConnections: 3 }),
+        makeSample({ reqPerSec: 2, activeConnections: 1 }),
+      ],
+    });
+    const topLabel = document.querySelector('.spark-axis-top') as HTMLElement;
+    const bottomLabel = document.querySelector('.spark-axis-bottom') as HTMLElement;
+    expect(topLabel.textContent).toBe('5.0');
+    expect(bottomLabel.textContent).toBe('0');
+  });
+
+  it('rounds the ceiling label to an integer when maxReq >= 10', () => {
+    render({
+      samples: [makeSample({ reqPerSec: 5 }), makeSample({ reqPerSec: 42 })],
+    });
+    expect((document.querySelector('.spark-axis-top') as HTMLElement).textContent).toBe('42');
+  });
+
+  it('shows the hovered sample on pointermove and clears on pointerleave', () => {
+    const now = Date.now();
+    render({
+      samples: [
+        makeSample({ reqPerSec: 1, activeConnections: 2, t: now - 30000 }),
+        makeSample({ reqPerSec: 5, activeConnections: 3, t: now - 20000 }),
+        makeSample({ reqPerSec: 2, activeConnections: 7, t: now - 10000 }),
+      ],
+    });
+    const chart = stubChartRect(100);
+
+    // x=50 -> fraction 0.5 -> nearestSampleIndex(0.5, 3) = round(1) = 1, the
+    // middle sample (5 req/s, 3 conns). bubbles:true is needed because Svelte 5
+    // delegates bubbling events to a root listener.
+    chart.dispatchEvent(new MouseEvent('pointermove', { clientX: 50, bubbles: true }));
+    flushSync();
+
+    const tooltip = document.querySelector('.spark-tooltip') as HTMLElement | null;
+    expect(tooltip).toBeTruthy();
+    expect(tooltip!.textContent).toContain('5.0 req/s');
+    expect(tooltip!.textContent).toContain('3 conns');
+    expect(tooltip!.textContent).toContain('ago');
+    expect(document.querySelector('.spark-guide')).toBeTruthy();
+
+    chart.dispatchEvent(new MouseEvent('pointerleave'));
+    flushSync();
+    expect(document.querySelector('.spark-tooltip')).toBeNull();
+    expect(document.querySelector('.spark-guide')).toBeNull();
+  });
+
+  it('maps the pointer to the first sample at the far-left edge', () => {
+    render({
+      samples: [
+        makeSample({ reqPerSec: 9, activeConnections: 1 }),
+        makeSample({ reqPerSec: 5, activeConnections: 2 }),
+        makeSample({ reqPerSec: 1, activeConnections: 3 }),
+      ],
+    });
+    const chart = stubChartRect(100);
+    chart.dispatchEvent(new MouseEvent('pointermove', { clientX: 0, bubbles: true }));
+    flushSync();
+    const tooltip = document.querySelector('.spark-tooltip') as HTMLElement | null;
+    expect(tooltip).toBeTruthy();
+    expect(tooltip!.textContent).toContain('9.0 req/s');
+    expect(tooltip!.textContent).toContain('1 conns');
+  });
+
+  it('does not show a hover tooltip during warm-up (< 2 samples)', () => {
+    render({ samples: [makeSample({ reqPerSec: 1, activeConnections: 2 })] });
+    const chart = stubChartRect(100);
+    chart.dispatchEvent(new MouseEvent('pointermove', { clientX: 50, bubbles: true }));
+    flushSync();
