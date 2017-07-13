@@ -56,22 +56,3 @@ func TestStatusRoute_GzipAppliedThroughMux(t *testing.T) {
 func TestStatusRoute_PlainPathUntouched(t *testing.T) {
 	t.Parallel()
 
-	mux, _ := muxWithStatusRoute(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/internal/status", nil)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Empty(t, rec.Header().Get("Content-Encoding"))
-	assert.NotEmpty(t, rec.Body.Bytes())
-}
-
-// TestStaticAssetRoute_GzipNotApplied confirms the scope discipline: the
-// dashboard's static asset subtree is served by embed.go via
-// http.ServeContent (Range/206 semantics), so it must NOT be wrapped by the
-// gzip middleware. We assert by probing /internal/ui/ through the real
-// registerRoutes() output and confirming no Content-Encoding header appears
-// on the response. This catches a future regression that wraps the dashboard
-// handler at registration time.
-func TestStaticAssetRoute_GzipNotApplied(t *testing.T) {
