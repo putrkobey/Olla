@@ -31,3 +31,14 @@ dist/
 internal/app/handlers/dashboard/dist/*
 !internal/app/handlers/dashboard/dist/.gitkeep
 
+# Test results
+test/results/
+coverage.out
+coverage.html
+
+# Research and experimental code
+research/
+
+# Legacy directories (to be removed)
+config-dev/
+default.yml
