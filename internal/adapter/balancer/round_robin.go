@@ -31,14 +31,3 @@ func (r *RoundRobinSelector) Select(ctx context.Context, endpoints []*domain.End
 	}
 
 	routable := make([]*domain.Endpoint, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		if endpoint.Status.IsRoutable() {
-			routable = append(routable, endpoint)
-		}
-	}
-
-	if len(routable) == 0 {
-		return nil, errors.New("no routable endpoints available")
-	}
-
-	current := atomic.AddUint64(&r.counter, 1) - 1 // Subtract 1 to start from 0

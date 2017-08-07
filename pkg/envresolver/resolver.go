@@ -69,27 +69,3 @@ func ExpandStrict(s string) (string, error) {
 		// Only report as missing when the variable is genuinely unset;
 		// an explicit empty value is a valid (if unusual) operator choice
 		// and is handled by the downstream empty-token validation.
-		if !set {
-			missing = append(missing, name)
-		}
-		return ""
-	})
-
-	if len(missing) > 0 {
-		errs := make([]error, len(missing))
-		for i, name := range missing {
-			errs[i] = fmt.Errorf("required environment variable %q is not set", name)
-		}
-		return "", errors.Join(errs...)
-	}
-
-	return expanded, nil
-}
-
-// ExpandWithFile resolves a config value that may come from either a literal
-// string or a file path (the _file sibling-field convention). Callers pass the
-// literal value and the file path; exactly one must be non-empty.
-//
-// When fileValue is set, the file is read and its contents are returned with
-// leading/trailing whitespace trimmed. This mirrors the Docker Secrets / k8s
-// mounted-secret pattern where a file holds a single secret value.
