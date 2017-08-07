@@ -4,6 +4,3 @@ import { createPollStore } from './poll-store.svelte';
 
 const ENDPOINTS_INTERVAL_MS = 5000;
 const URL = '/internal/status/endpoints';
-
-export const endpoints = createPollStore<EndpointStatusResponse>({
-  name: 'endpoints',

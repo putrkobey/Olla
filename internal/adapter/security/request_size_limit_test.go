@@ -383,3 +383,131 @@ func TestSizeValidator_Validate_MultipleHeaders(t *testing.T) {
 		t.Fatalf("Validate failed: %v", err)
 	}
 	if result.Allowed {
+		t.Error("Large multiple headers should be rejected")
+	}
+}
+
+func TestSizeValidator_Validate_ConcurrentRequests(t *testing.T) {
+	limits := config.ServerRequestLimits{
+		MaxBodySize:   1000,
+		MaxHeaderSize: 500,
+	}
+
+	validator := createTestSizeLimitValidator(limits)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 20)
+	results := make(chan bool, 20)
+
+	for i := range 10 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			var bodySize int64
+			if id%2 == 0 {
+				bodySize = 500
+			} else {
+				bodySize = 1500
+			}
+
+			req := ports.SecurityRequest{
+				ClientID:   "192.168.1.100",
+				Endpoint:   "/api/test",
+				Method:     "POST",
+				BodySize:   bodySize,
+				HeaderSize: 100,
+				Headers:    map[string][]string{"Content-Type": {"application/json"}},
+			}
+
+			result, err := validator.Validate(ctx, req)
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- result.Allowed
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+	close(results)
+
+	for err := range errors {
+		t.Errorf("Concurrent access error: %v", err)
+	}
+
+	allowedCount := 0
+	rejectedCount := 0
+	for allowed := range results {
+		if allowed {
+			allowedCount++
+		} else {
+			rejectedCount++
+		}
+	}
+
+	if allowedCount != 5 {
+		t.Errorf("Expected 5 allowed requests, got %d", allowedCount)
+	}
+	if rejectedCount != 5 {
+		t.Errorf("Expected 5 rejected requests, got %d", rejectedCount)
+	}
+}
+
+func TestSizeValidator_Validate_MultiValueHeaders(t *testing.T) {
+	limits := config.ServerRequestLimits{
+		MaxBodySize:   1024,
+		MaxHeaderSize: minHeaderSize,
+	}
+
+	validator := createTestSizeLimitValidator(limits)
+	ctx := context.Background()
+
+	req := ports.SecurityRequest{
+		ClientID:   "192.168.1.100",
+		Endpoint:   "/api/test",
+		Method:     "POST",
+		BodySize:   100,
+		HeaderSize: 200,
+		Headers: map[string][]string{
+			"Accept": {"application/json", "text/html", "application/xml"},
+		},
+	}
+
+	result, err := validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if !result.Allowed {
+		t.Errorf("Multi-value headers should be calculated correctly, got: %s", result.Reason)
+	}
+
+	req.Headers["Large-Header"] = []string{strings.Repeat("z", minHeaderSize)}
+	req.HeaderSize = minHeaderSize + 200
+
+	result, err = validator.Validate(ctx, req)
+	if err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if result.Allowed {
+		t.Error("Large multi-value headers should exceed limit")
+	}
+}
+
+// TestCreateNonProxyMiddleware_ChunkedOversizedBody confirms that an oversized
+// chunked request (Content-Length == -1) to a non-proxy route is rejected with
+// 413. This is the regression guard for P1: MaxBytesReader alone never fires on
+// routes that don't read the body, so CreateNonProxyMiddleware must drain the
+// body itself.
+func TestCreateNonProxyMiddleware_ChunkedOversizedBody(t *testing.T) {
+	t.Parallel()
+
+	const cap = 10
+
+	validator := createTestSizeLimitValidator(config.ServerRequestLimits{
+		MaxBodySize:   cap,
+		MaxHeaderSize: 0,
+	})
+
