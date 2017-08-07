@@ -8,3 +8,25 @@ import ModelsPanel from './ModelsPanel.svelte';
 // "No models discovered yet" empty-state copy - rendered right alongside
 // StatusBanner's error banner. An operator reading both at once sees "the
 // backends genuinely have no models" rather than "the request failed".
+
+let component: ReturnType<typeof mount> | undefined;
+afterEach(() => {
+  if (component) unmount(component);
+  document.body.innerHTML = '';
+});
+
+function emptyStateText() {
+  return [...document.querySelectorAll<HTMLElement>('.panel-intro')]
+    .map((el) => el.textContent!.trim())
+    .join(' ');
+}
+
+describe('ModelsPanel failed-fetch state', () => {
+  it('does not claim "no models discovered" when the fetch failed', async () => {
+    global.fetch = vi.fn(async () => {
+      throw new Error('network error');
+    });
+
+    component = mount(ModelsPanel, { target: document.body });
+    flushSync();
+
