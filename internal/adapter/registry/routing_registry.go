@@ -31,37 +31,3 @@ func NewRoutingRegistry(base domain.ModelRegistry, routingConfig *config.ModelRo
 			discoveryAdapter = &discoveryServiceAdapter{discovery: discovery}
 		}
 
-		// Attempt to create the configured strategy
-		strategy, err := factory.Create(*routingConfig, discoveryAdapter)
-		if err != nil || strategy == nil {
-			// Log the error and fall back to strict strategy
-			logger.Error("Failed to create routing strategy, falling back to strict",
-				"configured_type", routingConfig.Type,
-				"error", err)
-			routingStrategy = routing.NewStrictStrategy(logger)
-		} else {
-			routingStrategy = strategy
-		}
-	} else {
-		// default to strict strategy
-		routingStrategy = routing.NewStrictStrategy(logger)
-	}
-
-	// Ensure routingStrategy is never nil
-	if routingStrategy == nil {
-		logger.Warn("Routing strategy was nil, using strict strategy as fallback")
-		routingStrategy = routing.NewStrictStrategy(logger)
-	}
-
-	return &RoutingRegistry{
-		ModelRegistry:   base,
-		routingStrategy: routingStrategy,
-		logger:          logger,
-	}
-}
-
-// GetRoutableEndpointsForModel implements model routing strategy
-func (r *RoutingRegistry) GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
-	// get endpoints that have this model
-	modelEndpoints, err := r.GetEndpointsForModel(ctx, modelName)
-	if err != nil {
