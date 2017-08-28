@@ -69,3 +69,39 @@ func probeStaleness(checkTimeout time.Duration) time.Duration {
 
 // IsOpen reports whether the circuit is open for endpointURL, given that
 // endpoint's own CheckTimeout (used to derive the half-open staleness
+// window - see probeStaleness). checkTimeout may be zero if the caller has
+// no endpoint context (e.g. a test), in which case a package default
+// applies.
+//
+// The second return value, attempt, identifies the specific half-open probe
+// this call admitted (0 when the circuit is closed and no half-open gating
+// applies). Callers that proceed to perform the probe MUST pass attempt
+// back into the matching RecordSuccess/RecordFailure call - see those for
+// why: a late result from a probe that was superseded by a stale-handover
+// replacement must not clobber the replacement's state.
+func (cb *CircuitBreaker) IsOpen(endpointURL string, checkTimeout time.Duration) (open bool, attempt int64) {
+	state, ok := cb.endpoints.Load(endpointURL)
+	if !ok {
+		return false, 0
+	}
+	return state.IsOpen(probeStaleness(checkTimeout))
+}
+
+// RecordSuccess records a successful probe for endpointURL. attempt must be
+// the value IsOpen returned when it admitted this probe (0 for the normal
+// closed-circuit path, where no correlation is needed or performed).
+//
+// ABA race note: when attempt is non-zero (a half-open probe), this only
+// applies if attempt still matches state.lastAttempt - i.e. this call is the
+// most recent admitted probe, not one that a stale-handover already
+// superseded. Without this check, a very late result from a hung probe that
+// finally resolves AFTER a replacement probe has already run to completion
+// would clobber the replacement's outcome (e.g. a stale failure re-opening
+// a circuit the replacement had just legitimately closed, or vice versa).
+// This closes the gap for the common case - a superseded probe's result
+// arriving after the replacement has already resolved - but is not a full
+// fencing solution: two admitted probes racing to record at literally the
+// same instant are not additionally serialised beyond the atomics already
+// in play. That residual window did not previously exist as a correctness
+// requirement (the code before this had no correlation at all) and is left
+// as understood behaviour rather than a bug.
