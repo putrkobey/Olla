@@ -51,3 +51,29 @@ else
     echo "    docker compose logs llama-cpp"
     exit 1
 fi
+echo ""
+
+MODEL=$(echo "$MODELS" | jq -r '.data[0].id')
+echo -e "${YELLOW}Using model: ${MODEL}${NC}"
+echo ""
+
+# Test 4: Simple message (non-streaming)
+echo -e "${YELLOW}Test 4: Testing simple message (non-streaming)...${NC}"
+RESPONSE=$(curl -s -X POST "${ANTHROPIC_URL}/messages" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d "{
+    \"model\": \"${MODEL}\",
+    \"max_tokens\": 50,
+    \"messages\": [
+      {\"role\": \"user\", \"content\": \"Say 'Hello from llama.cpp!' in one sentence.\"}
+    ]
+  }")
+
+if echo "$RESPONSE" | jq -e '.content[0].text' > /dev/null 2>&1; then
+    echo -e "${GREEN}  Non-streaming message successful${NC}"
+    echo "  Response:"
+    echo "$RESPONSE" | jq -r '.content[0].text' | sed 's/^/    /'
+else
+    echo -e "${RED}  Non-streaming message failed${NC}"
+    echo "$RESPONSE" | jq .
