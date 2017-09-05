@@ -102,3 +102,107 @@ func TestRequestValidation_ParameterRanges(t *testing.T) {
 		_, err = translator.TransformRequest(ctx, req)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "max_tokens must be at least 1")
+	})
+
+	t.Run("temperature_too_high", func(t *testing.T) {
+		temp := 3.0 // > 2.0
+		anthropicReq := AnthropicRequest{
+			Model:       "claude-sonnet-4-20250929",
+			MaxTokens:   1024,
+			Temperature: &temp,
+			Messages: []AnthropicMessage{
+				{Role: "user", Content: "Hello"},
+			},
+		}
+
+		body, err := json.Marshal(anthropicReq)
+		require.NoError(t, err)
+
+		req := &http.Request{
+			Body: io.NopCloser(bytes.NewReader(body)),
+		}
+
+		_, err = translator.TransformRequest(ctx, req)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "temperature must be between 0 and 2")
+	})
+
+	t.Run("temperature_negative", func(t *testing.T) {
+		temp := -0.5
+		anthropicReq := AnthropicRequest{
+			Model:       "claude-sonnet-4-20250929",
+			MaxTokens:   1024,
+			Temperature: &temp,
+			Messages: []AnthropicMessage{
+				{Role: "user", Content: "Hello"},
+			},
+		}
+
+		body, err := json.Marshal(anthropicReq)
+		require.NoError(t, err)
+
+		req := &http.Request{
+			Body: io.NopCloser(bytes.NewReader(body)),
+		}
+
+		_, err = translator.TransformRequest(ctx, req)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "temperature must be between 0 and 2")
+	})
+
+	t.Run("top_p_too_high", func(t *testing.T) {
+		topP := 1.5 // > 1.0
+		anthropicReq := AnthropicRequest{
+			Model:     "claude-sonnet-4-20250929",
+			MaxTokens: 1024,
+			TopP:      &topP,
+			Messages: []AnthropicMessage{
+				{Role: "user", Content: "Hello"},
+			},
+		}
+
+		body, err := json.Marshal(anthropicReq)
+		require.NoError(t, err)
+
+		req := &http.Request{
+			Body: io.NopCloser(bytes.NewReader(body)),
+		}
+
+		_, err = translator.TransformRequest(ctx, req)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "top_p must be between 0 and 1")
+	})
+
+	t.Run("top_p_negative", func(t *testing.T) {
+		topP := -0.1
+		anthropicReq := AnthropicRequest{
+			Model:     "claude-sonnet-4-20250929",
+			MaxTokens: 1024,
+			TopP:      &topP,
+			Messages: []AnthropicMessage{
+				{Role: "user", Content: "Hello"},
+			},
+		}
+
+		body, err := json.Marshal(anthropicReq)
+		require.NoError(t, err)
+
+		req := &http.Request{
+			Body: io.NopCloser(bytes.NewReader(body)),
+		}
+
+		_, err = translator.TransformRequest(ctx, req)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "top_p must be between 0 and 1")
+	})
+
+	t.Run("top_k_negative", func(t *testing.T) {
+		topK := -10
+		anthropicReq := AnthropicRequest{
+			Model:     "claude-sonnet-4-20250929",
+			MaxTokens: 1024,
+			TopK:      &topK,
+			Messages: []AnthropicMessage{
+				{Role: "user", Content: "Hello"},
+			},
+		}
