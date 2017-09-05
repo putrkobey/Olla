@@ -27,3 +27,17 @@ func CalculateExponentialBackoff(attempt int, baseDelay time.Duration, maxDelay 
 		backoff += jitter
 	}
 
+	return time.Duration(backoff)
+}
+
+// CalculateEndpointBackoff computes backoff interval for endpoint health checks.
+// Uses exponential multiplier for proper backoff progression
+func CalculateEndpointBackoff(checkInterval time.Duration, backoffMultiplier int) time.Duration {
+	if backoffMultiplier <= 0 {
+		return checkInterval
+	}
+
+	// Use the provided multiplier directly (already exponential: 1, 2, 4, 8...)
+	backoffInterval := checkInterval * time.Duration(backoffMultiplier)
+
+	if backoffInterval > constants.DefaultMaxBackoffSeconds {
