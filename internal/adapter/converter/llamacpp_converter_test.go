@@ -123,3 +123,253 @@ func TestLlamaCppConverter_ConvertToFormat(t *testing.T) {
 		require.True(t, ok)
 		assert.Len(t, response.Data, 1)
 
+		model := response.Data[0]
+		assert.Equal(t, "mistral/7b:instruct", model.ID, "Should use unified ID when no aliases exist")
+	})
+
+	t.Run("filters work correctly with family filter", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID:     "tinyllama/1.1b:chat-v1.0",
+				Family: "tinyllama",
+				Aliases: []domain.AliasEntry{
+					{Name: "tinyllama-1.1b-chat.gguf", Source: "llamacpp"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "tinyllama-1.1b-chat.gguf"},
+				},
+			},
+			{
+				ID:     "llama/3.1:8b",
+				Family: "llama",
+				Aliases: []domain.AliasEntry{
+					{Name: "llama-3.1-8b.gguf", Source: "llamacpp"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "llama-3.1-8b.gguf"},
+				},
+			},
+		}
+
+		filters := ports.ModelFilters{
+			Family: "llama",
+		}
+
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(LlamaCppResponse)
+		require.True(t, ok)
+		assert.Len(t, response.Data, 1, "Should only include models matching family filter")
+		assert.Equal(t, "llama-3.1-8b.gguf", response.Data[0].ID)
+	})
+
+	t.Run("handles empty model list", func(t *testing.T) {
+		models := []*domain.UnifiedModel{}
+
+		filters := ports.ModelFilters{}
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(LlamaCppResponse)
+		require.True(t, ok)
+		assert.Equal(t, "list", response.Object)
+		assert.Empty(t, response.Data, "Should return empty data array for empty model list")
+	})
+
+	t.Run("handles organisation in path format - slash-separated", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID:     "llama/3.1:8b",
+				Family: "llama",
+				Aliases: []domain.AliasEntry{
+					{Name: "meta-llama/llama-3.1-8b-instruct.gguf", Source: "llamacpp"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "meta-llama/llama-3.1-8b-instruct.gguf"},
+				},
+			},
+		}
+
+		filters := ports.ModelFilters{}
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(LlamaCppResponse)
+		require.True(t, ok)
+		assert.Len(t, response.Data, 1)
+
+		model := response.Data[0]
+		assert.Equal(t, "meta-llama/llama-3.1-8b-instruct.gguf", model.ID)
+		assert.Equal(t, "meta-llama", model.OwnedBy, "Should extract organisation from slash-separated path")
+	})
+
+	t.Run("handles hyphenated organisation prefix", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID:     "mistral/7b:instruct",
+				Family: "mistral",
+				Aliases: []domain.AliasEntry{
+					{Name: "mistralai-mistral-7b-instruct.gguf", Source: "llamacpp"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{
+					{NativeName: "mistralai-mistral-7b-instruct.gguf"},
+				},
+			},
+		}
+
+		filters := ports.ModelFilters{}
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(LlamaCppResponse)
+		require.True(t, ok)
+		assert.Len(t, response.Data, 1)
+
+		model := response.Data[0]
+		assert.Equal(t, "mistralai-mistral-7b-instruct.gguf", model.ID)
+		// "mistralai" contains "mistral" which is a known organisation
+		assert.Equal(t, "mistralai", model.OwnedBy, "Should extract organisation from hyphenated prefix")
+	})
+
+	t.Run("all models have consistent structure", func(t *testing.T) {
+		models := []*domain.UnifiedModel{
+			{
+				ID:     "model1",
+				Family: "test",
+				Aliases: []domain.AliasEntry{
+					{Name: "test-model-1.gguf", Source: "llamacpp"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{{NativeName: "test-model-1.gguf"}},
+			},
+			{
+				ID:     "model2",
+				Family: "test",
+				Aliases: []domain.AliasEntry{
+					{Name: "test-model-2.gguf", Source: "llamacpp"},
+				},
+				SourceEndpoints: []domain.SourceEndpoint{{NativeName: "test-model-2.gguf"}},
+			},
+		}
+
+		result, err := converter.ConvertToFormat(models, ports.ModelFilters{})
+		require.NoError(t, err)
+
+		response := result.(LlamaCppResponse)
+		require.Len(t, response.Data, 2)
+
+		// Verify all models have required fields
+		for _, model := range response.Data {
+			assert.Equal(t, "model", model.Object, "All models should have object type 'model'")
+			assert.NotEmpty(t, model.ID, "All models should have an ID")
+			assert.NotZero(t, model.Created, "All models should have creation timestamp")
+			assert.NotEmpty(t, model.OwnedBy, "All models should have an owner")
+		}
+	})
+}
+
+func TestLlamaCppConverter_GetFormatName(t *testing.T) {
+	converter := NewLlamaCppConverter()
+	assert.Equal(t, "llamacpp", converter.GetFormatName(), "Format name should be 'llamacpp'")
+}
+
+func TestLlamaCppConverter_determineOwner(t *testing.T) {
+	converter := NewLlamaCppConverter().(*LlamaCppConverter)
+
+	tests := []struct {
+		name     string
+		modelID  string
+		expected string
+	}{
+		{
+			name:     "slash-separated path with organisation",
+			modelID:  "meta-llama/llama-3.1-8b-instruct.gguf",
+			expected: "meta-llama",
+		},
+		{
+			name:     "slash-separated with different organisation",
+			modelID:  "mistralai/mixtral-8x7b.gguf",
+			expected: "mistralai",
+		},
+		{
+			name:     "hyphenated prefix with known organisation",
+			modelID:  "mistralai-mistral-7b-instruct.gguf",
+			expected: "mistralai",
+		},
+		{
+			name:     "hyphenated prefix with meta organisation",
+			modelID:  "meta-llama-3-8b.gguf",
+			expected: "meta",
+		},
+		{
+			name:     "simple filename without organisation",
+			modelID:  "tinyllama-1.1b.gguf",
+			expected: "llamacpp",
+		},
+		{
+			name:     "model name that looks like organisation but is not",
+			modelID:  "llama-3-8b.gguf",
+			expected: "llamacpp",
+		},
+		{
+			name:     "unknown pattern defaults to llamacpp",
+			modelID:  "custom-model.gguf",
+			expected: "llamacpp",
+		},
+		{
+			name:     "huggingface-style path",
+			modelID:  "huggingface/gpt2.gguf",
+			expected: "huggingface",
+		},
+		{
+			name:     "single word without extension",
+			modelID:  "gpt4",
+			expected: "llamacpp",
+		},
+		{
+			name:     "organisation with hyphen in prefix",
+			modelID:  "google-gemma-7b.gguf",
+			expected: "google",
+		},
+		{
+			name:     "nomic organisation",
+			modelID:  "nomic-embed-text.gguf",
+			expected: "nomic",
+		},
+		{
+			name:     "case sensitivity - uppercase organisation",
+			modelID:  "Meta-Llama/model.gguf",
+			expected: "Meta-Llama",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.determineOwner(tt.modelID)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestLlamaCppConverter_FindNativeName(t *testing.T) {
+	converter := NewLlamaCppConverter().(*LlamaCppConverter)
+
+	t.Run("finds llamacpp name from aliases with llamacpp source", func(t *testing.T) {
+		model := &domain.UnifiedModel{
+			ID: "llama/3.1:8b",
+			Aliases: []domain.AliasEntry{
+				{Name: "llama3.1:latest", Source: "ollama"},
+				{Name: "llama-3.1-8b-instruct-q4_k_m.gguf", Source: "llamacpp"},
+				{Name: "meta-llama/Meta-Llama-3.1-8B", Source: "vllm"},
+			},
+			SourceEndpoints: []domain.SourceEndpoint{
+				{NativeName: "llama-3.1-8b-instruct-q4_k_m.gguf"},
+			},
+		}
+
+		result := converter.FindNativeName(model)
+		assert.Equal(t, "llama-3.1-8b-instruct-q4_k_m.gguf", result, "Should find llamacpp-specific alias")
+	})
+
+	t.Run("returns empty string when no llamacpp name found", func(t *testing.T) {
+		model := &domain.UnifiedModel{
