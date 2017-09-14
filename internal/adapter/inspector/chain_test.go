@@ -208,3 +208,73 @@ func TestChain_Inspect_AllInspectorsFail_ReturnsProfile(t *testing.T) {
 	ctx := context.Background()
 	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
 	targetPath := "/v1/chat/completions"
+
+	inspector1 := &mockInspector{
+		name: "fail1",
+		inspectFunc: func(ctx context.Context, r *http.Request, profile *domain.RequestProfile) error {
+			return errors.New("failure 1")
+		},
+	}
+
+	inspector2 := &mockInspector{
+		name: "fail2",
+		inspectFunc: func(ctx context.Context, r *http.Request, profile *domain.RequestProfile) error {
+			return errors.New("failure 2")
+		},
+	}
+
+	chain.AddInspector(inspector1)
+	chain.AddInspector(inspector2)
+
+	profile, err := chain.Inspect(ctx, req, targetPath)
+
+	if err != nil {
+		t.Errorf("Inspect() should not error when all inspectors fail, got %v", err)
+	}
+
+	if profile == nil {
+		t.Fatal("Inspect() should return profile even when all inspectors fail")
+	}
+
+	if profile.Path != targetPath {
+		t.Errorf("Inspect() profile path = %v, want %v", profile.Path, targetPath)
+	}
+
+	if len(profile.SupportedBy) != 0 {
+		t.Errorf("Inspect() should have no supported profiles when all fail, got %v", profile.SupportedBy)
+	}
+}
+
+func TestChain_Inspect_NilContext(t *testing.T) {
+	logger := createTestLogger()
+	chain := NewChain(logger)
+	req, _ := http.NewRequest("POST", "/v1/chat/completions", nil)
+	targetPath := "/v1/chat/completions"
+
+	inspector := &mockInspector{
+		name: "test",
+		inspectFunc: func(ctx context.Context, r *http.Request, profile *domain.RequestProfile) error {
+			if ctx == nil {
+				return errors.New("context is nil")
+			}
+			return nil
+		},
+	}
+
+	chain.AddInspector(inspector)
+
+	// This should not panic even with nil context
+	profile, err := chain.Inspect(nil, req, targetPath)
+
+	if err != nil {
+		t.Errorf("Inspect() should handle nil context gracefully, got %v", err)
+	}
+
+	if profile == nil {
+		t.Fatal("Inspect() should return profile with nil context")
+	}
+}
+
+func TestChain_Inspect_ExecutionOrder(t *testing.T) {
+	logger := createTestLogger()
+	chain := NewChain(logger)
