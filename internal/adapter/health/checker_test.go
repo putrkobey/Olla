@@ -182,3 +182,188 @@ func TestHTTPHealthChecker_Check_NetworkError(t *testing.T) {
 
 	result, err := checker.Check(context.Background(), endpoint)
 
+	if err == nil {
+		t.Fatal("Expected error but got none")
+	}
+	if result.Status != domain.StatusOffline {
+		t.Errorf("Expected StatusOffline, got %v", result.Status)
+	}
+}
+
+func TestHTTPHealthChecker_Check_SlowResponse(t *testing.T) {
+	mockClient := &mockHTTPClient{
+		statusCode: 200,
+		delay:      20 * time.Millisecond,
+	}
+	mockRepo := newMockRepository()
+
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, cleanup, _ := logger.New(loggerCfg)
+	defer cleanup()
+	styledLogger := logger.NewPlainStyledLogger(log)
+
+	checker := NewHTTPHealthChecker(mockRepo, styledLogger, mockClient)
+
+	testURL, _ := url.Parse("http://localhost:11434")
+	healthURL, _ := url.Parse("/health")
+	endpoint := &domain.Endpoint{
+		URL:            testURL,
+		HealthCheckURL: healthURL,
+		CheckTimeout:   time.Minute,
+	}
+
+	result, err := checker.Check(context.Background(), endpoint)
+
+	if err != nil {
+		t.Fatalf("Check failed: %v", err)
+	}
+
+	if result.Status != domain.StatusHealthy {
+		t.Errorf("Expected StatusHealthy for fast response, got %v", result.Status)
+	}
+
+	if result.Latency > 100*time.Millisecond {
+		t.Errorf("Response took too long: %v", result.Latency)
+	}
+}
+
+func TestCircuitBreaker_BasicOperation(t *testing.T) {
+	cb := NewCircuitBreaker()
+	url := "http://localhost:11434"
+
+	if open, _ := cb.IsOpen(url, 0); open {
+		t.Error("Circuit breaker should be closed initially")
+	}
+
+	// Record failures until it opens
+	for range DefaultCircuitBreakerThreshold {
+		cb.RecordFailure(url, 0)
+	}
+
+	if open, _ := cb.IsOpen(url, 0); !open {
+		t.Error("Circuit breaker should be open after threshold failures")
+	}
+
+	// Record success should close it
+	cb.RecordSuccess(url, 0)
+	if open, _ := cb.IsOpen(url, 0); open {
+		t.Error("Circuit breaker should be closed after success")
+	}
+}
+
+func TestCircuitBreaker_Cleanup(t *testing.T) {
+	cb := NewCircuitBreaker()
+	url1 := "http://localhost:11434"
+	url2 := "http://localhost:11435"
+
+	cb.RecordFailure(url1, 0)
+	cb.RecordFailure(url2, 0)
+
+	active := cb.GetActiveEndpoints()
+	if len(active) != 2 {
+		t.Errorf("Expected 2 active endpoints, got %d", len(active))
+	}
+
+	cb.CleanupEndpoint(url1)
+	active = cb.GetActiveEndpoints()
+	if len(active) != 1 {
+		t.Errorf("Expected 1 active endpoint after cleanup, got %d", len(active))
+	}
+}
+
+func TestHealthChecker_StartStop(t *testing.T) {
+	mockRepo := newMockRepository()
+
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, cleanup, _ := logger.New(loggerCfg)
+	defer cleanup()
+	styledLogger := logger.NewPlainStyledLogger(log)
+
+	checker := NewHTTPHealthChecker(mockRepo, styledLogger, &mockHTTPClient{statusCode: 200})
+	ctx := context.Background()
+
+	err := checker.StartChecking(ctx)
+	if err != nil {
+		t.Fatalf("StartChecking failed: %v", err)
+	}
+
+	stats := checker.GetSchedulerStats()
+	if !stats["isRunning"].(bool) {
+		t.Error("Checker should be running")
+	}
+
+	err = checker.StopChecking(ctx)
+	if err != nil {
+		t.Fatalf("StopChecking failed: %v", err)
+	}
+
+	stats = checker.GetSchedulerStats()
+	if stats["isRunning"].(bool) {
+		t.Error("Checker should be stopped")
+	}
+}
+
+func TestHTTPHealthChecker_ForceHealthCheck(t *testing.T) {
+	mockRepo := newMockRepository()
+	mockClient := &mockHTTPClient{statusCode: 200}
+
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, cleanup, _ := logger.New(loggerCfg)
+	defer cleanup()
+	styledLogger := logger.NewPlainStyledLogger(log) // Fix: add theme
+
+	checker := NewHTTPHealthChecker(mockRepo, styledLogger, mockClient)
+	ctx := context.Background()
+
+	// Add some endpoints
+	configs := []config.EndpointConfig{
+		{
+			Name:           "test-endpoint",
+			URL:            "http://localhost:11434",
+			HealthCheckURL: "/health",
+			CheckTimeout:   time.Second,
+		},
+	}
+	mockRepo.LoadFromConfig(ctx, configs)
+
+	// Start checker
+	checker.StartChecking(ctx)
+	defer checker.StopChecking(ctx)
+
+	// Force health check
+	err := checker.RunHealthCheck(ctx, true)
+	if err != nil {
+		t.Fatalf("RunHealthCheck failed: %v", err)
+	}
+
+	// Verify endpoint was updated
+	endpoints, _ := mockRepo.GetAll(ctx)
+	if len(endpoints) != 1 {
+		t.Fatalf("Expected 1 endpoint, got %d", len(endpoints))
+	}
+
+	if endpoints[0].Status != domain.StatusHealthy {
+		t.Errorf("Expected healthy status after force check, got %v", endpoints[0].Status)
+	}
+}
+
+func TestHealthChecker_ConcurrentAccess(t *testing.T) {
+	mockRepo := newMockRepository()
+	mockClient := &mockHTTPClient{statusCode: 200}
+
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, cleanup, _ := logger.New(loggerCfg)
+	defer cleanup()
+	styledLogger := logger.NewPlainStyledLogger(log)
+
+	checker := NewHTTPHealthChecker(mockRepo, styledLogger, mockClient)
+	ctx := context.Background()
+
+	configs := make([]config.EndpointConfig, 5)
+	for i := range 5 {
+		configs[i] = config.EndpointConfig{
+			Name:           fmt.Sprintf("endpoint-%d", i),
+			URL:            fmt.Sprintf("http://localhost:%d", 11434+i),
+			HealthCheckURL: "/health",
+			CheckTimeout:   time.Second,
+		}

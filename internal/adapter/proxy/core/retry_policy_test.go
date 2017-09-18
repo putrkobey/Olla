@@ -66,38 +66,3 @@ func TestExecuteWithRetry_Policy(t *testing.T) {
 				return nil
 			}
 
-			req := httptest.NewRequest(tt.method, "/v1/chat", nil)
-			err := h.ExecuteWithRetry(context.Background(), httptest.NewRecorder(), req, eps,
-				&roundRobinSelector{}, &ports.RequestStats{}, proxyFunc)
-
-			assert.Equal(t, tt.wantAttempts, attempts)
-			if tt.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			// The connection genuinely failed, so health demotion happens whether
-			// or not the request is allowed to fail over.
-			if tt.wantDemoted {
-				require.NotNil(t, ds.updatedEndpoint, "failed endpoint must still be demoted")
-				assert.Equal(t, domain.StatusOffline, ds.updatedEndpoint.Status)
-			}
-		})
-	}
-}
-
-// A circuit-breaker rejection never contacted the endpoint, so it must not spend
-// the attempt budget: with retry disabled or a small max_attempts, an open
-// breaker on one endpoint must not fail the request while a healthy peer exists.
-func TestExecuteWithRetry_CBOpenDoesNotSpendBudget(t *testing.T) {
-	t.Parallel()
-
-	for name, policy := range map[string]proxyconfig.RetryPolicy{
-		"disabled":       {Disabled: true},
-		"max_attempts 1": {MaxAttempts: 1},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			ds := &testDiscoveryService{}
-			h := newPolicyRetryHandler(t, ds, policy)
