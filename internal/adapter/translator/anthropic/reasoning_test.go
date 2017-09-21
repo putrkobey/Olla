@@ -230,3 +230,80 @@ func TestStreaming_Reasoning_MultipleChunksAccumulated(t *testing.T) {
 	assert.Equal(t, 3, thinkingDeltas, "one thinking_delta per reasoning chunk")
 	assert.Equal(t, 1, textDeltas, "one text_delta for content")
 
+	// all blocks closed, thinking first
+	assertBlocksClosed(t, events)
+	assertThinkingBlockTransitionOrder(t, events)
+}
+
+// ---------------------------------------------------------------------------
+// Non-streaming tests
+// ---------------------------------------------------------------------------
+
+// TestResponse_Reasoning_ReasoningField verifies that "reasoning" in a non-streaming
+// OpenAI message maps to a leading thinking block in the Anthropic response.
+func TestResponse_Reasoning_ReasoningField(t *testing.T) {
+	t.Parallel()
+	tr := mustNewTranslator(createResponseTestLogger(), createTestConfig())
+
+	openaiResp := map[string]interface{}{
+		"id":    "chatcmpl-nr",
+		"model": "deepseek-r1",
+		"choices": []interface{}{
+			map[string]interface{}{
+				"message": map[string]interface{}{
+					"role":      "assistant",
+					"reasoning": "First I consider the options.",
+					"content":   "The answer is 7.",
+				},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]interface{}{
+			"prompt_tokens":     float64(10),
+			"completion_tokens": float64(5),
+		},
+	}
+
+	result, err := tr.TransformResponse(context.Background(), openaiResp, nil)
+	require.NoError(t, err)
+
+	resp, ok := result.(AnthropicResponse)
+	require.True(t, ok)
+	require.Len(t, resp.Content, 2, "thinking block + text block")
+
+	assert.Equal(t, contentTypeThinking, resp.Content[0].Type)
+	assert.Equal(t, "First I consider the options.", resp.Content[0].Thinking)
+	assert.Empty(t, resp.Content[0].Text, "thinking block must not set Text")
+
+	assert.Equal(t, contentTypeText, resp.Content[1].Type)
+	assert.Equal(t, "The answer is 7.", resp.Content[1].Text)
+}
+
+// TestResponse_Reasoning_ReasoningContentField verifies the "reasoning_content"
+// field name variant (vLLM / SGLang / DeepSeek) maps to a thinking block.
+func TestResponse_Reasoning_ReasoningContentField(t *testing.T) {
+	t.Parallel()
+	tr := mustNewTranslator(createResponseTestLogger(), createTestConfig())
+
+	openaiResp := map[string]interface{}{
+		"id":    "chatcmpl-rcc",
+		"model": "qwq-32b",
+		"choices": []interface{}{
+			map[string]interface{}{
+				"message": map[string]interface{}{
+					"role":              "assistant",
+					"reasoning_content": "Step 1: identify the pattern.",
+					"content":           "Pattern identified.",
+				},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]interface{}{},
+	}
+
+	result, err := tr.TransformResponse(context.Background(), openaiResp, nil)
+	require.NoError(t, err)
+
+	resp, ok := result.(AnthropicResponse)
+	require.True(t, ok)
+	require.Len(t, resp.Content, 2)
