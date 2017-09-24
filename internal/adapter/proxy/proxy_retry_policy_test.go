@@ -28,3 +28,34 @@ func resetBackend(t *testing.T, partial string) (*httptest.Server, *atomic.Int32
 			w.Header().Set("Content-Length", "1000")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(partial))
+			w.(http.Flusher).Flush()
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	return srv, hits
+}
+
+func healthyBackend(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	hits := &atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte("from-b"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, hits
+}
+
+// TestRetryPolicy_BothEngines runs the real engines, built through the factory
+// the way the server builds them, against a backend that resets the connection
+// and a healthy second backend. It proves the proxy.retry policy reaches both
+// engines and that a started response is never replayed.
