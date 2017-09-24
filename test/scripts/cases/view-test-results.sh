@@ -54,3 +54,31 @@ main() {
     fi
     
     # Show all test combinations
+    print_section "Test Cases"
+    
+    # Find all test directories
+    for engine in sherpa olla; do
+        for profile in auto standard streaming; do
+            local test_dir="$results_dir/$engine-$profile"
+            if [[ -d "$test_dir" ]]; then
+                echo ""
+                print_color "$WHITE" "$engine/$profile:"
+                
+                # Show test case summary
+                if [[ -f "$test_dir/summary.txt" ]]; then
+                    cat "$test_dir/summary.txt" | sed 's/^/  /'
+                fi
+                
+                # Check logs directory
+                if [[ -d "$test_dir/logs" ]]; then
+                    print_color "$GREY" "  Logs:"
+                    
+                    # Olla log
+                    if [[ -f "$test_dir/logs/olla.log" ]]; then
+                        local size=$(wc -l < "$test_dir/logs/olla.log" 2>/dev/null || echo "0")
+                        print_color "$GREY" "    - olla.log ($size lines)"
+                    fi
+                    
+                    # Test logs
+                    for log in detection latency responses; do
+                        local log_file="$test_dir/logs/$log.log"
