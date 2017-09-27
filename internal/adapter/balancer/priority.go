@@ -68,3 +68,26 @@ func (p *PrioritySelector) Select(ctx context.Context, endpoints []*domain.Endpo
 		return highestPriorityEndpoints[0], nil
 	}
 
+	// Multiple endpoints at same priority - use weighted selection
+	return p.weightedSelect(highestPriorityEndpoints), nil
+}
+
+// weightedSelect performs weighted selection based on endpoint status
+func (p *PrioritySelector) weightedSelect(endpoints []*domain.Endpoint) *domain.Endpoint {
+	if len(endpoints) == 1 {
+		return endpoints[0]
+	}
+
+	// Calculate total weight
+	totalWeight := 0.0
+	for _, endpoint := range endpoints {
+		totalWeight += endpoint.Status.GetTrafficWeight()
+	}
+
+	// All endpoints have 0 weight, fallback to random selection
+	if totalWeight == 0 {
+		//nolint:gosec // fallback to non-secure random is fine here for endpoint shuffling
+		return endpoints[rand.Intn(len(endpoints))]
+	}
+
+	// Weighted random selection
