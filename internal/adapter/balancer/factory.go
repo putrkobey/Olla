@@ -38,16 +38,3 @@ func NewFactory(statsCollector ports.StatsCollector) *Factory {
 }
 
 func (f *Factory) Register(name string, creator func(ports.StatsCollector) domain.EndpointSelector) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.creators[name] = creator
-}
-
-func (f *Factory) Create(name string) (domain.EndpointSelector, error) {
-	f.mu.RLock()
-	creator, exists := f.creators[name]
-	f.mu.RUnlock()
-
-	if !exists {
-		return nil, fmt.Errorf("unknown load balancer strategy: %s", name)
-	}

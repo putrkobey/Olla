@@ -32,37 +32,3 @@ func (e *PermanentError) Error() string {
 }
 
 func (e *PermanentError) Unwrap() error {
-	return e.Err
-}
-
-func IsPermanent(err error) bool {
-	var permErr *PermanentError
-	return errors.As(err, &permErr)
-}
-
-func Retry(ctx context.Context, policy RetryPolicy, fn RetryableFunc) error {
-	var lastErr error
-
-	for attempt := range policy.MaxAttempts {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		if err := fn(ctx); err == nil {
-			return nil
-		} else {
-			lastErr = err
-
-			if IsPermanent(err) {
-				return err
-			}
-
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-		}
-
-		if attempt < policy.MaxAttempts-1 {
-			backoff := calculateBackoff(attempt, policy)
-
-			timer := time.NewTimer(backoff)
