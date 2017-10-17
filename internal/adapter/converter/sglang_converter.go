@@ -25,31 +25,3 @@ func NewSGLangConverter() ports.ModelResponseConverter {
 	}
 }
 
-func (c *SGLangConverter) GetFormatName() string {
-	return constants.ProviderTypeSGLang
-}
-
-func (c *SGLangConverter) ConvertToFormat(models []*domain.UnifiedModel, filters ports.ModelFilters) (interface{}, error) {
-	filtered := filterModels(models, filters)
-
-	data := make([]profile.SGLangModel, 0, len(filtered))
-	for _, model := range filtered {
-		sglangModel := c.convertModel(model)
-		if sglangModel != nil {
-			data = append(data, *sglangModel)
-		}
-	}
-
-	return profile.SGLangResponse{
-		Object: "list",
-		Data:   data,
-	}, nil
-}
-
-func (c *SGLangConverter) convertModel(model *domain.UnifiedModel) *profile.SGLangModel {
-	// For SGLang, prefer the native SGLang name if available from source endpoints
-	now := time.Now().Unix()
-	modelID := c.FindNativeName(model)
-	if modelID == "" {
-		// Fallback to first alias or unified ID
-		if len(model.Aliases) > 0 {
