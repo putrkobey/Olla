@@ -110,3 +110,60 @@ func TestServiceManager_StopServices_ConcurrentRegister(t *testing.T) {
 			_ = sm.Register(&fakeManagedService{name: name})
 		}(i)
 	}
+
+	wg.Wait()
+}
+
+// TestServiceManager_Start_ConcurrentRegister is the Start-side counterpart:
+// Start's per-service loop read sm.services[name] with the same missing lock
+// as stopServices.
+func TestServiceManager_Start_ConcurrentRegister(t *testing.T) {
+	sm := NewServiceManager(newTestLogger())
+
+	const n = 20
+
+	// Register an initial batch so Start has real entries to iterate.
+	// Each Start call sleeps briefly, the same trick fakeManagedService.Stop
+	// uses above, so the Register goroutines below have a real window to
+	// overlap Start's per-service map read instead of racing to finish first.
+	for i := range n {
+		name := "initial-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		if err := sm.Register(&fakeManagedService{name: name, startDelay: time.Millisecond}); err != nil {
+			t.Fatalf("Register failed: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := sm.Start(context.Background()); err != nil {
+			t.Errorf("Start failed: %v", err)
+		}
+	}()
+
+	for i := range n {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := "extra-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+			_ = sm.Register(&fakeManagedService{name: name})
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// registerChain registers a -> b -> c -> d where each service depends on the previous
+// one, so the start order is a, b, c, d regardless of map iteration.
+func registerChain(t *testing.T, sm *ServiceManager, rec *lifecycleRecorder, failAt string, startErr error) {
+	t.Helper()
+	names := []string{"a", "b", "c", "d"}
+	for i, n := range names {
+		svc := &fakeManagedService{name: n, rec: rec}
+		if i > 0 {
+			svc.deps = []string{names[i-1]}
+		}
+		if n == failAt {
+			svc.startErr = startErr
