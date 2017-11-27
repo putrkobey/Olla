@@ -36,23 +36,3 @@ func TestStatusRoute_GzipAppliedThroughMux(t *testing.T) {
 	mux, _ := muxWithStatusRoute(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/internal/status", nil)
-	req.Header.Set("Accept-Encoding", "gzip")
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, "gzip", rec.Header().Get("Content-Encoding"),
-		"status route must be wrapped with the gzip middleware at registration time")
-
-	gr, err := gzip.NewReader(rec.Body)
-	require.NoError(t, err)
-	body, err := io.ReadAll(gr)
-	require.NoError(t, err)
-	assert.NotEmpty(t, body)
-}
-
-// TestStatusRoute_PlainPathUntouched confirms the same route, requested
-// without Accept-Encoding, is delivered verbatim with no Content-Encoding.
-func TestStatusRoute_PlainPathUntouched(t *testing.T) {
-	t.Parallel()
-
