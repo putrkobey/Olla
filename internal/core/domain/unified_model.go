@@ -156,3 +156,82 @@ func cloneMetadataValue(v interface{}) interface{} {
 		out := make(map[string]bool, len(t))
 		for k, b := range t {
 			out[k] = b
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(t))
+		for k, s := range t {
+			out[k] = s
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = cloneMetadataValue(e)
+		}
+		return out
+	case []string:
+		return append([]string(nil), t...)
+	default:
+		return v
+	}
+}
+
+// GetAliasStrings returns a slice of alias names for backward compatibility
+func (u *UnifiedModel) GetAliasStrings() []string {
+	aliases := make([]string, len(u.Aliases))
+	for i, a := range u.Aliases {
+		aliases[i] = a.Name
+	}
+	return aliases
+}
+
+// GetEndpointByURL returns the source endpoint for a given URL
+func (u *UnifiedModel) GetEndpointByURL(url string) *SourceEndpoint {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == url {
+			return &u.SourceEndpoints[i]
+		}
+	}
+	return nil
+}
+
+// AddOrUpdateEndpoint adds or updates a source endpoint
+func (u *UnifiedModel) AddOrUpdateEndpoint(endpoint SourceEndpoint) {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == endpoint.EndpointURL {
+			u.SourceEndpoints[i] = endpoint
+			return
+		}
+	}
+	u.SourceEndpoints = append(u.SourceEndpoints, endpoint)
+}
+
+// RemoveEndpoint removes a source endpoint by URL
+func (u *UnifiedModel) RemoveEndpoint(url string) bool {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == url {
+			u.SourceEndpoints = append(u.SourceEndpoints[:i], u.SourceEndpoints[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// GetTotalDiskSize calculates total disk size across all endpoints
+func (u *UnifiedModel) GetTotalDiskSize() int64 {
+	var total int64
+	for _, endpoint := range u.SourceEndpoints {
+		total += endpoint.DiskSize
+	}
+	return total
+}
+
+// IsAvailable checks if the model is available on any endpoint
+func (u *UnifiedModel) IsAvailable() bool {
+	return len(u.SourceEndpoints) > 0
+}
+
+// GetLoadedEndpoints returns endpoints where the model is loaded
+func (u *UnifiedModel) GetLoadedEndpoints() []SourceEndpoint {
+	var loaded []SourceEndpoint
