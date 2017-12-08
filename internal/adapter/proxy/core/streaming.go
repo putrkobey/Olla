@@ -62,3 +62,25 @@ func isStreamingContentType(contentType string) bool {
 		}
 	}
 	return false
+}
+
+var binaryPrefixes = []string{
+	constants.ContentTypePrefixImage,
+	constants.ContentTypePrefixVideo,
+	constants.ContentTypePrefixAudio,
+	constants.ContentTypePDF,
+	constants.ContentTypeZIP,
+	constants.ContentTypeGZIP,
+	constants.ContentTypeTAR,
+	constants.ContentTypeRAR,
+	constants.ContentType7Z,
+	constants.ContentTypePrefixFont,
+	constants.ContentTypePrefixModel, // 3D models, CAD files
+}
+var binaryTypes = []string{
+	constants.ContentTypeOctetStream,
+	constants.ContentTypeExcel,
+	constants.ContentTypeOfficeDocument,
+	constants.ContentTypeWordDOC,
+	constants.ContentTypePowerPoint,
+}
