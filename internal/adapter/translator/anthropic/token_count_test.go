@@ -251,3 +251,256 @@ func TestCountTokensWithRawJSON(t *testing.T) {
 		jsonBody      string
 		expectedExact int
 	}{
+		{
+			name: "raw JSON with untyped content blocks",
+			jsonBody: `{
+				"model": "claude-3-5-sonnet-20241022",
+				"max_tokens": 1024,
+				"messages": [
+					{
+						"role": "user",
+						"content": [
+							{
+								"type": "text",
+								"text": "Hello world"
+							}
+						]
+					}
+				]
+			}`,
+			expectedExact: 2, // "Hello world" = 11 chars, 11/4 = 2 (truncated)
+		},
+		{
+			name: "tool result with nested content",
+			jsonBody: `{
+				"model": "claude-3-5-sonnet-20241022",
+				"max_tokens": 1024,
+				"messages": [
+					{
+						"role": "user",
+						"content": [
+							{
+								"type": "tool_result",
+								"tool_use_id": "toolu_123",
+								"content": "Result text"
+							}
+						]
+					}
+				]
+			}`,
+			expectedExact: 2, // "Result text" = 11 chars, 11/4 = 2
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewReader([]byte(tt.jsonBody)))
+			if err != nil {
+				t.Fatalf("Failed to create request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			ctx := context.Background()
+			resp, err := trans.CountTokens(ctx, req)
+			if err != nil {
+				t.Fatalf("CountTokens failed: %v", err)
+			}
+
+			if resp.InputTokens != tt.expectedExact {
+				t.Errorf("Expected exactly %d tokens, got %d", tt.expectedExact, resp.InputTokens)
+			}
+		})
+	}
+}
+
+func TestCountTokensErrors(t *testing.T) {
+	trans := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	tests := []struct {
+		name        string
+		body        io.Reader
+		shouldError bool
+	}{
+		{
+			name:        "invalid JSON",
+			body:        bytes.NewReader([]byte(`{invalid json`)),
+			shouldError: true,
+		},
+		{
+			name:        "empty body",
+			body:        bytes.NewReader([]byte(``)),
+			shouldError: true,
+		},
+		{
+			name: "valid minimal request",
+			body: bytes.NewReader([]byte(`{
+				"model": "claude-3-5-sonnet-20241022",
+				"max_tokens": 1024,
+				"messages": []
+			}`)),
+			shouldError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("POST", "/v1/messages/count_tokens", tt.body)
+			if err != nil {
+				t.Fatalf("Failed to create request: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+
+			ctx := context.Background()
+			resp, err := trans.CountTokens(ctx, req)
+
+			if tt.shouldError {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Expected no error but got: %v", err)
+				}
+				if resp == nil {
+					t.Error("Expected non-nil response")
+				}
+			}
+		})
+	}
+}
+
+// TestCountTokensMatchesPythonReference verifies our implementation matches
+// the Python reference from anthropic-proxy.py
+func TestCountTokensMatchesPythonReference(t *testing.T) {
+	trans := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	// This test case directly mirrors the Python implementation logic
+	testCase := AnthropicRequest{
+		Model:     "claude-3-5-sonnet-20241022",
+		MaxTokens: 1024,
+		System:    "You are helpful", // 15 chars
+		Messages: []AnthropicMessage{
+			{
+				Role:    "user",
+				Content: "Hello", // 5 chars
+			},
+			{
+				Role: "assistant",
+				Content: []ContentBlock{
+					{
+						Type: "text",
+						Text: "Hi there", // 8 chars
+					},
+				},
+			},
+		},
+	}
+
+	// Python logic: total_chars = len(system) + sum(len(content) for each message)
+	// = 15 + 5 + 8 = 28
+	// token_count = max(1, 28 // 4) = max(1, 7) = 7
+
+	reqBody, err := json.Marshal(testCase)
+	if err != nil {
+		t.Fatalf("Failed to marshal request: %v", err)
+	}
+
+	req, err := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+
+	ctx := context.Background()
+	resp, err := trans.CountTokens(ctx, req)
+	if err != nil {
+		t.Fatalf("CountTokens failed: %v", err)
+	}
+
+	expectedTokens := 7 // (15 + 5 + 8) / 4 = 7
+	if resp.InputTokens != expectedTokens {
+		t.Errorf("Expected %d tokens to match Python reference, got %d", expectedTokens, resp.InputTokens)
+	}
+}
+
+// TestCountTokensWireResponse verifies that SerialiseCountTokens emits only
+// {"input_tokens":N} — no output_tokens or total_tokens fields.
+// Anthropic's spec, vLLM, lmdeploy, bifrost, and litellm all define this shape.
+func TestCountTokensWireResponse(t *testing.T) {
+	t.Parallel()
+
+	trans := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	reqBody := []byte(`{
+		"model": "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": [{"role": "user", "content": "Hello world"}]
+	}`)
+
+	req, err := http.NewRequest("POST", "/v1/messages/count_tokens", bytes.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	resp, err := trans.CountTokens(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CountTokens failed: %v", err)
+	}
+	if resp.InputTokens == 0 {
+		t.Fatal("expected non-zero InputTokens")
+	}
+
+	wireBytes, err := trans.SerialiseCountTokens(resp)
+	if err != nil {
+		t.Fatalf("SerialiseCountTokens failed: %v", err)
+	}
+
+	var wireMap map[string]interface{}
+	if err := json.Unmarshal(wireBytes, &wireMap); err != nil {
+		t.Fatalf("wire response is not valid JSON: %v", err)
+	}
+
+	// Must contain input_tokens
+	if _, ok := wireMap["input_tokens"]; !ok {
+		t.Error("wire response missing input_tokens field")
+	}
+
+	// Must NOT contain output_tokens or total_tokens
+	if _, ok := wireMap["output_tokens"]; ok {
+		t.Error("wire response must not contain output_tokens (not part of Anthropic count_tokens spec)")
+	}
+	if _, ok := wireMap["total_tokens"]; ok {
+		t.Error("wire response must not contain total_tokens (not part of Anthropic count_tokens spec)")
+	}
+
+	// Must contain exactly one field
+	if len(wireMap) != 1 {
+		t.Errorf("wire response must have exactly 1 field, got %d: %v", len(wireMap), wireMap)
+	}
+}
+
+// TestEstimateInputTokens verifies the streaming token seeding path.
+func TestEstimateInputTokens(t *testing.T) {
+	t.Parallel()
+
+	trans := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	body := []byte(`{
+		"model": "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": [{"role": "user", "content": "Hello, this is a test message for token estimation."}]
+	}`)
+
+	estimate := trans.EstimateInputTokens(body)
+	if estimate <= 0 {
+		t.Errorf("expected positive token estimate for non-empty prompt, got %d", estimate)
+	}
+}
+
+// TestEstimateInputTokens_InvalidBody returns 0 without panicking on malformed input.
+func TestEstimateInputTokens_InvalidBody(t *testing.T) {
+	t.Parallel()
+
+	trans := mustNewTranslator(createTestLogger(), createTestConfig())
+
+	estimate := trans.EstimateInputTokens([]byte(`{not json`))
+	if estimate != 0 {
