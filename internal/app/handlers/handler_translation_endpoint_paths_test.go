@@ -113,3 +113,118 @@ type translationPathApp struct {
 	handler http.Handler
 	trans   *anthropic.Translator
 	log     *warnCounter
+}
+
+// newTranslationPathApp wires the shipped profiles, a real PathInspector and the chosen real
+// engine. hosts maps model name to the endpoints that host it; strict picks the model routing
+// strategy (strict rejects, optimistic falls back to every healthy endpoint).
+func newTranslationPathApp(t *testing.T, engine string, strict, passthrough bool, endpoints []*domain.Endpoint, hosts map[string][]*domain.Endpoint) *translationPathApp {
+	t.Helper()
+
+	factory, err := profile.NewFactory("../../../config/profiles")
+	require.NoError(t, err)
+
+	appLog := newWarnCounter()
+	pathInspector := inspector.NewPathInspector(factory, appLog)
+	chain := inspector.NewChain(appLog)
+	chain.AddInspector(pathInspector)
+	bodyInspector, err := inspector.NewBodyInspector(appLog)
+	require.NoError(t, err)
+	chain.AddInspector(bodyInspector)
+
+	trans, err := anthropic.NewTranslator(appLog, config.AnthropicTranslatorConfig{PassthroughEnabled: passthrough})
+	require.NoError(t, err)
+
+	endpointsForModel := make(map[string][]string, len(hosts))
+	for model, eps := range hosts {
+		for _, ep := range eps {
+			endpointsForModel[model] = append(endpointsForModel[model], ep.URLString)
+		}
+	}
+
+	engineLog := logger.NewStyledLogger(slog.New(slog.NewTextHandler(io.Discard, nil)), &theme.Theme{}, false)
+	collector := stats.NewCollector(engineLog)
+	selector, err := balancer.NewFactory(collector).Create(balancer.DefaultBalancerPriority)
+	require.NoError(t, err)
+	discovery := &mockDiscoveryServiceWithFunc{getHealthyEndpointsFunc: func(context.Context) ([]*domain.Endpoint, error) {
+		return endpoints, nil
+	}}
+
+	app := &Application{
+		Config:           &config.Config{},
+		logger:           appLog,
+		rejectLog:        newRejectLogs(appLog, nil),
+		inspectorChain:   chain,
+		pathInspector:    pathInspector,
+		profileFactory:   factory,
+		profileLookup:    factory,
+		discoveryService: discovery,
+		modelRegistry:    &mockSimpleModelRegistry{strict: strict, endpointsForModel: endpointsForModel},
+		statsCollector:   collector,
+	}
+
+	switch engine {
+	case "sherpa":
+		cfg := &sherpa.Configuration{}
+		cfg.ResponseTimeout, cfg.ReadTimeout, cfg.StreamBufferSize = 5*time.Second, 5*time.Second, 8192
+		svc, serr := sherpa.NewService(discovery, selector, cfg, collector, nil, engineLog)
+		require.NoError(t, serr)
+		app.proxyService = svc
+	case "olla":
+		cfg := &olla.Configuration{}
+		cfg.ResponseTimeout, cfg.ReadTimeout, cfg.StreamBufferSize = 5*time.Second, 5*time.Second, 8192
+		svc, serr := olla.NewService(discovery, selector, cfg, collector, nil, engineLog)
+		require.NoError(t, serr)
+		t.Cleanup(svc.Cleanup)
+		app.proxyService = svc
+	default:
+		t.Fatalf("unknown engine %q", engine)
+	}
+
+	return &translationPathApp{app: app, handler: app.translationHandler(trans), trans: trans, log: appLog}
+}
+
+func (f *translationPathApp) post(t *testing.T, model string, stream bool) *httptest.ResponseRecorder {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"model":      model,
+		"max_tokens": 16,
+		"stream":     stream,
+		"messages":   []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", bytes.NewReader(b))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	req.RemoteAddr = "203.0.113.7:4000"
+	w := httptest.NewRecorder()
+	f.handler.ServeHTTP(w, req)
+	return w
+}
+
+// requireTranslatedOK checks the response is a translated Anthropic message (not passthrough).
+func requireTranslatedOK(t *testing.T, w *httptest.ResponseRecorder, stream bool) {
+	t.Helper()
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Empty(t, w.Header().Get(constants.HeaderXOllaMode), "must be translation, not passthrough")
+	if stream {
+		assert.Contains(t, w.Body.String(), "message_stop")
+		return
+	}
+	var msg map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &msg))
+	assert.Equal(t, "message", msg["type"])
+}
+
+var (
+	translationEngines = []string{"sherpa", "olla"}
+	translationModes   = []struct {
+		name   string
+		strict bool
+	}{{"strict", true}, {"optimistic", false}}
+	translationStreaming = []struct {
+		name   string
+		stream bool
+	}{{"non-streaming", false}, {"streaming", true}}
+)
+
+// A mixed fleet: each model lives on one backend, and translation must reach that backend
