@@ -19,14 +19,3 @@ function emptyStateText() {
   return [...document.querySelectorAll<HTMLElement>('.panel-intro')]
     .map((el) => el.textContent!.trim())
     .join(' ');
-}
-
-describe('ModelsPanel failed-fetch state', () => {
-  it('does not claim "no models discovered" when the fetch failed', async () => {
-    global.fetch = vi.fn(async () => {
-      throw new Error('network error');
-    });
-
-    component = mount(ModelsPanel, { target: document.body });
-    flushSync();
-
