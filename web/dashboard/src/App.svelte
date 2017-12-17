@@ -30,3 +30,19 @@
   $effect(() => {
     startClock();
     overview.start();
+    pollScheduler.start();
+    return () => {
+      pollScheduler.stop();
+      theme.destroy();
+    };
+  });
+
+  // URL hash routing. On mount, restore the panel (and any targeted endpoint
+  // row) from the location hash so a refresh or shared link re-opens the
+  // exact view. The hashchange listener then covers back/forward and manual
+  // URL edits; pushState (used by tab clicks and jump-to-endpoint) is silent,
+  // so it never re-enters this path - that's the idempotency contract between
+  // click-driven nav and history-driven restore.
+  $effect(() => {
+    const restore = (r: Route) => {
+      if (r.endpointKey) void jumpToEndpointKey(r.endpointKey);
