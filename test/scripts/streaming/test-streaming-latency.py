@@ -239,3 +239,124 @@ class StreamingLatencyTester:
             
             self.print_color(GREY, f"    Question: {question[:60]}{'...' if len(question) > 60 else ''}")
             self.print_color(YELLOW, f"    Streaming: ", end='')
+            sys.stdout.flush()
+            
+            with requests.post(url, json=payload, stream=True, timeout=self.timeout) as response:
+                if response.status_code != 200:
+                    result['error'] = f"HTTP {response.status_code}: {response.text[:100]}"
+                    return result
+                    
+                # Extract response headers
+                result['endpoint_used'] = response.headers.get('X-Olla-Endpoint', 'unknown')
+                
+                first_token_received = False
+                content_buffer = ""
+                chunk_count = 0
+                
+                # Process streaming response
+                for line in response.iter_lines(decode_unicode=True, chunk_size=1):
+                    if not line or not line.strip():
+                        continue
+                        
+                    current_time = time.time()
+                    
+                    # Handle Server-Sent Events format
+                    if line.startswith('data: '):
+                        data = line[6:].strip()  # Remove 'data: ' prefix
+                        
+                        if data == '[DONE]':
+                            break
+                            
+                        try:
+                            json_data = json.loads(data)
+                            choices = json_data.get('choices', [])
+                            
+                            if choices and 'delta' in choices[0]:
+                                delta = choices[0]['delta']
+                                content = delta.get('content', '')
+                                
+                                if content:
+                                    if not first_token_received:
+                                        result['time_to_first_token'] = current_time - start_time
+                                        first_token_received = True
+                                        self.print_color(GREEN, "●", end='')
+                                    else:
+                                        self.print_color(CYAN, "●", end='')
+                                        # Record interval between chunks
+                                        interval = current_time - last_chunk_time
+                                        result['chunk_intervals'].append(interval)
+                                        
+                                    sys.stdout.flush()
+                                    content_buffer += content
+                                    chunk_count += 1
+                                    last_chunk_time = current_time
+                                    
+                        except json.JSONDecodeError:
+                            continue
+                            
+                result['success'] = chunk_count > 0
+                result['chunks_received'] = chunk_count
+                result['total_chars'] = len(content_buffer)
+                result['total_time'] = time.time() - start_time
+                
+                # Analyze streaming quality
+                if result['chunk_intervals']:
+                    avg_interval = sum(result['chunk_intervals']) / len(result['chunk_intervals'])
+                    max_interval = max(result['chunk_intervals'])
+                    
+                    # Classify based on chunk patterns
+                    if len(result['chunk_intervals']) < 3:
+                        # Too few chunks to be streaming
+                        result['streaming_quality'] = 'single_chunk'
+                    elif max_interval > 1.0:  # Long pauses between chunks
+                        result['streaming_quality'] = 'choppy'
+                    elif avg_interval < 0.01:  # Very fast (<10ms) suggests batched
+                        result['streaming_quality'] = 'batched'
+                    elif avg_interval < 0.05:  # 10-50ms is typical for good streaming
+                        result['streaming_quality'] = 'smooth'
+                    elif avg_interval < 0.2:  # 50-200ms is acceptable streaming
+                        result['streaming_quality'] = 'smooth'
+                    else:
+                        # Slower than 200ms average
+                        result['streaming_quality'] = 'choppy'
+                else:
+                    result['streaming_quality'] = 'single_chunk'
+                    
+        except requests.exceptions.Timeout:
+            result['error'] = "Request timeout"
+        except Exception as e:
+            result['error'] = str(e)
+            
+        return result
+        
+    def analyze_results(self, results: List[Dict[str, Any]]):
+        """Analyze and display results"""
+        print("\n")
+        self.print_color(PURPLE, "=" * 60)
+        self.print_color(WHITE, f"{BOLD}Streaming Latency Analysis{RESET}")
+        self.print_color(PURPLE, "=" * 60)
+        
+        successful_results = [r for r in results if r['success']]
+        
+        if not successful_results:
+            self.print_color(RED, "No successful streaming tests to analyze")
+            return
+            
+        # Overall statistics
+        total_tests = len(results)
+        successful_tests = len(successful_results)
+        success_rate = (successful_tests / total_tests) * 100
+        
+        self.print_color(WHITE, f"\nOverall Results:")
+        self.print_color(GREY, f"  Total tests: {total_tests}")
+        self.print_color(GREY, f"  Successful: {successful_tests}")
+        self.print_color(GREY, f"  Success rate: {success_rate:.1f}%")
+        
+        # Latency analysis
+        ttft_times = [r['time_to_first_token'] for r in successful_results if r['time_to_first_token'] > 0]
+        if ttft_times:
+            avg_ttft = sum(ttft_times) / len(ttft_times)
+            min_ttft = min(ttft_times)
+            max_ttft = max(ttft_times)
+            
+            self.print_color(WHITE, f"\nTime to First Token:")

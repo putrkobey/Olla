@@ -154,3 +154,55 @@ func TestThrottle_DistinctKeyStormStaysBounded(t *testing.T) {
 		total   = 100_000
 		workers = 8
 	)
+	var full atomic.Int64
+	var wg sync.WaitGroup
+	for w := range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := w; i < total; i += workers {
+				if th.Allow(fmt.Sprintf("10.%d.%d.%d", i>>16&255, i>>8&255, i&255)) {
+					full.Add(1)
+				}
+				if i%1000 == 0 {
+					require.LessOrEqual(t, th.Len(), DefaultThrottleMaxKeys)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.LessOrEqual(t, th.Len(), DefaultThrottleMaxKeys)
+	require.LessOrEqual(t, int(full.Load()), DefaultThrottleMaxKeys+1)
+
+	th.Flush()
+	_, suppressed := rec.total()
+	require.Equal(t, total, int(full.Load())+suppressed, "every event is either logged or counted")
+}
+
+func TestThrottle_StartsNoGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	for range 50 {
+		th := NewThrottle(ThrottleConfig{})
+		th.Allow("a")
+		th.Flush()
+	}
+	require.LessOrEqual(t, runtime.NumGoroutine(), before)
+}
+
+// A flood that stops must still get its tail summary. Nothing calls Flush on the request
+// paths, and the attacker's own key never returns, so the report has to come from the
+// next unrelated event once a window has lapsed.
+func TestThrottle_TailSummaryWrittenByUnrelatedTraffic(t *testing.T) {
+	t.Parallel()
+	clock := newFakeClock()
+	rec := &summaryRecorder{}
+	th := NewThrottle(ThrottleConfig{Window: 10 * time.Second, Now: clock.Now, OnSummary: rec.record})
+
+	for range 50 {
+		th.Allow("6.6.6.6")
+	}
+	_, got := rec.total()
+	require.Zero(t, got)
+
+	// mid-window traffic from someone else reports nothing yet
