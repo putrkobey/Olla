@@ -175,3 +175,91 @@ create_engine_profile_config() {
 
 # Function to start Olla with custom log file
 start_olla_with_log() {
+    local engine=$1
+    local profile=$2
+    local log_file="$TEST_RESULTS_DIR/olla-$engine-$profile.log"
+    
+    # Call the start_olla function from _olla.sh
+    start_olla "$TEST_CONFIG" "$log_file"
+}
+
+
+
+
+# Function to run a single test configuration
+run_test_case() {
+    local engine=$1
+    local profile=$2
+    local test_start=$(date +%s)
+    
+    print_section "Testing: $engine engine with $profile profile"
+    
+    # Create test case directory structure
+    local test_case_dir="$TEST_RESULTS_DIR/$engine-$profile"
+    mkdir -p "$test_case_dir/config"
+    mkdir -p "$test_case_dir/logs"
+    
+    # Create test configuration
+    if ! create_engine_profile_config "$engine" "$profile"; then
+        print_color "$RED" "Failed to create configuration for $engine/$profile"
+        return 1
+    fi
+    
+    # Copy the test configuration to the test case folder
+    cp "$PROJECT_ROOT/$TEST_CONFIG" "$test_case_dir/config/config.yaml"
+    print_color "$CYAN" "Saved test config to: $test_case_dir/config/config.yaml"
+    
+    # Start Olla with the log in the test case directory
+    print_color "$YELLOW" "Starting Olla with $engine/$profile configuration..."
+    local log_file="$test_case_dir/logs/olla.log"
+    if ! start_olla "$TEST_CONFIG" "$log_file"; then
+        print_color "$RED" "Failed to start Olla for $engine/$profile"
+        return 1
+    fi
+    
+    # Check for phi model
+    print_color "$YELLOW" "Checking for phi models..."
+    if ! check_phi_models; then
+        print_color "$RED" "No phi models available, skipping tests"
+        stop_olla
+        return 1
+    fi
+    
+    # Run streaming tests
+    print_color "$YELLOW" "Running streaming test suite..."
+    if run_all_streaming_tests "$test_case_dir/logs"; then
+        print_color "$GREEN" "All streaming tests passed"
+    else
+        print_color "$YELLOW" "Some streaming tests failed (check logs)"
+    fi
+    
+    # Stop Olla
+    print_color "$YELLOW" "Stopping Olla..."
+    stop_olla
+    
+    # Calculate test duration
+    local test_end=$(date +%s)
+    local duration=$((test_end - test_start))
+    
+    # Create a summary file for this test case
+    {
+        echo "Test Case: $engine/$profile"
+        echo "Duration: ${duration}s"
+        echo "Binary: ../bin/$(ls "$TEST_RESULTS_DIR/bin" | head -1)"
+        echo "Config: config.yaml"
+        echo "Port: $TEST_PORT"
+        echo "Date: $(date)"
+    } > "$test_case_dir/summary.txt"
+    
+    print_color "$GREEN" "✓ Completed $engine/$profile in ${duration}s"
+    print_color "$GREY" "  Test case directory: $test_case_dir/"
+    
+    # Small delay to ensure clean shutdown
+    sleep 2
+}
+
+# Function to generate summary report
+generate_summary() {
+    local report_file="$TEST_RESULTS_DIR/summary.txt"
+    
+    print_header "Test Summary"
