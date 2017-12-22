@@ -263,3 +263,92 @@ generate_summary() {
     local report_file="$TEST_RESULTS_DIR/summary.txt"
     
     print_header "Test Summary"
+    
+    {
+        echo "Proxy Engine Profile Test Results"
+        echo "================================="
+        echo ""
+        echo "Test Run: $(date)"
+        echo "Base Config: $BASE_CONFIG"
+        echo "Runtime: ${minutes}m ${seconds}s"
+        echo ""
+        
+        for engine in "${PROXY_ENGINES[@]}"; do
+            for profile in "${PROXY_PROFILES[@]}"; do
+                echo -n "$engine/$profile: "
+                
+                # Check if all test files exist and have content
+                local test_dir="$TEST_RESULTS_DIR/$engine-$profile"
+                if [[ -f "$test_dir/logs/detection.log" ]] && [[ -f "$test_dir/logs/latency.log" ]] && [[ -f "$test_dir/logs/responses.log" ]]; then
+                    # Use check_streaming_test_passed from _streaming_tests.sh
+                    local all_passed=true
+                    for log in detection.log latency.log responses.log; do
+                        if ! check_streaming_test_passed "$test_dir/logs/$log"; then
+                            all_passed=false
+                            break
+                        fi
+                    done
+                    
+                    if $all_passed; then
+                        echo "PASSED"
+                    else
+                        echo "FAILED"
+                    fi
+                else
+                    echo "INCOMPLETE"
+                fi
+            done
+        done
+        
+        echo ""
+        echo "Detailed logs available in: $TEST_RESULTS_DIR"
+        
+        # Include streaming test analysis for each configuration
+        echo ""
+        echo "Detailed Analysis:"
+        echo "=================="
+        for engine in "${PROXY_ENGINES[@]}"; do
+            for profile in "${PROXY_PROFILES[@]}"; do
+                echo ""
+                echo "$engine/$profile:"
+                analyze_streaming_results "$TEST_RESULTS_DIR/$engine-$profile" | sed 's/^/  /'
+            done
+        done
+    } | tee "$report_file"
+    
+    print_color "$CYAN" "\nSummary saved to: $report_file"
+}
+
+# Cleanup function
+cleanup() {
+    print_color "$YELLOW" "\nCleaning up..."
+    cleanup_olla
+    deactivate_venv
+}
+
+# Set trap for cleanup
+trap 'echo -e "\n${YELLOW}Interrupted! Cleaning up...${RESET}"; cleanup; exit 130' INT TERM
+trap cleanup EXIT
+
+# Main execution
+main() {
+    print_header "Olla Proxy Engine & Profile Test Suite"
+    
+    # Record start time
+    local start_time=$(date +%s)
+    
+    # Check virtual environment
+    if ! check_venv; then
+        exit 1
+    fi
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Create results directory
+    TEST_RESULTS_DIR=$(create_results_dir "test-results")
+    print_color "$CYAN" "Test results will be saved to: $TEST_RESULTS_DIR"
+    
+    # Generate random port for this test run
+    TEST_PORT=$(get_random_port 40114 40144)
+    print_color "$CYAN" "Using test port: $TEST_PORT"
