@@ -61,35 +61,3 @@ func TestAliasRejection_StrictRouting_FailsFastWithoutProxying(t *testing.T) {
 		endpoints: []*domain.Endpoint{{
 			Name:      "ollama-1",
 			URL:       u,
-			URLString: u.String(),
-			Type:      domain.ProfileOllama,
-			Status:    domain.StatusHealthy,
-		}},
-	}
-
-	body := `{"model":"gpt-oss-120b","messages":[{"role":"user","content":"hi"}]}`
-
-	newApp := func(called *bool) *Application {
-		return &Application{
-			Config: &config.Config{
-				Server: config.ServerConfig{RateLimits: config.ServerRateLimits{}},
-			},
-			logger:           styledLog,
-			profileFactory:   profileFactory,
-			inspectorChain:   chain,
-			discoveryService: discoveryService,
-			modelRegistry:    modelRegistry,
-			aliasResolver:    aliasResolver,
-			proxyService: &mockProxyService{
-				proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoints []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
-					*called = true
-					w.WriteHeader(http.StatusOK)
-					return nil
-				},
-			},
-			StartTime: time.Now(),
-		}
-	}
-
-	t.Run("provider route rejects without proxying", func(t *testing.T) {
-		var called bool
