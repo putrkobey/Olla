@@ -49,28 +49,3 @@ func (s *StrictStrategy) GetRoutableEndpoints(
 				s.Name(),
 				"rejected",
 				len(healthyEndpoints),
-				modelEndpoints,
-				fmt.Errorf("model %s not found on any endpoint", modelName),
-			)
-	}
-
-	// create map for fast lookup
-	modelEndpointMap := make(map[string]bool)
-	for _, url := range modelEndpoints {
-		modelEndpointMap[url] = true
-	}
-
-	// filter healthy endpoints to those that have the model
-	var routable []*domain.Endpoint
-	for _, endpoint := range healthyEndpoints {
-		if modelEndpointMap[endpoint.URLString] {
-			routable = append(routable, endpoint)
-		}
-	}
-
-	// no healthy endpoints have the model
-	if len(routable) == 0 {
-		s.logger.Info("Model only available on unhealthy endpoints",
-			"model", modelName,
-			"model_endpoints", len(modelEndpoints),
-			"healthy_endpoints", len(healthyEndpoints))
