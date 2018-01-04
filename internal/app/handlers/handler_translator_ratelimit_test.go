@@ -67,3 +67,72 @@ func wireTranslatorRoutes(t *testing.T, engine string, adapters *security.Adapte
 	f.app.translatorRegistry = translator.NewRegistry(&mockStyledLogger{})
 	f.app.translatorRegistry.Register("anthropic", f.trans)
 	f.app.translatorRegistry.Register("plain", plainTranslator{f.trans})
+	f.app.registerTranslatorRoutes()
+
+	mux := http.NewServeMux()
+	// The access-log middleware needs a real slog logger underneath.
+	accessLog := logger.NewStyledLogger(slog.New(slog.NewTextHandler(io.Discard, nil)), &theme.Theme{}, false)
+	reg.WireUpWithSecurityChain(mux, &SecurityAdapters{securityAdapters: adapters, logger: accessLog})
+	return reg, mux
+}
+
+func mustAdapters(a *security.Adapters, _ *stats.Collector) *security.Adapters { return a }
+
+func translatorRequest(method, path, body string) *http.Request {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	req.RemoteAddr = "203.0.113.9:5000"
+	return req
+}
+
+const translatorBody = `{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+
+// Every translator route is an inference entry point and has to sit behind the limiter.
+// The loop reads the route table, so a translator registered later is covered without
+// anyone remembering to add it here.
+func TestTranslatorRoutes_AreRateLimited(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		t.Run(engine, func(t *testing.T) {
+			t.Parallel()
+
+			const burst = 3
+			reg, _ := wireTranslatorRoutes(t, engine, mustAdapters(translatorSecurity(t, burst, 1<<20)))
+
+			var translatorRoutes []string
+			for path, info := range reg.GetRoutes() {
+				if info.IsTranslator {
+					translatorRoutes = append(translatorRoutes, path)
+				}
+			}
+			require.GreaterOrEqual(t, len(translatorRoutes), 4, "anthropic messages, models, count_tokens and the plain translator")
+
+			for _, path := range translatorRoutes {
+				t.Run(path, func(t *testing.T) {
+					// A fresh client and mux per route keeps the buckets independent.
+					_, mux := wireTranslatorRoutes(t, engine, mustAdapters(translatorSecurity(t, burst, 1<<20)))
+					method := reg.GetRoutes()[path].Method
+
+					var limited *httptest.ResponseRecorder
+					for i := 0; i < burst+2 && limited == nil; i++ {
+						rec := httptest.NewRecorder()
+						mux.ServeHTTP(rec, translatorRequest(method, path, translatorBody))
+						if rec.Code == http.StatusTooManyRequests {
+							limited = rec
+						}
+					}
+					require.NotNil(t, limited, "%s was never rate limited", path)
+
+					// Only the per-IP bucket is enabled, so another client is unaffected.
+					other := translatorRequest(method, path, translatorBody)
+					other.RemoteAddr = "198.51.100.77:5000"
+					rec := httptest.NewRecorder()
+					mux.ServeHTTP(rec, other)
+					assert.NotEqual(t, http.StatusTooManyRequests, rec.Code, "a different client must have its own bucket")
+
+					retry, err := strconv.Atoi(limited.Header().Get("Retry-After"))
+					require.NoError(t, err, "Retry-After must be whole seconds")
+					assert.Positive(t, retry)
+				})
+			}
