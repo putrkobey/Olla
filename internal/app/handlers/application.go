@@ -190,3 +190,67 @@ func NewApplication(
 	if err != nil {
 		return nil, fmt.Errorf("failed to create body inspector: %w", err)
 	}
+	inspectorChain.AddInspector(bodyInspector)
+
+	// Create security adapters
+	throttles := newThrottleSet()
+	securityAdapters := &SecurityAdapters{
+		securityChain: securityChain,
+		logger:        logger,
+		throttles:     throttles,
+	}
+
+	// Create route registry
+	routeRegistry := router.NewRouteRegistry(logger)
+
+	// Create HTTP server
+	server := &http.Server{
+		Addr:         cfg.Server.GetAddress(),
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
+	}
+
+	// translator registry avoids bloating app struct
+	translatorRegistry := translator.NewRegistry(logger)
+
+	// Register Anthropic translator if enabled
+	if cfg.Translators.Anthropic.Enabled {
+		// Validate configuration before registering
+		if err := cfg.Translators.Anthropic.Validate(); err != nil {
+			logger.Error("Invalid Anthropic translator configuration", "error", err)
+			return nil, fmt.Errorf("invalid Anthropic translator config: %w", err)
+		}
+
+		anthropicTranslator, err := anthropic.NewTranslator(logger, cfg.Translators.Anthropic)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Anthropic translator: %w", err)
+		}
+		translatorRegistry.Register("anthropic", anthropicTranslator)
+
+		logger.Info("Registered Anthropic translator",
+			"max_message_size", cfg.Translators.Anthropic.MaxMessageSize)
+	} else {
+		logger.Info("Anthropic translator disabled via configuration")
+	}
+
+	// Create alias resolver for model name aliasing (nil if no aliases configured)
+	aliasResolver := registry.NewAliasResolver(cfg.ModelAliases, logger)
+	if aliasResolver != nil {
+		logger.Info("Model aliases configured", "alias_count", len(cfg.ModelAliases))
+	}
+
+	// Use profile factory directly as it implements the ProfileLookup interface
+	// The Factory.GetAnthropicSupport method provides the required functionality
+	profileLookup := profileFactory
+
+	return &Application{
+		Config:             cfg,
+		logger:             logger,
+		proxyService:       proxyService,
+		statsCollector:     statsCollector,
+		modelRegistry:      modelRegistry,
+		discoveryService:   discoveryService,
+		repository:         repository,
+		inspectorChain:     inspectorChain,
+		pathInspector:      pathInspector,
