@@ -68,3 +68,27 @@ const (
 	HeaderKeepAlive         = "Keep-Alive"
 	HeaderProxyAuthenticate = "Proxy-Authenticate"
 	HeaderTE                = "TE"
+	HeaderTrailer           = "Trailer"
+	HeaderTransferEncoding  = "Transfer-Encoding"
+	HeaderUpgrade           = "Upgrade"
+
+	// Proxy/Forwarding Headers
+	HeaderXForwardedFor   = "X-Forwarded-For"
+	HeaderXForwardedProto = "X-Forwarded-Proto"
+	HeaderXForwardedHost  = "X-Forwarded-Host"
+	HeaderXRealIP         = "X-Real-IP"
+	HeaderXProxiedBy      = "X-Proxied-By"
+
+	// Rate Limiting Headers
+	HeaderXRateLimitLimit     = "X-RateLimit-Limit"
+	HeaderXRateLimitRemaining = "X-RateLimit-Remaining"
+	HeaderXRateLimitReset     = "X-RateLimit-Reset"
+	HeaderRetryAfter          = "Retry-After"
+
+	// Custom/API Headers
+	HeaderXRequestID         = "X-Request-ID"
+	HeaderXModel             = "X-Model"
+	HeaderXAPIKey            = "X-Api-Key"    //nolint:gosec // We're just using the header name, not a credential
+	HeaderXAuthToken         = "X-Auth-Token" //nolint:gosec // We're just using the header name, not a credential
+	HeaderXServedBy          = "X-Served-By"
+	HeaderProxyAuthorization = "Proxy-Authorization"
