@@ -1,0 +1,126 @@
+# Docker Model Runner inference platform profile
+# Requires Docker Desktop 4.40+ (macOS Apple Silicon or Linux x86_64 with NVIDIA)
+#
+# LAZY MODEL LOADING: Models are loaded into memory on the first inference request, not at
+# startup. The /engines/v1/models endpoint returns 200 with an empty data array when no
+# models have been pulled yet - this is normal and does not indicate an unhealthy endpoint.
+name: docker-model-runner
+home: "https://docs.docker.com/ai/model-runner/"
+version: "1.0"
+display_name: "Docker Model Runner"
+description: "Docker's built-in LLM inference server powered by llama.cpp and vLLM"
+
+# Routing configuration
+routing:
+  prefixes:
+    - dmr
+
+# API compatibility
+api:
+  openai_compatible: true
+
+  # Anthropic Messages API support
+  # DMR exposes the Anthropic Messages API natively, enabling direct passthrough
+  # without translation overhead for Claude-format requests.
+  anthropic_support:
+    enabled: true
+    messages_path: /anthropic/v1/messages
+    token_count: true
+
+  # preserve_path is not required here. The proxy strips its own prefix (e.g. /olla/proxy)
+  # and forwards the remainder verbatim. Because DMR endpoint base URLs carry no path
+  # (e.g. http://localhost:12434), the /engines/... paths reach the backend unchanged.
+  paths:
+    # Simplified engine-routed paths (DMR selects the appropriate engine automatically)
+    - /engines/v1/models                # 0: model discovery and health check
+    - /engines/v1/chat/completions      # 1: chat completions
+    - /engines/v1/completions           # 2: text completions
+    - /engines/v1/embeddings            # 3: embeddings
+
+    # Explicit llama.cpp engine paths (for GGUF models)
+    - /engines/llama.cpp/v1/models              # 4: list models (llama.cpp)
+    - /engines/llama.cpp/v1/chat/completions    # 5: chat completions (llama.cpp)
+    - /engines/llama.cpp/v1/completions         # 6: text completions (llama.cpp)
+    - /engines/llama.cpp/v1/embeddings          # 7: embeddings (llama.cpp)
+
+    # Explicit vLLM engine paths (for safetensors models)
+    - /engines/vllm/v1/models              # 8: list models (vLLM)
+    - /engines/vllm/v1/chat/completions    # 9: chat completions (vLLM)
+    - /engines/vllm/v1/completions         # 10: text completions (vLLM)
+    - /engines/vllm/v1/embeddings          # 11: embeddings (vLLM)
+
+    # The Anthropic paths and unprefixed /v1/responses need Docker Model Runner 1.0.11+;
+    # /engines/v1/responses needs 1.2.7+. Older releases 404.
+    # Anthropic Messages API lives outside /engines; declared so a direct
+    # /olla/proxy/anthropic/v1/messages call is not narrowed to other profiles'
+    # /v1/messages (which suffix-match it) and DMR evicted.
+    - /anthropic/v1/messages               # 12: Anthropic Messages API
+    - /anthropic/v1/messages/count_tokens  # 13: Anthropic token count
+
+    # OpenAI Responses API (pkg/responses registers it under /v1, /engines/v1 and
+    # /engines/{backend}/v1). The unprefixed form is declared so a standard /v1/responses
+    # call keeps DMR as a candidate.
+    - /engines/v1/responses                # 14: OpenAI Responses API
+    - /v1/responses                        # 15: OpenAI Responses API (unprefixed)
+
+  model_discovery_path: /engines/v1/models
+  health_check_path: /engines/v1/models
+
+# Platform characteristics
+characteristics:
+  timeout: 5m
+  max_concurrent_requests: 8
+  default_priority: 95        # High priority — local, built-in Docker feature
+  streaming_support: true
+  single_model_server: false  # DMR can serve multiple models concurrently
+
+# Detection hints for auto-discovery
+detection:
+  path_indicators:
+    - "/engines/v1/models"
+    - "/engines/llama.cpp/v1/models"
+  default_ports:
+    - 12434
+  response_headers:
+    - "X-Docker-Model-Runner"  # Future-proofing if DMR adds this header
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "docker-model-runner"
+  parsing_rules:
+    chat_completions_path: "/engines/v1/chat/completions"
+    completions_path: "/engines/v1/completions"
+    model_field_name: "model"
+    supports_streaming: true
+
+# Path indices for specific functions
+path_indices:
+  health: 0
+  models: 0
+  chat_completions: 1
+  completions: 2
+  embeddings: 3
+
+# Model handling
+models:
+  name_format: "{{.Name}}"  # DMR uses "namespace/name" format (e.g., "ai/smollm2")
+  capability_patterns:
+    chat:
+      - "*-Instruct*"
+      - "*-Chat*"
+      - "*-chat-*"
+      - "*-instruct*"
+    embeddings:
+      - "*embed*"
+      - "*embedding*"
+    vision:
+      - "*vision*"
+      - "*llava*"
+      - "*bakllava*"
+    code:
+      - "*code*"
+      - "*Code*"
+      - "*coder*"
+  # Context window patterns for common Docker Hub models

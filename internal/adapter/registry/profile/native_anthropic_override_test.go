@@ -50,3 +50,21 @@ func TestShippedProfiles_NativeAnthropicDefaults(t *testing.T) {
 }
 
 func TestShippedProfiles_NativeAnthropicLocalOverrideDisables(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		file string
+	}{
+		{domain.ProfileSGLang, "sglang.yaml"},
+		{domain.ProfileLMDeploy, "lmdeploy.yaml"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			shipped, err := os.ReadFile(shippedProfilesDir + tc.file)
+			require.NoError(t, err)
+
+			const enabled = "anthropic_support:\n    enabled: true"
+			require.Contains(t, string(shipped), enabled, "the docs quote this block")
+			override := strings.Replace(string(shipped), enabled, "anthropic_support:\n    enabled: false", 1)

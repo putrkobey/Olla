@@ -175,3 +175,180 @@ func TestCollector_RecordSecurityViolation(t *testing.T) {
 	// Record size limit violation
 	violation3 := ports.SecurityViolation{
 		Timestamp:     time.Now(),
+		ClientID:      "192.168.1.100",
+		ViolationType: constants.ViolationSizeLimit,
+		Endpoint:      "/api/upload",
+		Size:          10485760, // 10MB
+	}
+	collector.RecordSecurityViolation(violation3)
+
+	// Check security stats
+	securityStats := collector.GetSecurityStats()
+	if securityStats.RateLimitViolations != 2 {
+		t.Errorf("Expected 2 rate limit violations, got %d", securityStats.RateLimitViolations)
+	}
+	if securityStats.SizeLimitViolations != 1 {
+		t.Errorf("Expected 1 size limit violation, got %d", securityStats.SizeLimitViolations)
+	}
+	if securityStats.UniqueRateLimitedIPs != 2 {
+		t.Errorf("Expected 2 unique rate limited IPs, got %d", securityStats.UniqueRateLimitedIPs)
+	}
+}
+
+func TestCollector_LatencyMinMax(t *testing.T) {
+	collector := NewCollector(createTestLogger())
+	endpoint := createTestEndpoint("http://localhost:8080", "local")
+
+	// Record requests with different latencies
+	collector.RecordRequest(endpoint, StatusSuccess, 50*time.Millisecond, 100)
+	collector.RecordRequest(endpoint, StatusSuccess, 200*time.Millisecond, 100)
+	collector.RecordRequest(endpoint, StatusSuccess, 25*time.Millisecond, 100)
+	collector.RecordRequest(endpoint, StatusSuccess, 150*time.Millisecond, 100)
+
+	endpointStats := collector.GetEndpointStats()
+	stats := endpointStats[endpoint.URL.String()]
+
+	if stats.MinLatency != 25 {
+		t.Errorf("Expected min latency 25ms, got %d", stats.MinLatency)
+	}
+	if stats.MaxLatency != 200 {
+		t.Errorf("Expected max latency 200ms, got %d", stats.MaxLatency)
+	}
+	if stats.AverageLatency != 106 { // (50+200+25+150)/4 = 106.25, truncated to 106
+		t.Errorf("Expected average latency 106ms, got %d", stats.AverageLatency)
+	}
+}
+
+// TestCollector_ProxyStatsLatencyBounds is the regression test for GetProxyStats
+// hardcoding MinLatency/MaxLatency to 0: it must report the true min/max across
+// every endpoint, not just one, and must ignore failed requests (which never
+// touch latency bounds, mirroring the per-endpoint behaviour).
+func TestCollector_ProxyStatsLatencyBounds(t *testing.T) {
+	collector := NewCollector(createTestLogger())
+	endpointA := createTestEndpoint("http://localhost:8080", "a")
+	endpointB := createTestEndpoint("http://localhost:8081", "b")
+
+	collector.RecordRequest(endpointA, StatusSuccess, 50*time.Millisecond, 100)
+	collector.RecordRequest(endpointB, StatusSuccess, 10*time.Millisecond, 100) // global min
+	collector.RecordRequest(endpointA, StatusSuccess, 300*time.Millisecond, 100)
+	collector.RecordRequest(endpointB, StatusSuccess, 999*time.Millisecond, 100) // global max
+	collector.RecordRequest(endpointA, StatusFailure, 1*time.Millisecond, 0)     // must not move the bounds
+
+	proxyStats := collector.GetProxyStats()
+	if proxyStats.MinLatency != 10 {
+		t.Errorf("MinLatency = %d, want 10", proxyStats.MinLatency)
+	}
+	if proxyStats.MaxLatency != 999 {
+		t.Errorf("MaxLatency = %d, want 999", proxyStats.MaxLatency)
+	}
+}
+
+func TestCollector_ConcurrentAccess(t *testing.T) {
+	collector := NewCollector(createTestLogger())
+	endpoint := createTestEndpoint("http://localhost:8080", "local")
+
+	const numGoroutines = 50
+	const requestsPerGoroutine = 10
+
+	var wg sync.WaitGroup
+
+	// Concurrent request recording
+	for i := range numGoroutines {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for range requestsPerGoroutine {
+				collector.RecordRequest(endpoint, StatusSuccess, 100*time.Millisecond, 1024)
+			}
+		}(i)
+	}
+
+	// Concurrent connection tracking
+	for range numGoroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			collector.RecordConnection(endpoint, 1)
+			collector.RecordConnection(endpoint, -1)
+		}()
+	}
+
+	// Concurrent security violations
+	for i := range numGoroutines {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			violation := ports.SecurityViolation{
+				Timestamp:     time.Now(),
+				ClientID:      "192.168.1.100",
+				ViolationType: constants.ViolationRateLimit,
+				Endpoint:      "/api/test",
+				Size:          0,
+			}
+			collector.RecordSecurityViolation(violation)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Check results
+	proxyStats := collector.GetProxyStats()
+	expectedRequests := int64(numGoroutines * requestsPerGoroutine)
+	if proxyStats.TotalRequests != expectedRequests {
+		t.Errorf("Expected %d total requests, got %d", expectedRequests, proxyStats.TotalRequests)
+	}
+	if proxyStats.SuccessfulRequests != expectedRequests {
+		t.Errorf("Expected %d successful requests, got %d", expectedRequests, proxyStats.SuccessfulRequests)
+	}
+
+	connectionStats := collector.GetConnectionStats()
+	if connectionStats[endpoint.URL.String()] != 0 {
+		t.Errorf("Expected 0 connections (balanced increments/decrements), got %d", connectionStats[endpoint.URL.String()])
+	}
+
+	securityStats := collector.GetSecurityStats()
+	if securityStats.RateLimitViolations != int64(numGoroutines) {
+		t.Errorf("Expected %d rate limit violations, got %d", numGoroutines, securityStats.RateLimitViolations)
+	}
+}
+
+func TestCollector_MultipleEndpoints(t *testing.T) {
+	collector := NewCollector(createTestLogger())
+
+	endpoints := []*domain.Endpoint{
+		createTestEndpoint("http://localhost:8080", "local-1"),
+		createTestEndpoint("http://localhost:8081", "local-2"),
+		createTestEndpoint("http://localhost:8082", "local-3"),
+	}
+
+	// Record requests for different endpoints
+	for i, endpoint := range endpoints {
+		for range i + 1 { // endpoint 0 gets 1 request, endpoint 1 gets 2, etc.
+			collector.RecordRequest(endpoint, StatusSuccess, time.Duration(100*(i+1))*time.Millisecond, 1024)
+		}
+	}
+
+	endpointStats := collector.GetEndpointStats()
+	if len(endpointStats) != len(endpoints) {
+		t.Errorf("Expected %d endpoints, got %d", len(endpoints), len(endpointStats))
+	}
+
+	// Check each endpoint individually
+	for i, endpoint := range endpoints {
+		stats, exists := endpointStats[endpoint.URL.String()]
+		if !exists {
+			t.Errorf("Stats not found for endpoint %s", endpoint.URL.String())
+			continue
+		}
+
+		expectedRequests := int64(i + 1)
+		if stats.TotalRequests != expectedRequests {
+			t.Errorf("Endpoint %s: expected %d requests, got %d", endpoint.URL.String(), expectedRequests, stats.TotalRequests)
+		}
+
+		expectedLatency := int64(100 * (i + 1))
+		if stats.AverageLatency != expectedLatency {
+			t.Errorf("Endpoint %s: expected %dms latency, got %d", endpoint.URL.String(), expectedLatency, stats.AverageLatency)
+		}
+	}
+
