@@ -78,3 +78,30 @@ describe('EndpointsPanel success bar is gated on endpoint status', () => {
     // Not the green bucket - a dead backend must not paint confident health.
     expect(fill.getAttribute('style')).not.toContain('green');
     // But the real figure survives: this endpoint has history, unlike one
+    // that never took a request, and hiding it destroys that distinction.
+    expect(fill.getAttribute('style')).toMatch(/width:\s*100%/);
+    expect(pctCell().textContent).toContain('100%');
+    expect(pctCell().textContent).not.toContain('no data');
+  });
+
+  it('shows no data for an offline endpoint that never took a request', async () => {
+    component = mount(EndpointsPanel, { target: document.body });
+    flushSync();
+
+    await refreshWith({
+      name: 'ollama-never-traded',
+      url: 'http://ollama-never-traded:11434',
+      type: 'ollama',
+      status: 'offline',
+      priority: 100,
+      success_rate: '0.0%',
+      request_count: 0,
+      model_count: 1,
+      avg_latency_ms: null,
+      min_latency_ms: 0,
+      max_latency_ms: 0,
+    });
+
+    const fill = pctFill();
+    expect(fill).toBeTruthy();
+    expect(fill.getAttribute('style')).not.toContain('green');
