@@ -30,3 +30,19 @@ function render(props: RangeBarProps): void {
 
 describe('RangeBar', () => {
   it('renders the numeric average, formatted, alongside the range', () => {
+    render({ min: 10, avg: 288, max: 900, globalMax: 900 });
+    expect(document.body.textContent).toContain('288ms');
+    expect(document.body.textContent).toContain('900ms');
+    const bar = document.querySelector('[role="img"]')!;
+    expect(bar.getAttribute('aria-label')).toBe('latency: average 288ms, range 10ms to 900ms');
+  });
+
+  it('formats a >=1000ms average using the same seconds form as the API', () => {
+    render({ min: 10, avg: 1500, max: 2000, globalMax: 2000 });
+    expect(document.body.textContent).toContain('1.5s');
+  });
+
+  it('shows a placeholder, not "0ms", when avg_latency_ms is null (no traffic yet)', () => {
+    render({ min: 0, avg: null, max: 500, globalMax: 500 });
+    const avgText = document.querySelector('.range-labels')!.firstChild!.textContent!.trim();
+    expect(avgText).toBe('—');
