@@ -44,3 +44,49 @@ api:
     - /v1/messages         # 14: Anthropic Messages API
     # Deliberately absent: /api/pull, /api/push, /api/create, /api/copy,
     # and /api/delete mutate one backend's model store, so
+    # Olla answers them with 501 instead of applying them to an arbitrary
+    # instance (see registerProviderPrefixRoutes). /api/me, /api/signout and
+    # /api/user/keys act on an Ollama account, not on inference.
+  model_discovery_path: /api/tags
+  health_check_path: /
+
+# Platform characteristics
+characteristics:
+  timeout: 5m  # Ollama can be slow for large models
+  max_concurrent_requests: 10
+  default_priority: 100
+  streaming_support: true
+  auth:
+    required: false
+    types:
+      - bearer   # used by Ollama Cloud and protected remote instances
+  
+# Detection hints for auto-discovery
+detection:
+  user_agent_patterns:
+    - "ollama/"
+  headers:
+    - "X-Ollama-Version"
+  path_indicators:
+    - "/"
+    - "/api/tags"
+  default_ports:
+    - 11434
+
+# Model handling
+models:
+  name_format: "{{.Name}}"  # e.g., "llama3:latest"
+  capability_patterns:
+    vision:
+      - "*llava*"
+      - "*vision*"
+      - "*bakllava*"
+    embeddings:
+      - "*embed*"
+      - "nomic-embed-text"
+      - "mxbai-embed-large"
+    code:
+      - "*code*"
+      - "codellama*"
+      - "deepseek-coder*"
+      - "qwen*coder*"
