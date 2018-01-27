@@ -75,3 +75,41 @@ func TestDiscoveryServiceAdapter_GetEndpoints(t *testing.T) {
 			healthyEndpoints: healthyOnly,
 		}
 
+		adapter := &discoveryServiceAdapter{discovery: mock}
+
+		result, err := adapter.GetEndpoints(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, allEndpoints, result)
+	})
+
+	t.Run("uses type assertion correctly", func(t *testing.T) {
+		healthyOnly := []*domain.Endpoint{
+			{Name: "ep1", Status: domain.StatusHealthy},
+		}
+
+		// This mock implements the interface but adapter should
+		// detect it has GetEndpoints and use it
+		mock := &mockDiscoveryServiceOnlyHealthy{
+			healthyEndpoints: healthyOnly,
+		}
+
+		adapter := &discoveryServiceAdapter{discovery: mock}
+
+		result, err := adapter.GetEndpoints(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, healthyOnly, result)
+	})
+}
+
+func TestDiscoveryServiceAdapter_GetHealthyEndpoints(t *testing.T) {
+	ctx := context.Background()
+
+	healthyEndpoints := []*domain.Endpoint{
+		{Name: "ep1", Status: domain.StatusHealthy},
+	}
+
+	mock := &mockDiscoveryService{
+		healthyEndpoints: healthyEndpoints,
+	}
+
+	adapter := &discoveryServiceAdapter{discovery: mock}
