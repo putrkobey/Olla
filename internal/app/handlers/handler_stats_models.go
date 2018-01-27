@@ -138,3 +138,73 @@ func (a *Application) buildModelStats(modelStats map[string]ports.ModelStats,
 
 	// Sort models by request count (most popular first)
 	sort.Slice(models, func(i, j int) bool {
+		return models[i].TotalRequests > models[j].TotalRequests
+	})
+
+	return models, acc
+}
+
+func (a *Application) convertModelStats(name string, stats ports.ModelStats,
+	modelEndpointStats map[string]map[string]ports.EndpointModelStats,
+	includeEndpoints bool) ModelStats {
+
+	successRate := float64(0)
+	if stats.TotalRequests > 0 {
+		successRate = float64(stats.SuccessfulRequests) / float64(stats.TotalRequests) * 100
+	}
+
+	var endpointBreakdown map[string]EndpointModelStats
+	if includeEndpoints {
+		endpointBreakdown = a.buildEndpointBreakdown(name, modelEndpointStats)
+	}
+
+	return ModelStats{
+		Name:               name,
+		TotalRequests:      stats.TotalRequests,
+		SuccessfulRequests: stats.SuccessfulRequests,
+		FailedRequests:     stats.FailedRequests,
+		SuccessRate:        format.Percentage(successRate),
+		TotalTraffic:       format.Bytes(safeInt64ToUint64(stats.TotalBytes)),
+		AverageLatency:     format.Latency(stats.AverageLatency),
+		P95Latency:         format.Latency(stats.P95Latency),
+		P99Latency:         format.Latency(stats.P99Latency),
+		UniqueClients:      stats.UniqueClients,
+		LastRequested:      format.TimeAgo(stats.LastRequested),
+		RoutingHits:        stats.RoutingHits,
+		RoutingMisses:      stats.RoutingMisses,
+		RoutingFallbacks:   stats.RoutingFallbacks,
+		EndpointBreakdown:  endpointBreakdown,
+	}
+}
+
+func (a *Application) buildEndpointBreakdown(modelName string,
+	modelEndpointStats map[string]map[string]ports.EndpointModelStats) map[string]EndpointModelStats {
+
+	endpoints, ok := modelEndpointStats[modelName]
+	if !ok {
+		return nil
+	}
+
+	breakdown := make(map[string]EndpointModelStats)
+	for epName, epStats := range endpoints {
+		breakdown[epName] = EndpointModelStats{
+			EndpointName:      epStats.EndpointName,
+			RequestCount:      epStats.RequestCount,
+			SuccessRate:       epStats.SuccessRate,
+			AverageLatency:    format.Latency(epStats.AverageLatency),
+			LastUsed:          format.TimeAgo(epStats.LastUsed),
+			ConsecutiveErrors: epStats.ConsecutiveErrors,
+		}
+	}
+	return breakdown
+}
+
+func (a *Application) buildSummary(models []ModelStats, modelStats map[string]ports.ModelStats,
+	acc *modelStatsAccumulator) ModelStatsSummary {
+
+	// Calculate active models (requested in last hour)
+	activeModels := 0
+	hourAgo := time.Now().Add(-time.Hour)
+	for _, stats := range modelStats {
+		if stats.LastRequested.After(hourAgo) {
+			activeModels++
