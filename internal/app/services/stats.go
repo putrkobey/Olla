@@ -13,3 +13,33 @@ import (
 // It initialises early in the startup sequence as most other services depend on it
 // for instrumentation and observability.
 type StatsService struct {
+	collector ports.StatsCollector
+	logger    logger.StyledLogger
+}
+
+// NewStatsService creates a new stats service
+func NewStatsService(logger logger.StyledLogger) *StatsService {
+	return &StatsService{
+		logger: logger,
+	}
+}
+
+// Name returns the service name
+func (s *StatsService) Name() string {
+	return "stats"
+}
+
+// Start initialises the stats collector
+func (s *StatsService) Start(ctx context.Context) error {
+	s.logger.Info("Initialising stats collector")
+
+	s.collector = stats.NewCollector(s.logger)
+
+	s.logger.Info("Stats collector initialised")
+	return nil
+}
+
+// Stop gracefully shuts down the stats collector
+func (s *StatsService) Stop(ctx context.Context) error {
+	// Lock-free atomic implementation requires no explicit cleanup
+	s.logger.InfoWithStatus("Stopping Stats collector", "OK")
