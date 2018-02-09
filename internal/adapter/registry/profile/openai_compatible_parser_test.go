@@ -74,3 +74,80 @@ func TestOpenAIParser_Parse(t *testing.T) {
 
 		response := `{
 			"object": "list",
+			"data": [
+				{
+					"id": "gpt-3.5-turbo",
+					"object": "model",
+					"created": 1677610602,
+					"owned_by": "openai"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		m := models[0]
+		// Details may exist (due to created), but MaxContextLength must be nil
+		if m.Details != nil {
+			assert.Nil(t, m.Details.MaxContextLength)
+		}
+	})
+
+	t.Run("model without any metadata has nil details", func(t *testing.T) {
+		t.Parallel()
+
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "bare-model",
+					"object": "model"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		assert.Nil(t, models[0].Details)
+	})
+
+	t.Run("zero max_model_len does not set MaxContextLength", func(t *testing.T) {
+		t.Parallel()
+
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "zero-context-model",
+					"object": "model",
+					"max_model_len": 0
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		// Neither details nor MaxContextLength should be set for a zero value
+		m := models[0]
+		if m.Details != nil {
+			assert.Nil(t, m.Details.MaxContextLength)
+		}
+	})
+
+	t.Run("skips models without ID", func(t *testing.T) {
+		t.Parallel()
+
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"object": "model",
+					"max_model_len": 4096
+				},
+				{
