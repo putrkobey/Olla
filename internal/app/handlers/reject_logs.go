@@ -25,12 +25,3 @@ type rejectLogs struct {
 func newRejectLogs(log logger.StyledLogger, set *logger.ThrottleSet) *rejectLogs {
 	return &rejectLogs{
 		request:   set.Track(logger.NewRejectThrottle(log, "Request rejected", "proxy", "client_status", nil)),
-		psFailure: set.Track(logger.NewRejectThrottle(log, "Ollama /api/ps failed", "ollama_ps", "endpoint", nil)),
-	}
-}
-
-// allowRequest is true when this client's rejection should be logged in full. A nil receiver
-// (an Application built without NewApplication, as in tests) logs everything.
-func (r *rejectLogs) allowRequest(clientIP string, status int) bool {
-	return r == nil || r.request.Allow(strconv.Itoa(status)+"|"+clientIP)
-}
