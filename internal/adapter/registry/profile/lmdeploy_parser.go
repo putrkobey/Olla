@@ -19,24 +19,3 @@ func (p *lmdeployParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
 		return nil, fmt.Errorf("failed to parse LMDeploy response: %w", err)
 	}
 
-	models := make([]*domain.ModelInfo, 0, len(response.Data))
-	now := time.Now()
-
-	for _, model := range response.Data {
-		if model.ID == "" {
-			continue
-		}
-
-		modelInfo := &domain.ModelInfo{
-			Name:     model.ID,
-			LastSeen: now,
-		}
-
-		details := &domain.ModelDetails{}
-		hasDetails := false
-
-		if model.Created > 0 {
-			createdTime := time.Unix(model.Created, 0)
-			details.ModifiedAt = &createdTime
-			hasDetails = true
-		}

@@ -35,3 +35,21 @@ func (c *DockerModelRunnerConverter) ConvertToFormat(models []*domain.UnifiedMod
 	data := make([]profile.DockerModelRunnerModel, 0, len(filtered))
 	for _, model := range filtered {
 		dmrModel := c.convertModel(model)
+		if dmrModel != nil {
+			data = append(data, *dmrModel)
+		}
+	}
+
+	return profile.DockerModelRunnerResponse{
+		Object: "list",
+		Data:   data,
+	}, nil
+}
+
+func (c *DockerModelRunnerConverter) convertModel(model *domain.UnifiedModel) *profile.DockerModelRunnerModel {
+	now := time.Now().Unix()
+	modelID := c.FindNativeName(model)
+	if modelID == "" {
+		// Fall back to first alias, then unified ID
+		if len(model.Aliases) > 0 {
+			modelID = model.Aliases[0].Name
