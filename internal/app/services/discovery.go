@@ -154,3 +154,81 @@ func (s *DiscoveryService) Start(ctx context.Context) error {
 		discoveryConfig := discovery.DiscoveryConfig{
 			Interval:          s.config.ModelDiscovery.Interval,
 			Timeout:           s.config.ModelDiscovery.Timeout,
+			ConcurrentWorkers: s.config.ModelDiscovery.ConcurrentWorkers,
+			RetryAttempts:     s.config.ModelDiscovery.RetryAttempts,
+			RetryBackoff:      s.config.ModelDiscovery.RetryBackoff,
+		}
+		s.modelDiscovery = discovery.NewModelDiscoveryService(client, s.endpointRepo, s.registry, discoveryConfig, s.logger)
+
+		// Set up recovery callback to trigger model discovery when endpoints recover
+		s.healthChecker.SetRecoveryCallback(health.RecoveryCallbackFunc(func(ctx context.Context, endpoint *domain.Endpoint) error {
+			s.logger.Info("Triggering model discovery for recovered endpoint",
+				"endpoint", endpoint.Name,
+				"url", endpoint.GetURLString())
+
+			// Discover models for the recovered endpoint
+			if err := s.modelDiscovery.DiscoverEndpoint(ctx, endpoint); err != nil {
+				s.logger.Warn("Failed to discover models for recovered endpoint",
+					"endpoint", endpoint.Name,
+					"error", err)
+				return err
+			}
+
+			s.logger.Info("Successfully refreshed models for recovered endpoint",
+				"endpoint", endpoint.Name)
+			return nil
+		}))
+
+		if err := s.modelDiscovery.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start model discovery: %w", err)
+		}
+
+		// Run initial model discovery to populate the catalogue immediately
+		if err := s.modelDiscovery.DiscoverAll(ctx); err != nil {
+			s.logger.Warn("Initial model discovery failed", "error", err)
+		}
+	}
+
+	s.logger.Info("Discovery service initialised",
+		"type", s.config.Type,
+		"endpoints", len(endpoints))
+
+	return nil
+}
+
+// Stop gracefully shuts down discovery components
+func (s *DiscoveryService) Stop(ctx context.Context) error {
+	s.logger.Info(" Stopping discovery service")
+
+	defer func() {
+		s.logger.ResetLine()
+		s.logger.InfoWithStatus("Stopping discovery service", "OK")
+	}()
+	if s.healthChecker != nil {
+		if err := s.healthChecker.StopChecking(ctx); err != nil {
+			s.logger.Warn("  Failed to stop health checker", "error", err)
+		}
+	}
+
+	if s.modelDiscovery != nil {
+		if err := s.modelDiscovery.Stop(ctx); err != nil {
+			s.logger.Warn("  Failed to stop model discovery", "error", err)
+		}
+	}
+	return nil
+}
+
+// Dependencies returns service dependencies
+func (s *DiscoveryService) Dependencies() []string {
+	return []string{"stats"}
+}
+
+// GetRegistry returns the model registry
+func (s *DiscoveryService) GetRegistry() (domain.ModelRegistry, error) {
+	if s.registry == nil {
+		return nil, errors.New("model registry not initialised")
+	}
+	return s.registry, nil
+}
+
+// GetEndpointRepository returns the endpoint repository

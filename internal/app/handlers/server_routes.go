@@ -206,3 +206,107 @@ func (a *Application) registerTranslatorRoutes() {
 
 				a.logger.InfoWithEndpoint(" ", name, "path", path)
 			} else {
+				a.logger.Debug("Registered translator routes",
+					"translator", name,
+					"messages_path", path,
+					"models_path", modelsPath)
+			}
+		} else {
+			a.logger.Debug("Translator does not implement PathProvider, skipping route registration",
+				"translator", name)
+		}
+	}
+
+	a.logger.InfoWithCount("Finished registering translator routes", len(translators))
+}
+
+// extractBasePath extracts the base path from a translator's API path
+// For example: "/olla/anthropic/v1/messages" -> "/olla/anthropic/v1"
+// Handles trailing slashes: "/olla/anthropic/v1/messages/" -> "/olla/anthropic/v1"
+func extractBasePath(path string) string {
+	// Remove any trailing slashes first
+	path = strings.TrimRight(path, "/")
+
+	// Find the last slash and return everything before it
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' {
+			return path[:i]
+		}
+	}
+	return path
+}
+
+// registerProviderRoutes builds HTTP paths from provider YAML configurations.
+// Falls back to static registration in test environments without profile loading.
+func (a *Application) registerProviderRoutes() {
+	if a.profileFactory == nil {
+		a.logger.Warn("Profile factory not available, using static route registration")
+		a.registerStaticProviderRoutes()
+		return
+	}
+
+	// Need all profiles for complete route coverage
+	profiles := a.profileFactory.GetAvailableProfiles()
+
+	// openai-compatible is special - it's a routing target but not listed as a provider
+	profiles = append(profiles, "openai-compatible")
+
+	a.logger.Info("Registering provider routes from profiles", "count", len(profiles))
+
+	for _, profileName := range profiles {
+		profile, err := a.profileFactory.GetProfile(profileName)
+		if err != nil {
+			// openai-compatible might not exist in minimal test setups
+			if profileName != "openai-compatible" {
+				a.logger.Warn("Failed to get profile", "profile", profileName, "error", err)
+			}
+			continue
+		}
+
+		config := profile.GetConfig()
+		if config == nil || len(config.Routing.Prefixes) == 0 {
+			a.logger.Debug("Profile has no routing prefixes", "profile", profileName)
+			continue
+		}
+
+		// Each prefix becomes a distinct URL namespace (e.g., /olla/lmstudio/, /olla/lm-studio/)
+		a.logger.Debug("Profile has routing prefixes", "profile", profileName, "prefixes", config.Routing.Prefixes)
+		for _, prefix := range config.Routing.Prefixes {
+			a.registerProviderPrefixRoutes(prefix, profileName, config)
+		}
+	}
+}
+
+// hasModelListingFormat reports whether a converter exists for a profile's
+// response format, i.e. whether Olla can answer a native model listing in it.
+func (a *Application) hasModelListingFormat(format string) bool {
+	return format != "" && a.converterFactory != nil && slices.Contains(a.converterFactory.GetSupportedFormats(), format)
+}
+
+// routeMethodAny labels a route that answers every HTTP method. The registry only
+// records Method for the startup table, so a specific verb there would misstate it.
+const routeMethodAny = "ANY"
+
+// registerProviderPrefixRoutes creates the full routing table for one provider prefix.
+// This handles both native endpoints (e.g., Ollama's /api/tags) and OpenAI compatibility.
+func (a *Application) registerProviderPrefixRoutes(prefix, profileName string, config *domain.ProfileConfig) {
+	basePath := constants.DefaultOllaProxyPathPrefix + prefix + constants.DefaultPathPrefix
+
+	a.logger.Debug("Registering routes for provider", "prefix", prefix, "profile", profileName)
+
+	// Model discovery varies by provider - some use /api/tags, others /v1/models
+	if config.API.ModelDiscoveryPath != "" {
+		// Provider's native API format
+		nativePath := basePath + strings.TrimPrefix(config.API.ModelDiscoveryPath, constants.DefaultPathPrefix)
+
+		// Ollama has unique endpoints beyond standard model discovery
+		if profileName == constants.ProviderTypeOllama {
+			a.routeRegistry.RegisterWithMethod(nativePath,
+				a.ollamaModelsHandler,
+				prefix+" models listing", "GET")
+
+			// Loaded state lives on each instance, so /api/ps is fanned out and merged
+			// rather than forwarded to whichever instance the balancer picks.
+			// It fans out to every Ollama host, so it takes the proxy route's rate-limit
+			// chain (the registry applies that to proxy routes only), as it did when it
+			// was forwarded through the proxy.
