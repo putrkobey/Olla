@@ -136,3 +136,72 @@ func TestTranslatorRoutes_AreRateLimited(t *testing.T) {
 					assert.Positive(t, retry)
 				})
 			}
+		})
+	}
+}
+
+// Claude Code reads the Anthropic error envelope, so a 429 from the limiter has to use it
+// for translators with an error writer, and fall back to plain text for ones without.
+func TestTranslatorRoutes_RateLimitUsesTranslatorErrorFormat(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		t.Run(engine, func(t *testing.T) {
+			t.Parallel()
+
+			_, mux := wireTranslatorRoutes(t, engine, mustAdapters(translatorSecurity(t, 1, 1<<20)))
+
+			for _, path := range []string{"/olla/anthropic/v1/messages", "/olla/anthropic/v1/messages/count_tokens"} {
+				// Exhaust the single-token bucket, then expect the rejection.
+				var rec *httptest.ResponseRecorder
+				for range 3 {
+					rec = httptest.NewRecorder()
+					mux.ServeHTTP(rec, translatorRequest(http.MethodPost, path, translatorBody))
+					if rec.Code == http.StatusTooManyRequests {
+						break
+					}
+				}
+				require.Equal(t, http.StatusTooManyRequests, rec.Code, path)
+				assert.Equal(t, constants.ContentTypeJSON, rec.Header().Get(constants.HeaderContentType))
+				assert.NotEmpty(t, rec.Header().Get("Retry-After"))
+
+				var body struct {
+					Type  string `json:"type"`
+					Error struct {
+						Type    string `json:"type"`
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body), rec.Body.String())
+				assert.Equal(t, "error", body.Type)
+				assert.Equal(t, "rate_limit_error", body.Error.Type)
+				assert.NotEmpty(t, body.Error.Message)
+				assert.NotEmpty(t, rec.Header().Get("request-id"), "rejections carry a request id like Anthropic's")
+			}
+
+			// A translator without an error writer still gets limited, in plain text.
+			var rec *httptest.ResponseRecorder
+			for range 3 {
+				rec = httptest.NewRecorder()
+				mux.ServeHTTP(rec, translatorRequest(http.MethodPost, "/olla/plain/v1/messages", translatorBody))
+				if rec.Code == http.StatusTooManyRequests {
+					break
+				}
+			}
+			require.Equal(t, http.StatusTooManyRequests, rec.Code)
+			assert.False(t, json.Valid(rec.Body.Bytes()), "plain translators keep the text rejection: %s", rec.Body.String())
+		})
+	}
+}
+
+// The size cap applies to the translator routes as it does on the proxy routes, answers in the
+// Anthropic error schema, and counts the violation, for Content-Length and chunked bodies alike.
+func TestTranslatorRoutes_SizeLimitApplies(t *testing.T) {
+	t.Parallel()
+
+	big := `{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"` + strings.Repeat("x", 512) + `"}]}`
+
+	for _, engine := range translationEngines {
+		for _, path := range []string{"/olla/anthropic/v1/messages", "/olla/anthropic/v1/messages/count_tokens"} {
+			for _, chunked := range []bool{false, true} {
+				name := engine + path
