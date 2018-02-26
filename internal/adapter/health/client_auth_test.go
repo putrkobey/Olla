@@ -55,3 +55,32 @@ func TestHealthProbe_BearerAuth(t *testing.T) {
 	ep.AuthHeaderValue = token
 
 	hc := NewHealthClient(http.DefaultClient, NewCircuitBreaker())
+	result, err := hc.Check(context.Background(), ep)
+
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusHealthy, result.Status, "probe with correct bearer token must be healthy")
+	assert.Equal(t, http.StatusOK, result.StatusCode)
+}
+
+// TestHealthProbe_MissingAuth demonstrates that probing an auth-protected backend
+// without credentials configured on the endpoint returns an unhealthy classification.
+// A 401 response maps to StatusConfigError via the health client's status mapping.
+func TestHealthProbe_MissingAuth(t *testing.T) {
+	t.Parallel()
+
+	srv := authEnforcingBackend(t, "Authorization", "Bearer required")
+
+	// Endpoint has no auth configured; backend will reject with 401.
+	ep := makeEndpoint(t, srv.URL)
+
+	hc := NewHealthClient(http.DefaultClient, NewCircuitBreaker())
+	result, err := hc.Check(context.Background(), ep)
+
+	// No transport error; just an HTTP 401.
+	require.NoError(t, err, "401 is an HTTP response, not a transport error")
+	assert.Equal(t, http.StatusUnauthorized, result.StatusCode)
+	assert.NotEqual(t, domain.StatusHealthy, result.Status, "unauthenticated probe must not be healthy")
+}
+
+// TestHealthProbe_CustomHeaders proves that the endpoint.Headers map entries
+// are forwarded on health probes, not just on proxy requests.
