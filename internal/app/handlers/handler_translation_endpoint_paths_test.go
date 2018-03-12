@@ -228,3 +228,119 @@ var (
 )
 
 // A mixed fleet: each model lives on one backend, and translation must reach that backend
+// on the chat path its profile declares. Nothing else may be touched.
+func TestTranslation_MixedFleetLandsOnEachBackendsChatPath(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		for _, mode := range translationModes {
+			for _, st := range translationStreaming {
+				t.Run(engine+"/"+mode.name+"/"+st.name, func(t *testing.T) {
+					t.Parallel()
+
+					backends := map[string]*pathBackend{
+						"docker-model-runner": newPathBackend(t, dmrChatPath),
+						"lemonade":            newPathBackend(t, lemonadeChatPath),
+						"vllm":                newPathBackend(t, rootChatPath),
+						"ollama":              newPathBackend(t, rootChatPath),
+					}
+					wantPath := map[string]string{
+						"docker-model-runner": dmrChatPath,
+						"lemonade":            lemonadeChatPath,
+						"vllm":                rootChatPath,
+						"ollama":              rootChatPath,
+					}
+					var eps []*domain.Endpoint
+					hosts := map[string][]*domain.Endpoint{}
+					for typ, b := range backends {
+						ep := liveEndpoint(t, typ+"-host", typ, b.URL, 50)
+						eps = append(eps, ep)
+						hosts["model-"+typ] = []*domain.Endpoint{ep}
+					}
+					f := newTranslationPathApp(t, engine, mode.strict, false, eps, hosts)
+
+					for typ := range backends {
+						w := f.post(t, "model-"+typ, st.stream)
+						requireTranslatedOK(t, w, st.stream)
+					}
+					for typ, b := range backends {
+						assert.Equal(t, []string{wantPath[typ]}, b.paths(), "%s must be hit once, on its own chat path", typ)
+					}
+				})
+			}
+		}
+	}
+}
+
+// Each attempt builds its own URL, so failing over between backends that mount the API
+// differently must not carry the first backend's path to the second.
+func TestTranslation_FailoverUsesEachEndpointsOwnPath(t *testing.T) {
+	t.Parallel()
+
+	type pair struct {
+		name         string
+		deadType     string
+		liveType     string
+		livePath     string
+		liveServes   string
+		deadPriority int
+	}
+	pairs := []pair{
+		{"dead DMR to vLLM", "docker-model-runner", "vllm", rootChatPath, rootChatPath, 100},
+		{"dead vLLM to DMR", "vllm", "docker-model-runner", dmrChatPath, dmrChatPath, 100},
+		{"dead Lemonade to Ollama", "lemonade", "ollama", rootChatPath, rootChatPath, 100},
+		{"dead Ollama to Lemonade", "ollama", "lemonade", lemonadeChatPath, lemonadeChatPath, 100},
+	}
+
+	for _, engine := range translationEngines {
+		for _, mode := range translationModes {
+			for _, st := range translationStreaming {
+				for _, p := range pairs {
+					t.Run(engine+"/"+mode.name+"/"+st.name+"/"+p.name, func(t *testing.T) {
+						t.Parallel()
+
+						live := newPathBackend(t, p.liveServes)
+						dead := liveEndpoint(t, "dead-host", p.deadType, closedBackendURL(t), p.deadPriority)
+						up := liveEndpoint(t, "live-host", p.liveType, live.URL, 50)
+						eps := []*domain.Endpoint{up, dead}
+						hosts := map[string][]*domain.Endpoint{"shared-model": eps}
+						f := newTranslationPathApp(t, engine, mode.strict, false, eps, hosts)
+
+						w := f.post(t, "shared-model", st.stream)
+
+						requireTranslatedOK(t, w, st.stream)
+						assert.Equal(t, []string{p.livePath}, live.paths())
+					})
+				}
+			}
+		}
+	}
+}
+
+// Backends with native Anthropic support keep getting /v1/messages passthrough (DMR on its
+// own /anthropic prefix), decided by anthropic_support and not by the chat path.
+func TestTranslation_PassthroughHostsUnaffected(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		for _, mode := range translationModes {
+			for _, st := range translationStreaming {
+				t.Run(engine+"/"+mode.name+"/"+st.name, func(t *testing.T) {
+					t.Parallel()
+
+					vllm := newPathBackend(t, "/v1/messages", rootChatPath)
+					lem := newPathBackend(t, lemonadeChatPath)
+					// the higher-priority Lemonade has no native Anthropic support, so passthrough
+					// must still pick the capable vLLM rather than translate to Lemonade
+					eps := []*domain.Endpoint{
+						liveEndpoint(t, "lemonade-host", "lemonade", lem.URL, 100),
+						liveEndpoint(t, "vllm-host", "vllm", vllm.URL, 50),
+					}
+					f := newTranslationPathApp(t, engine, mode.strict, true, eps, map[string][]*domain.Endpoint{"shared-model": eps})
+
+					w := f.post(t, "shared-model", st.stream)
+
+					require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+					assert.Equal(t, string(constants.TranslatorModePassthrough), w.Header().Get(constants.HeaderXOllaMode))
+					assert.Equal(t, []string{"/v1/messages"}, vllm.paths())
+					assert.Empty(t, lem.paths())

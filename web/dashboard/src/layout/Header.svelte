@@ -17,10 +17,3 @@
     <a
       class="brand-link"
       href="https://tensorfoundry.io/products/olla"
-      target="_blank"
-      rel="noopener noreferrer"
-      title="Olla on TensorFoundry"
-    >
-      <img class="brand-logo" src={ollaThumb} alt="Olla llama head logo" />
-      <span class="brand-text">
-        <h1>OLLA</h1>
