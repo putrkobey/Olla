@@ -76,3 +76,42 @@ func createRefactoredOllaProxy(endpoints []*domain.Endpoint) (ports.ProxyService
 	config.IdleConnTimeout = 90 * time.Second
 	config.MaxConnsPerHost = 50
 	return olla.NewService(discovery, selector, config, collector, nil, logger)
+}
+
+func benchmarkProxy(b *testing.B, proxy ports.ProxyService) {
+	b.ReportAllocs()
+
+	for i := range b.N {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		w := httptest.NewRecorder()
+		stats := &ports.RequestStats{
+			RequestID: fmt.Sprintf("bench-%d", i),
+			StartTime: time.Now(),
+		}
+
+		err := proxy.ProxyRequest(context.Background(), w, req, stats, createTestLogger())
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if w.Code != http.StatusOK {
+			b.Fatalf("unexpected status code: %d", w.Code)
+		}
+	}
+}
+
+// BenchmarkStreamingComparison benchmarks streaming performance
+func BenchmarkStreamingComparison(b *testing.B) {
+	// 10KB response
+	responseData := strings.Repeat("x", 10*1024)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(responseData))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("test", upstream.URL, domain.StatusHealthy)
+	endpoints := []*domain.Endpoint{endpoint}
+

@@ -102,38 +102,3 @@ func TestCombinedLogging_OrdinaryTrafficIsNeverSampled(t *testing.T) {
 			w.WriteHeader(status)
 		}))
 		for range 20 {
-			req := httptest.NewRequest(http.MethodGet, "/version", nil)
-			req.RemoteAddr = "203.0.113.7:5555"
-			mw.ServeHTTP(httptest.NewRecorder(), req)
-		}
-		assert.Equal(t, 20, h.count("Access log"), "status %d must keep one access line per request", status)
-		assert.Equal(t, 20, h.count("Request completed"), "status %d", status)
-	}
-}
-
-// The tail of a flood that stops before shutdown is reported by the owner's set.
-func TestNewCombinedLoggingMiddleware_FlushReportsPendingSummary(t *testing.T) {
-	t.Parallel()
-
-	h := &recordHandler{}
-	log := &warnCapture{mockStyledLogger: &mockStyledLogger{underlying: slog.New(h)}}
-	set := &logger.ThrottleSet{}
-	mw := NewCombinedLoggingMiddleware(log, set)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	for range 10 {
-		req := httptest.NewRequest(http.MethodGet, "/internal/ui/", nil)
-		req.RemoteAddr = "203.0.113.7:5555"
-		mw.ServeHTTP(httptest.NewRecorder(), req)
-	}
-	require.Empty(t, log.warns, "nothing reported while the window is open")
-
-	set.Flush()
-	require.Equal(t, []string{"Rejected request, repeats suppressed"}, log.warns)
-}
-
-// Rotating X-Forwarded-For must not mint a fresh sampling key per request: this layer
-// has no trusted-proxy configuration, so the TCP peer is the key.
-func TestCombinedLogging_RejectionKeyIgnoresForwardedHeaders(t *testing.T) {
-	t.Parallel()
-
