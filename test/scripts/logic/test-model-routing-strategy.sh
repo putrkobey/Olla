@@ -22,27 +22,3 @@ echo "================================"
 echo ""
 
 # function to make a request and check headers
-test_request() {
-    local description="$1"
-    local model="$2"
-    local expected_strategy="$3"
-    
-    echo "Test: $description"
-    echo "Model: $model"
-    echo "Expected Strategy: $expected_strategy"
-    
-    response=$(curl -s -i -X POST "$OLLA_URL/olla/api/generate" \
-        -H "Content-Type: application/json" \
-        -d "{\"model\": \"$model\", \"prompt\": \"test\", \"stream\": false}" \
-        2>&1 || true)
-    
-    # extract headers
-    strategy_header=$(echo "$response" | grep -i "X-Olla-Routing-Strategy:" | head -n 1 || echo "")
-    decision_header=$(echo "$response" | grep -i "X-Olla-Routing-Decision:" | head -n 1 || echo "")
-    reason_header=$(echo "$response" | grep -i "X-Olla-Routing-Reason:" | head -n 1 || echo "")
-    status_code=$(echo "$response" | head -n 1 | awk '{print $2}')
-    
-    echo "Response Status: $status_code"
-    echo "Routing Strategy: $strategy_header"
-    echo "Routing Decision: $decision_header"
-    echo "Routing Reason: $reason_header"
