@@ -38,3 +38,83 @@ export interface SystemSummary {
   endpoints_up: string;
   success_rate: string;
   avg_latency: string;
+  total_traffic: string;
+  uptime: string;
+  version: string;
+  commit: string;
+  active_connections: number;
+  security_violations: number;
+  total_requests: number;
+  total_failures: number;
+  // Lets the dashboard branch on the no-traffic state without guessing from
+  // a "0%" success rate. Always emitted by the backend (no omitempty); false
+  // on a fresh boot, flips true once any proxy request has been counted.
+  // When false, success_rate arrives as "N/A" rather than "0%".
+  has_traffic: boolean;
+}
+
+export interface EndpointModelsResponse {
+  last_updated: string;
+  count: number;
+}
+
+export interface EndpointResponse {
+  avg_latency_ms?: number;
+  next_check_at?: string;
+  health_check_at?: string;
+  models: EndpointModelsResponse;
+  name: string;
+  status: string;
+  success_rate: string;
+  avg_latency: string;
+  traffic: string;
+  last_check: string;
+  next_check: string;
+  issues: string;
+  url: string;
+  id: string;
+  priority: number;
+  connections: number;
+  requests: number;
+  min_latency_ms: number;
+  max_latency_ms: number;
+}
+
+export interface StatusResponse {
+  timestamp: string;
+  proxy: ProxySummary;
+  endpoints: EndpointResponse[];
+  security: SecuritySummary;
+  system: SystemSummary;
+}
+
+// --- handler_status_endpoints.go --------------------------------------
+
+export interface EndpointSummary {
+  avg_latency_ms?: number;
+  next_check_at?: string;
+  health_check_at?: string;
+  last_model_sync_at?: string;
+  name: string;
+  type: string;
+  status: string;
+  last_model_sync?: string;
+  health_check: string;
+  response_time?: string;
+  success_rate: string;
+  issues?: string;
+  url: string;
+  id: string;
+  priority: number;
+  model_count: number;
+  request_count: number;
+  min_latency_ms: number;
+  max_latency_ms: number;
+  active_connections: number;
+}
+
+export interface EndpointStatusResponse {
+  timestamp: string;
+  endpoints: EndpointSummary[];
+  total_count: number;
+  healthy_count: number;
