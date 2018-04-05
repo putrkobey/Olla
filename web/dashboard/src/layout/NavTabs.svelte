@@ -14,3 +14,19 @@
     // Move focus to the newly-active tab once the DOM has updated.
     queueMicrotask(() => {
       document.getElementById(`tab-${name}`)?.focus();
+    });
+  }
+
+  function onKeydown(e: KeyboardEvent): void {
+    const idx = navigation.sections.indexOf(navigation.current);
+    let next: number | null = null;
+    if (e.key === 'ArrowRight') next = (idx + 1) % navigation.sections.length;
+    else if (e.key === 'ArrowLeft') next = (idx - 1 + navigation.sections.length) % navigation.sections.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = navigation.sections.length - 1;
+    if (next !== null) {
+      e.preventDefault();
+      activate(navigation.sections[next]);
+    }
+  }
+</script>
