@@ -191,3 +191,99 @@ func TestIsConnectionError(t *testing.T) {
 			name:     "timeout",
 			err:      errors.New("dial tcp 127.0.0.1:9999: i/o timeout"),
 			expected: true,
+		},
+		{
+			name:     "no such host",
+			err:      errors.New("dial tcp: lookup invalid.host: no such host"),
+			expected: true,
+		},
+		{
+			name:     "non-connection error",
+			err:      errors.New("invalid request"),
+			expected: false,
+		},
+		{
+			name:     "EOF error",
+			err:      io.EOF,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := core.IsConnectionError(tt.err)
+			assert.Equal(t, tt.expected, result, "IsConnectionError(%v) = %v, want %v", tt.err, result, tt.expected)
+		})
+	}
+}
+
+func TestRetryExhaustsAllEndpoints(t *testing.T) {
+	mockLogger := createRetryTestLogger()
+
+	// Create test configuration
+	config := &Configuration{}
+	config.ProxyPrefix = "/olla/"
+	config.ConnectionTimeout = 100 * time.Millisecond
+	config.ConnectionKeepAlive = time.Second
+	config.ResponseTimeout = 100 * time.Millisecond
+	config.ReadTimeout = 100 * time.Millisecond
+	config.StreamBufferSize = 8192
+
+	// Create test endpoints - all will fail with connection errors
+	endpoint1 := &domain.Endpoint{
+		Name:   "endpoint1",
+		URL:    &url.URL{Scheme: "http", Host: "localhost:9991"},
+		Status: domain.StatusHealthy,
+	}
+
+	endpoint2 := &domain.Endpoint{
+		Name:   "endpoint2",
+		URL:    &url.URL{Scheme: "http", Host: "localhost:9992"},
+		Status: domain.StatusHealthy,
+	}
+
+	endpoint3 := &domain.Endpoint{
+		Name:   "endpoint3",
+		URL:    &url.URL{Scheme: "http", Host: "localhost:9993"},
+		Status: domain.StatusHealthy,
+	}
+
+	discoveryService := &testDiscoveryService{
+		endpoints: []*domain.Endpoint{endpoint1, endpoint2, endpoint3},
+	}
+
+	selector := &testSelector{}
+
+	// Create service (not used in this test, but verifies it can be created)
+	_, err := NewService(discoveryService, selector, config, nil, nil, mockLogger)
+	assert.NoError(t, err)
+
+	// Create test request
+	req := httptest.NewRequest("GET", "/olla/test", nil)
+	w := httptest.NewRecorder()
+
+	stats := &ports.RequestStats{
+		StartTime: time.Now(),
+	}
+
+	// Create retry handler
+	retryHandler := core.NewRetryHandler(discoveryService, mockLogger)
+
+	// Define proxy function that always fails with connection error
+	proxyFunc := func(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoint *domain.Endpoint, stats *ports.RequestStats) error {
+		return fmt.Errorf("dial tcp %s: connect: connection refused", endpoint.URL.Host)
+	}
+
+	// Execute with retry
+	err = retryHandler.ExecuteWithRetry(
+		context.Background(),
+		w,
+		req,
+		[]*domain.Endpoint{endpoint1, endpoint2, endpoint3},
+		selector,
+		stats,
+		proxyFunc,
+	)
+
+	// Verify that all endpoints were tried and failed
+	assert.Error(t, err)
