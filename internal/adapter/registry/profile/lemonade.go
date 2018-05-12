@@ -14,3 +14,11 @@ type LemonadeResponse struct {
 }
 
 // LemonadeModel represents a model in Lemonade response with Lemonade-specific metadata
+type LemonadeModel struct {
+	// Standard OpenAI-compatible fields
+	ID      string `json:"id"`       // mOdel identifier (e.g., "Qwen2.5-0.5B-Instruct-CPU")
+	Object  string `json:"object"`   // always "model"
+	OwnedBy string `json:"owned_by"` // always "lemonade"
+
+	// Lemonade-specific fields (critical for local inference routing)
+	Checkpoint string `json:"checkpoint"` // HuggingFace model path (e.g., "amd/Qwen2.5-0.5B-Instruct-quantized_int4-float16-cpu-onnx")
