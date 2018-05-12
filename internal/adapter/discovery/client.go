@@ -18,13 +18,3 @@ type ModelDiscoveryClient interface {
 
 	// GetMetrics metrics for discovery operations
 	GetMetrics() DiscoveryMetrics
-}
-
-// DiscoveryResult contains the result of a model discovery operation
-type DiscoveryResult struct {
-	Error       error
-	EndpointURL string
-	ProfileUsed string
-	Models      []*domain.ModelInfo
-	Duration    time.Duration
-	StatusCode  int

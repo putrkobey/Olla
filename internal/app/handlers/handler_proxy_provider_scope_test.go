@@ -95,3 +95,100 @@ func TestProviderProxyHandler_VllmScopedFailsClosedOnCrossTypeOutage(t *testing.
 	app.proxyService = capture
 
 	req := httptest.NewRequest(http.MethodPost, "/olla/vllm/v1/chat/completions", strings.NewReader(`{"model":"llama3"}`))
+	w := httptest.NewRecorder()
+
+	app.providerProxyHandler(w, req)
+
+	if capture.capturedCtx != nil {
+		t.Fatal("proxy must never be invoked - the openai-compatible endpoint must not serve a vllm-scoped request")
+	}
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d (body=%q)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "No vllm endpoints available") {
+		t.Errorf("expected the provider-specific rejection message, got %q", w.Body.String())
+	}
+}
+
+// TestProviderProxyHandler_OpenAIRouteStaysInclusive confirms the OpenAI
+// route's documented inclusive behaviour is untouched by the fail-closed
+// fix: when no endpoint's type is in IsCompatibleWith's OpenAI-compatible
+// allowlist, the request still widens to whatever is healthy rather than
+// 404ing, because createProviderProfile never sets FailClosedOnNoMatch for
+// the OpenAI branch.
+func TestProviderProxyHandler_OpenAIRouteStaysInclusive(t *testing.T) {
+	app := createTestApplication(t)
+
+	vllmURL, _ := url.Parse("http://localhost:8001")
+	app.discoveryService = &mockDiscoveryServiceWithHealthy{
+		endpoints: []*domain.Endpoint{{
+			Name:      "vllm-1",
+			URL:       vllmURL,
+			URLString: vllmURL.String(),
+			Type:      "vllm",
+			Status:    domain.StatusHealthy,
+		}},
+	}
+
+	capture := &captureProxyService{}
+	app.proxyService = capture
+
+	req := httptest.NewRequest(http.MethodPost, "/olla/openai/v1/chat/completions", strings.NewReader(`{"model":"llama3"}`))
+	w := httptest.NewRecorder()
+
+	app.providerProxyHandler(w, req)
+
+	if capture.capturedCtx == nil {
+		t.Fatalf("expected the openai route to widen and proxy through the available endpoint, got status=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+// modelNameInspector is a minimal test RequestInspector that sets ModelName
+// and a SupportedBy hint on the profile, mimicking a real body inspector
+// detecting both from the request payload together - the realistic shape
+// that exercises getProviderEndpoints' second filterEndpointsByProfile call
+// (handler_provider_common.go), which only fires when pr.profile.SupportedBy
+// is non-empty.
+type modelNameInspector struct {
+	modelName   string
+	supportedBy string
+}
+
+func (m *modelNameInspector) Name() string { return "test-model-name-inspector" }
+func (m *modelNameInspector) Inspect(_ context.Context, _ *http.Request, profile *domain.RequestProfile) error {
+	profile.ModelName = m.modelName
+	profile.AddSupportedProfile(m.supportedBy)
+	return nil
+}
+
+// registryKnowsModelElsewhere simulates a model registry that knows a model
+// exists (on some endpoint, possibly of a different provider type than the
+// one currently being routed) but must answer honestly when asked to route
+// among zero candidate endpoints: a real routing strategy consults its own
+// global endpoint map, not just the (possibly already-filtered-to-empty)
+// healthyEndpoints slice it's handed, so it can produce a 503
+// model_unavailable decision even though the model is perfectly reachable on
+// a different provider type.
+type registryKnowsModelElsewhere struct {
+	baseMockRegistry
+	knownModel string
+}
+
+func (m *registryKnowsModelElsewhere) GetRoutableEndpointsForModel(_ context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
+	if modelName == m.knownModel && len(healthyEndpoints) == 0 {
+		return nil, &domain.ModelRoutingDecision{
+			Strategy:   "test",
+			Action:     "rejected",
+			Reason:     "model_unavailable",
+			StatusCode: http.StatusServiceUnavailable,
+		}, nil
+	}
+	return healthyEndpoints, &domain.ModelRoutingDecision{Strategy: "test", Action: "routed"}, nil
+}
+
+// TestProviderProxyHandler_VllmScopedFailsClosed_NotMaskedByModelRouting is
+// the handler-level guard for the diagnostic-masking bug found in review of
+// the fail-closed fix: with a populated model registry, the fail-closed
+// empty list used to still reach getProviderEndpoints' second
+// filterEndpointsByProfile call and its stage-3 model-routing pass, which
+// consults the registry's global view and can attach a 503
