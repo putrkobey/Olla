@@ -134,3 +134,49 @@ func TestIntegration_PerformanceRegression(t *testing.T) {
 	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
 	log, _, _ := logger.New(loggerCfg)
 	testLogger := logger.NewPlainStyledLogger(log)
+	extractor, err := NewExtractor(factory, testLogger)
+	require.NoError(t, err)
+
+	err = extractor.ValidateProfile(profile)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Warm up
+	for range 100 {
+		_ = extractor.ExtractFromChunk(ctx, ollamaResponse, "ollama")
+	}
+
+	// Measure performance
+	start := time.Now()
+	iterations := 10000
+	for range iterations {
+		metrics := extractor.ExtractFromChunk(ctx, ollamaResponse, "ollama")
+		if metrics == nil {
+			t.Fatal("Expected metrics to be extracted")
+		}
+	}
+	elapsed := time.Since(start)
+
+	// Calculate per-operation time
+	perOp := elapsed / time.Duration(iterations)
+
+	// Assert performance is acceptable (should be < 50µs per operation with new implementation)
+	assert.Less(t, perOp, 50*time.Microsecond,
+		"Extraction took %v per operation, expected < 50µs", perOp)
+
+	t.Logf("Performance: %v per extraction (%d iterations in %v)", perOp, iterations, elapsed)
+}
+
+// TestIntegration_LargeChunkHandling verifies we handle large responses correctly
+func TestIntegration_LargeChunkHandling(t *testing.T) {
+	// Create a large response that would have caused issues with old implementation
+	largeResponse := []byte(`{
+		"model": "llama2",
+		"done": true,
+		"eval_count": 1000,
+		"eval_duration": 10000000000,
+		"context": [` + generateLargeArray(1000) + `]
+	}`)
+
+	profile := &mockProfile{
