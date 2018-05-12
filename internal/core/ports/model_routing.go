@@ -19,13 +19,3 @@ type ModelRoutingStrategy interface {
 	) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error)
 
 	// Name returns the strategy name for logging
-	Name() string
-}
-
-// routing decision actions
-const (
-	RoutingActionRouted   = "routed"
-	RoutingActionFallback = "fallback"
-	RoutingActionRejected = "rejected"
-)
-
