@@ -175,3 +175,62 @@ func TestCircuitBreaker_HalfOpen_StaleProbeReleased_ConcurrentHandover(t *testin
 
 	for range goroutines {
 		go func() {
+			defer done.Done()
+			ready.Done()
+			start.Wait()
+			if open, _ := cb.IsOpen(HalfOpenStaleness); !open {
+				atomic.AddInt64(&admitted, 1)
+			}
+		}()
+	}
+
+	ready.Wait()
+	start.Done()
+	done.Wait()
+
+	if admitted != 1 {
+		t.Fatalf("expected exactly 1 replacement probe admitted across the stale handover, got %d", admitted)
+	}
+}
+
+// TestCircuitBreaker_HalfOpen_FailureReopens verifies a probe failure that
+// crosses the threshold trips the breaker back open and blocks further traffic.
+func TestCircuitBreaker_HalfOpen_FailureReopens(t *testing.T) {
+	cb := openCircuitBreaker(1) // single failure re-opens
+
+	open, attempt := cb.IsOpen(HalfOpenStaleness)
+	if open {
+		t.Fatal("expected the first call after timeout elapsed to admit a half-open probe")
+	}
+
+	cb.RecordFailure(attempt)
+
+	if !cb.Tripped() {
+		t.Fatal("expected the breaker to be open after a threshold-crossing RecordFailure")
+	}
+	if open, _ := cb.IsOpen(HalfOpenStaleness); !open {
+		t.Fatal("re-opened breaker admitted a request before its timeout elapsed again")
+	}
+}
+
+// TestCircuitBreaker_ABARace_SupersededProbeResultDropped pins the ABA-race
+// guard: a late result from a probe that a stale-handover already superseded
+// must not clobber the replacement's state. Without attempt correlation, the
+// original hung probe's late RecordSuccess would close a circuit the
+// replacement had just legitimately re-opened via RecordFailure (and the
+// inverse: a stale failure re-opening a circuit the replacement just closed).
+func TestCircuitBreaker_ABARace_SupersededProbeResultDropped(t *testing.T) {
+	// Direction 1: stale success must not close a circuit the replacement
+	// re-opened.
+	cb := openCircuitBreaker(1) // single failure re-opens
+
+	// Admit probe A (the call transitions open -> half-open and stamps the
+	// single-flight gate); discard its token and backdate lastAttempt past the
+	// staleness window directly (rather than sleeping) to simulate a hung probe.
+	// attemptA is taken as that backdated stamp so it is guaranteed distinct
+	// from attemptB - two real IsOpen() calls a few lines apart can share the
+	// same UnixNano() value on a coarser system clock.
+	open, _ := cb.IsOpen(HalfOpenStaleness)
+	if open {
+		t.Fatal("expected the first call to admit a half-open probe")
+	}

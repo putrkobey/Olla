@@ -7,3 +7,12 @@ import { pollScheduler } from '../lib/poll-scheduler';
 // Regression coverage for finding 13: Header ran its own setInterval(...,
 // 1000) instead of reading the shared clock, contradicting the stated
 // invariant (App.svelte / clock.svelte.js) that the scheduler owns every
+// timer in the SPA - and quietly skipping the visibility backoff every
+// other live value gets for free.
+
+let component: ReturnType<typeof mount> | undefined;
+afterEach(() => {
+  if (component) unmount(component);
+  document.body.innerHTML = '';
+  vi.useRealTimers();
+});
