@@ -1,0 +1,99 @@
+# LMDeploy inference platform profile
+name: lmdeploy
+home: "https://github.com/InternLM/lmdeploy"
+version: "1.0"
+display_name: "LMDeploy"
+description: "LMDeploy efficient inference and serving for LLMs and VLMs"
+
+# Routing configuration
+routing:
+  prefixes:
+    - lmdeploy
+
+# API compatibility
+api:
+  openai_compatible: true
+
+  # LMDeploy v0.13.0+ serves the Anthropic Messages API natively (/v1/messages and
+  # /v1/messages/count_tokens, serve/anthropic/endpoints), so requests bypass
+  # translation. Older releases answer 404 on /v1/messages. The server insists on an
+  # anthropic-version header, which Anthropic clients send and Olla forwards untouched.
+  #
+  # v0.13.0 to v0.17.x reject the Anthropic tools and tool_choice fields with a
+  # NotImplementedError (serve/anthropic/adapter.py); v0.18.0 accepts them. Claude Code
+  # always sends tools, so no_tool_use makes those requests translate instead. It is
+  # a limitation rather than a min_version bump because min_version is not enforced
+  # at runtime. The cost is that tool requests to 0.18+ also translate; drop the
+  # limitation in a local copy of this profile if every LMDeploy in the fleet is 0.18+.
+  # min_version is documentation only; Olla does not check the backend's version.
+  anthropic_support:
+    enabled: true
+    messages_path: /v1/messages
+    token_count: true
+    min_version: "0.13.0"
+    limitations:
+      - no_tool_use
+
+  paths:
+    # Health and system endpoints
+    - /health              # 0: health check (HTTP 200, empty body)
+
+    # Model management
+    - /v1/models           # 1: list models (OpenAI-compatible ModelList)
+
+    # Text generation endpoints (OpenAI-compatible)
+    - /v1/chat/completions # 2: chat completions with SSE streaming
+    - /v1/completions      # 3: text completions
+
+    # LMDeploy-specific endpoints
+    - /v1/encode           # 4: token encoding (LMDeploy-specific)
+    - /generate            # 5: native generation endpoint
+    - /pooling             # 6: reward/score pooling (the real embeddings path)
+    # NOTE: /v1/embeddings is intentionally excluded — LMDeploy returns HTTP 400
+    # unconditionally for all backends on that path.
+
+    # Sleep state probe (LMDeploy-specific, used for auto-detection)
+    - /is_sleeping         # 7: sleep state probe
+    # Anthropic paths need LMDeploy 0.13.0+, /v1/responses 0.14.0+; older releases 404.
+    - /v1/messages # 8: Anthropic Messages API
+    - /v1/messages/count_tokens # 9: Anthropic token count
+    - /v1/responses # 10: OpenAI Responses API (create_responses_router)
+
+  model_discovery_path: /v1/models
+  health_check_path: /health
+
+# Platform characteristics
+characteristics:
+  timeout: 2m
+  max_concurrent_requests: 100
+  default_priority: 82      # between SGLang (85) and vLLM (80)
+  streaming_support: true
+
+# Detection hints for auto-discovery
+detection:
+  path_indicators:
+    - "/v1/encode"    # LMDeploy-specific token encoding
+    - "/generate"     # LMDeploy native generation
+    - "/pooling"      # LMDeploy reward/score path
+    - "/is_sleeping"  # distinct from vLLM and SGLang
+  default_ports:
+    - 23333           # api_server default (not 8000 which is proxy_server)
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "lmdeploy"
+  parsing_rules:
+    chat_completions_path: "/v1/chat/completions"
+    completions_path: "/v1/completions"
+    model_field_name: "model"
+    supports_streaming: true
+
+# Path indices for specific functions
+path_indices:
+  health: 0
+  models: 1
+  chat_completions: 2
+  completions: 3
+
