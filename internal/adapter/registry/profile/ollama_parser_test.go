@@ -64,36 +64,3 @@ func TestOllamaParser_CapabilitiesTyping(t *testing.T) {
 			body:     `{"models":[{"name":"rerank:latest","capabilities":["embedding","rerank"]}]}`,
 			wantType: "embeddings",
 		},
-		{
-			name: "only unknown values stays untyped",
-			body: `{"models":[{"name":"foo:latest","capabilities":["foo"]}]}`,
-		},
-		{
-			name: "empty capabilities stays untyped",
-			body: `{"models":[{"name":"x:latest","details":{"family":"x"},"capabilities":[]}]}`,
-		},
-		{
-			name:     "capabilities alone still create details",
-			body:     `{"models":[{"name":"nomic-embed-text:latest","capabilities":["embedding"]}]}`,
-			wantType: "embeddings",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			models, err := parser.Parse([]byte(tt.body))
-			require.NoError(t, err)
-			require.Len(t, models, 1)
-
-			if tt.wantType == "" {
-				if models[0].Details != nil {
-					assert.Nil(t, models[0].Details.Type)
-				}
-			} else {
-				require.NotNil(t, models[0].Details)
-				require.NotNil(t, models[0].Details.Type)
-				assert.Equal(t, tt.wantType, *models[0].Details.Type)
-			}
-			if len(tt.wantCaps) == 0 {
