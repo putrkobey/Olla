@@ -22,11 +22,3 @@ func (a *Application) stickyStatsHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	stats := a.stickyStatsFn()
-	if stats == nil {
-		// stickyStatsFn is wired but the wrapper was not created because sticky
-		// sessions are disabled in config — return the same stable shape as the
-		// nil-function path so callers always branch on "enabled", not status codes.
-		if err := json.NewEncoder(w).Encode(struct {
-			Enabled bool `json:"enabled"`
-		}{Enabled: false}); err != nil {

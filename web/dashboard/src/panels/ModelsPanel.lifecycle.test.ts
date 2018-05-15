@@ -22,15 +22,3 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-describe('ModelsPanel polling lifecycle', () => {
-  it('activates the models job on mount and deactivates on unmount', () => {
-    expect(pollScheduler.isActive('models')).toBe(false);
-
-    component = mount(ModelsPanel, { target: document.body });
-    flushSync();
-
-    expect(pollScheduler.isActive('models')).toBe(true);
-
-    unmount(component);
-    component = undefined;
-    flushSync();
