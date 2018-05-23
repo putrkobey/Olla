@@ -101,3 +101,55 @@ describe('StatusStrip staleness indicator', () => {
     const strip = document.querySelector('.status-strip')!;
     expect(strip.getAttribute('data-state')).toBe('error');
     expect(strip.querySelector('[data-stale]')).toBeTruthy();
+  });
+
+  it('shows no staleness marker when overview.status is "ok"', () => {
+    holder.status = 'ok';
+    component = mount(StatusStrip, { target: document.body });
+    flushSync();
+
+    const strip = document.querySelector('.status-strip')!;
+    expect(strip.getAttribute('data-state')).toBeNull();
+    expect(strip.querySelector('[data-stale]')).toBeNull();
+  });
+});
+
+describe('StatusStrip degraded reason', () => {
+  // The strip used to derive its offline count from the pausable endpoints
+  // store, which froze mid-outage once EndpointsPanel unmounted. It now reads
+  // overview.data.endpoints (always fresh because the overview store runs for
+  // the lifetime of the dashboard). When that field is absent the strip must
+  // stay silent rather than fabricate a count.
+
+  it('derives the offline count from overview.data.endpoints (fresh payload)', () => {
+    holder.status = 'ok';
+    holder.sys.status = 'degraded';
+    holder.endpoints = [
+      { name: 'a', status: 'offline', url: 'u1', id: 'e1', success_rate: '0%', avg_latency: '0ms', traffic: '0', last_check: '', next_check: '', issues: '', priority: 0, connections: 0, requests: 0, min_latency_ms: 0, max_latency_ms: 0, models: { last_updated: '', count: 0 } },
+      { name: 'b', status: 'healthy', url: 'u2', id: 'e2', success_rate: '100%', avg_latency: '0ms', traffic: '0', last_check: '', next_check: '', issues: '', priority: 0, connections: 0, requests: 0, min_latency_ms: 0, max_latency_ms: 0, models: { last_updated: '', count: 0 } },
+      { name: 'c', status: 'critical', url: 'u3', id: 'e3', success_rate: '0%', avg_latency: '0ms', traffic: '0', last_check: '', next_check: '', issues: '', priority: 0, connections: 0, requests: 0, min_latency_ms: 0, max_latency_ms: 0, models: { last_updated: '', count: 0 } },
+    ];
+    component = mount(StatusStrip, { target: document.body });
+    flushSync();
+
+    // Two of three endpoints are offline/critical; the strip surfaces that
+    // as the degraded reason, sourced from the always-fresh overview payload.
+    const reason = document.querySelector('.status-strip .status-reason');
+    expect(reason?.textContent?.trim()).toBe('2 offline');
+  });
+
+  it('suppresses the reason when the overview payload has no endpoints array', () => {
+    holder.status = 'ok';
+    holder.sys.status = 'degraded';
+    holder.endpoints = [];
+    component = mount(StatusStrip, { target: document.body });
+    flushSync();
+
+    // No endpoint data to count from - the strip stays quiet rather than
+    // show a fabricated or stale count.
+    const reason = document.querySelector('.status-strip .status-reason');
+    expect(reason).toBeNull();
+  });
+
+  it('stays quiet when degraded but every listed endpoint is healthy', () => {
+    holder.status = 'ok';
