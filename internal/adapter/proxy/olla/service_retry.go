@@ -123,3 +123,66 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 		return fmt.Errorf("failed to create proxy request: %w", err)
 	}
 
+	rlog.Debug("making round-trip request", "target", targetURL.String())
+	backendStart := time.Now()
+	resp, err := transport.RoundTrip(proxyReq)
+	stats.BackendResponseMs = time.Since(backendStart).Milliseconds()
+
+	if err != nil {
+		if cb != nil {
+			cb.RecordFailure(attempt)
+		}
+		// Don't log as error if it's a connection failure - the retry handler will handle it
+		if core.IsConnectionError(err) {
+			rlog.Debug("round-trip connection failed", "error", err)
+		} else {
+			rlog.Error("round-trip failed", "error", err)
+		}
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), err)
+		duration := time.Since(stats.StartTime)
+		return common.MakeUserFriendlyError(err, duration, "backend", cfg.GetResponseTimeout())
+	}
+	defer resp.Body.Close()
+
+	// Record success with circuit breaker
+	if cb != nil {
+		cb.RecordSuccess(attempt)
+	}
+
+	rlog.Debug("round-trip success", "status", resp.StatusCode)
+
+	core.SetResponseHeaders(w, stats, endpoint)
+	core.SetStickySessionHeaders(w, r)
+
+	// Copy response headers, stripping any sensitive headers the upstream may reflect
+	core.CopyResponseHeaders(w.Header(), resp.Header, endpoint)
+
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the response through with Olla's optimizations
+	rlog.Debug("starting response stream")
+	streamStart := time.Now()
+	stats.FirstDataMs = time.Since(stats.StartTime).Milliseconds()
+
+	buffer, poolErr := s.bufferPool.Get()
+	if poolErr != nil {
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), poolErr)
+		return fmt.Errorf("olla: stream buffer unavailable: %w", poolErr)
+	}
+	defer s.bufferPool.Put(buffer)
+
+	// Separate client and upstream contexts for proper cancellation handling
+	upstreamCtx := ctx
+	if resp != nil && resp.Request != nil {
+		upstreamCtx = resp.Request.Context()
+	}
+
+	// Stream with Olla's optimized streaming
+	// Use r.Context() for client context and upstreamCtx for upstream context
+	bytesWritten, lastChunk, streamErr := s.streamResponse(r.Context(), upstreamCtx, w, resp, *buffer, rlog)
+	stats.StreamingMs = time.Since(streamStart).Milliseconds()
+	stats.TotalBytes = bytesWritten
+
+	if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
+		rlog.Error("streaming failed", "error", streamErr)
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), streamErr)

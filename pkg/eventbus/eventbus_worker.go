@@ -31,3 +31,37 @@ func NewWorkerPool[T any](bus *EventBus[T], workers int, bufferSize int) *Worker
 		ctx:       ctx,
 		cancel:    cancel,
 	}
+
+	// Start worker goroutines
+	for range workers {
+		wp.wg.Add(1)
+		go wp.worker()
+	}
+
+	return wp
+}
+
+// PublishAsync queues an event for async publishing
+func (wp *WorkerPool[T]) PublishAsync(event T) {
+	// Check if we're shutting down
+	select {
+	case <-wp.ctx.Done():
+		// Worker pool is shutting down, drop the event
+		return
+	default:
+	}
+
+	// Add before attempting the send, not after: a buffered channel send
+	// returns as soon as there's room, with no guarantee the worker hasn't
+	// already dequeued and processed the item before this goroutine gets to
+	// its next statement. Adding afterwards let a worker's Done() race ahead
+	// of the matching Add(), driving the counter negative under load.
+	wp.pending.Add(1)
+
+	// Try non-blocking send
+	select {
+	case wp.eventChan <- event:
+		// Successfully queued - a worker will call Done() once it has run
+		// this event through bus.Publish.
+	default:
+		// Queue is full, drop the event to prevent blocking. This is a
