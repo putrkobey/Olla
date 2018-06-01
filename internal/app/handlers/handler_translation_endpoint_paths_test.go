@@ -344,3 +344,118 @@ func TestTranslation_PassthroughHostsUnaffected(t *testing.T) {
 					assert.Equal(t, string(constants.TranslatorModePassthrough), w.Header().Get(constants.HeaderXOllaMode))
 					assert.Equal(t, []string{"/v1/messages"}, vllm.paths())
 					assert.Empty(t, lem.paths())
+				})
+			}
+		}
+	}
+
+	for _, engine := range translationEngines {
+		t.Run(engine+"/DMR keeps its own native path", func(t *testing.T) {
+			t.Parallel()
+
+			dmr := newPathBackend(t, "/anthropic/v1/messages")
+			eps := []*domain.Endpoint{liveEndpoint(t, "dmr-host", "docker-model-runner", dmr.URL, 100)}
+			f := newTranslationPathApp(t, engine, true, true, eps, map[string][]*domain.Endpoint{"shared-model": eps})
+
+			w := f.post(t, "shared-model", false)
+
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, string(constants.TranslatorModePassthrough), w.Header().Get(constants.HeaderXOllaMode))
+			assert.Equal(t, []string{"/anthropic/v1/messages"}, dmr.paths())
+		})
+	}
+}
+
+// With passthrough on but declined for this request, the capable backends fall back to
+// translation and are still sent to their chat path.
+func TestTranslation_PassthroughDeclinedFallsBackToChatPath(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		t.Run(engine, func(t *testing.T) {
+			t.Parallel()
+
+			dmr := newPathBackend(t, dmrChatPath)
+			eps := []*domain.Endpoint{liveEndpoint(t, "dmr-host", "docker-model-runner", dmr.URL, 100)}
+			f := newTranslationPathApp(t, engine, true, false, eps, map[string][]*domain.Endpoint{"shared-model": eps})
+
+			w := f.post(t, "shared-model", false)
+
+			requireTranslatedOK(t, w, false)
+			assert.Equal(t, []string{dmrChatPath}, dmr.paths())
+		})
+	}
+}
+
+// A fleet with no backend that serves a chat path (TEI) is refused with a 404 before
+// anything is dispatched, and the refusal goes through the sampled rejection log.
+func TestTranslation_NoChatPathIsSampled404(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		for _, mode := range translationModes {
+			for _, st := range translationStreaming {
+				t.Run(engine+"/"+mode.name+"/"+st.name, func(t *testing.T) {
+					t.Parallel()
+
+					tei := newPathBackend(t, "/embed")
+					eps := []*domain.Endpoint{liveEndpoint(t, "tei-host", "text-embeddings-inference", tei.URL, 100)}
+					f := newTranslationPathApp(t, engine, mode.strict, false, eps, map[string][]*domain.Endpoint{"shared-model": eps})
+
+					const total = 50
+					for range total {
+						w := f.post(t, "shared-model", st.stream)
+						require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+						assert.Contains(t, w.Body.String(), "not_found_error")
+					}
+
+					assert.Empty(t, tei.paths(), "nothing may be dispatched to a backend that cannot serve chat")
+					assert.Equal(t, 1, f.log.count("Request rejected"), "repeated refusals are one sampled line")
+					assert.Zero(t, f.log.errorTotal(), "no ERROR per refused request")
+					assert.Zero(t, f.log.count("No compatible endpoints found for path, falling back to all endpoints"),
+						"the unsampled stage-1 widening WARN must not fire per request")
+				})
+			}
+		}
+	}
+}
+
+// An endpoint whose type has no profile is served as OpenAI-compatible. Scoping translation
+// to the known chat profiles must not evict it, even when a model lives only on it.
+func TestTranslation_CustomTypeEndpointStillServed(t *testing.T) {
+	t.Parallel()
+
+	for _, engine := range translationEngines {
+		for _, mode := range translationModes {
+			for _, st := range translationStreaming {
+				t.Run(engine+"/"+mode.name+"/"+st.name, func(t *testing.T) {
+					t.Parallel()
+
+					custom := newPathBackend(t, rootChatPath)
+					vllm := newPathBackend(t, rootChatPath)
+					customEP := liveEndpoint(t, "custom-host", "my-custom-engine", custom.URL, 50)
+					eps := []*domain.Endpoint{customEP, liveEndpoint(t, "vllm-host", "vllm", vllm.URL, 50)}
+					f := newTranslationPathApp(t, engine, mode.strict, false, eps, map[string][]*domain.Endpoint{"custom-only": {customEP}})
+
+					w := f.post(t, "custom-only", st.stream)
+
+					requireTranslatedOK(t, w, st.stream)
+					assert.Equal(t, []string{rootChatPath}, custom.paths())
+					assert.Empty(t, vllm.paths())
+				})
+			}
+		}
+	}
+}
+
+// A base path on a preserve_path endpoint is joined onto the request path by the proxy, so the
+// resolved chat path must not repeat it (/api + /api/v1/... would 404).
+func TestTranslation_PreservePathBaseNotDuplicated(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ typ, base, chat, wantHit string }{
+		{"lemonade", "/api", lemonadeChatPath, lemonadeChatPath},
+		{"docker-model-runner", "/engines", dmrChatPath, dmrChatPath},
+		{"docker-model-runner", "/engines/llama.cpp", "/engines/llama.cpp/v1/chat/completions", "/engines/llama.cpp/v1/chat/completions"},
+		{"docker-model-runner", "/engines/vllm/", "/engines/vllm/v1/chat/completions", "/engines/vllm/v1/chat/completions"},
+		{"vllm", "/gw", rootChatPath, "/gw/v1/chat/completions"},

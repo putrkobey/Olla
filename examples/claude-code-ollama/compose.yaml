@@ -13,3 +13,19 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    # Uncomment for NVIDIA GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  olla:
+    image: ghcr.io/putrkobey/Olla:latest
+    container_name: olla
+    restart: unless-stopped
+    ports:
+      - "40114:40114"
+    volumes:
