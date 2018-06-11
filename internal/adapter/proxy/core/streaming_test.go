@@ -127,3 +127,67 @@ func TestDetectStreamingMode(t *testing.T) {
 			name:        "auto mode buffers Word documents",
 			profile:     constants.ConfigurationProxyProfileAuto,
 			contentType: constants.ContentTypeWordDOCX,
+			want:        false,
+		},
+		{
+			name:        "auto mode buffers fonts",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: "font/woff2",
+			want:        false,
+		},
+		{
+			name:        "auto mode buffers 3D models",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: "model/gltf-binary",
+			want:        false,
+		},
+
+		// Text formats stream by default - better UX for LLM responses
+		{
+			name:        "auto mode streams JSON by default",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeJSON,
+			want:        true,
+		},
+		{
+			name:        "auto mode streams HTML",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeHTML,
+			want:        true,
+		},
+		{
+			name:        "auto mode streams XML",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeXML,
+			want:        true,
+		},
+		{
+			name:        "auto mode streams plain text",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeText,
+			want:        true,
+		},
+
+		// Client preferences from original request context
+		{
+			name:        "context stream=true forces streaming for JSON",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeJSON,
+			ctxStream:   true,
+			want:        true,
+		},
+		{
+			name:        "context stream=false doesn't force buffering in auto mode",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeJSON,
+			ctxStream:   false,
+			want:        true, // Text still streams regardless
+		},
+		{
+			name:        "context stream=true forces streaming even for images in auto mode",
+			profile:     constants.ConfigurationProxyProfileAuto,
+			contentType: constants.ContentTypeImagePNG,
+			ctxStream:   true,
+			want:        true,
+		},
+
