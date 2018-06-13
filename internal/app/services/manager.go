@@ -139,3 +139,50 @@ func (sm *ServiceManager) Start(ctx context.Context) error {
 		sm.mu.RLock()
 		service, ok := sm.services[name]
 		sm.mu.RUnlock()
+		if !ok {
+			// No path currently removes a registered service, but production code
+			// must not assume a map lookup always hits - guard it the same way
+			// stopServices already does below, instead of panicking on a nil
+			// ManagedService.
+			sm.rollback(ctx, started)
+			return fmt.Errorf("service %s not found while starting services", name)
+		}
+		sm.logger.Debug("Starting service", "name", name, "dependencies", service.Dependencies())
+
+		if err := service.Start(ctx); err != nil {
+			sm.logger.Error("Failed to start service", "name", name, "error", err)
+			sm.rollback(ctx, started)
+			return fmt.Errorf("failed to start service %s: %w", name, err)
+		}
+
+		started = append(started, name)
+		sm.logger.Debug("Service started", "name", name)
+	}
+
+	sm.logger.Debug("All services started successfully")
+	return nil
+}
+
+// Stop gracefully shuts down all services in reverse dependency order, ensuring
+// dependants stop before their dependencies. This prevents resource access violations
+// during shutdown.
+func (sm *ServiceManager) Stop(ctx context.Context) error {
+	sm.mu.RLock()
+	order := make([]string, len(sm.startOrder))
+	copy(order, sm.startOrder)
+	sm.mu.RUnlock()
+
+	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+		order[i], order[j] = order[j], order[i]
+	}
+
+	sm.logger.Debug("Stopping services", "count", len(order))
+	return sm.stopServices(ctx, order)
+}
+
+// rollback stops the services started so far, newest first, so dependants stop
+// before their dependencies (matching Stop). The caller's slice is left intact.
+// A start failure is often a cancelled or expired ctx, and Stop implementations
+// derive their shutdown deadlines from it (HTTPService, DiscoveryService), so
+// reusing it would abort the cleanup and leave services running.
+func (sm *ServiceManager) rollback(ctx context.Context, started []string) {
