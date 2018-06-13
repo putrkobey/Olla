@@ -7,7 +7,3 @@
 //
 // This hash (FNV-1a 32-bit -> base36) is collision-resistant, not lossless -
 // a 32-bit space can theoretically map two distinct strings to the same id,
-// but at real fleet sizes (tens to low hundreds of endpoints/models) that is
-// negligible. It emits only [0-9a-z] so the result is always a legal HTML id,
-// and is a pure function of the input, so OverviewPanel's jump lookup and
-// EndpointsPanel's row id agree without either panel needing to know the

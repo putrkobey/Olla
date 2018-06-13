@@ -69,27 +69,3 @@ func BenchmarkBuildTargetURL(b *testing.B) {
 				b.Fatalf("unexpected path: %s", targetURL.Path)
 			}
 		}
-	})
-
-	b.Run("FastPath_WithQueryString", func(b *testing.B) {
-		// Test fast path with query string
-		endpointURL, _ := url.Parse("http://localhost:11434")
-		endpoint := &domain.Endpoint{
-			Name: "ollama",
-			URL:  endpointURL,
-		}
-
-		req, _ := http.NewRequest("GET", "/olla/api/tags?format=json&details=true", nil)
-
-		b.ResetTimer()
-		b.ReportAllocs()
-
-		for range b.N {
-			targetURL := common.BuildTargetURL(req, endpoint, service.configuration.Load().GetProxyPrefix())
-			if targetURL.Path != "/api/tags" {
-				b.Fatalf("unexpected path: %s", targetURL.Path)
-			}
-			if targetURL.RawQuery != "format=json&details=true" {
-				b.Fatalf("unexpected query: %s", targetURL.RawQuery)
-			}
-		}
