@@ -21,14 +21,3 @@
   // We have a real figure but the endpoint is currently down: show the
   // number (and its real fill width) but force the neutral bucket so it
   // never reads as current, live health.
-  const historical = $derived(hasData && down);
-  const bucket = $derived(historical ? 'neutral' : pctBucket(pct, hasData));
-  const label = $derived(
-    !hasData
-      ? 'no data'
-      : historical
-        ? `${pct.toFixed(1)}% response rate (historical, endpoint offline)`
-        : `${pct.toFixed(1)}% response rate`
-  );
-</script>
-
