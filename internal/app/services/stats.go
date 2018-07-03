@@ -28,18 +28,3 @@ func NewStatsService(logger logger.StyledLogger) *StatsService {
 func (s *StatsService) Name() string {
 	return "stats"
 }
-
-// Start initialises the stats collector
-func (s *StatsService) Start(ctx context.Context) error {
-	s.logger.Info("Initialising stats collector")
-
-	s.collector = stats.NewCollector(s.logger)
-
-	s.logger.Info("Stats collector initialised")
-	return nil
-}
-
-// Stop gracefully shuts down the stats collector
-func (s *StatsService) Stop(ctx context.Context) error {
-	// Lock-free atomic implementation requires no explicit cleanup
-	s.logger.InfoWithStatus("Stopping Stats collector", "OK")
