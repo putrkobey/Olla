@@ -14,37 +14,3 @@ const (
 	ProfileVLLMMLX          = "vllm-mlx"
 	ProfileOpenAI           = "openai"
 	ProfileOpenAICompatible = "openai-compatible"
-	ProfileDockerMR         = "docker-model-runner"
-	ProfileOMLX             = "omlx"
-	ProfileAuto             = "auto"
-)
-
-// PlatformProfile defines how to interact with a specific AI inference platform
-type PlatformProfile interface {
-	GetName() string
-	GetVersion() string
-
-	// GetModelDiscoveryURL returns the URL path for discovering available models
-	GetModelDiscoveryURL(baseURL string) string
-	// GetHealthCheckPath returns the preferred health check path for this platform
-	GetHealthCheckPath() string
-	// IsOpenAPICompatible indicates if this platform supports OpenIA-compatible endpoints
-	IsOpenAPICompatible() bool
-	// GetRequestParsingRules returns rules for extracting model names from requests
-	GetRequestParsingRules() RequestParsingRules
-	// GetModelResponseFormat returns the expected json response structure for model discovery
-	GetModelResponseFormat() ModelResponseFormat
-	// GetDetectionHints returns hints for auto-detection for this platform
-	GetDetectionHints() DetectionHints
-	// ParseModelsResponse parses platform-specific JSON response into an ModelInfo slice
-	ParseModelsResponse(data []byte) ([]*ModelInfo, error)
-	// GetPaths returns all the paths that this profile allows the proxy to request from
-	GetPaths() []string
-	// GetPath returns the path at the specified index
-	GetPath(index int) string
-}
-
-// RequestParsingRules defines how to extract model names from different request types
-type RequestParsingRules struct {
-	ChatCompletionsPath string // /v1/chat/completions
-	CompletionsPath     string // /v1/completions

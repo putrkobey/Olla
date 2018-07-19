@@ -126,3 +126,131 @@ func TestLifecycleUnifier_ModelTTLCleanup(t *testing.T) {
 
 	// Wait for TTL to expire
 	time.Sleep(200 * time.Millisecond)
+
+	// Model should be removed
+	model, err = unifier.ResolveModel(ctx, "test-model")
+	assert.Error(t, err)
+	assert.Nil(t, model)
+}
+
+func TestLifecycleUnifier_CircuitBreaker(t *testing.T) {
+	config := DefaultConfig()
+	config.CircuitBreaker.Enabled = true
+	config.CircuitBreaker.FailureThreshold = 3
+	config.CircuitBreaker.OpenDuration = 100 * time.Millisecond
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
+	endpoint := &domain.Endpoint{
+		URLString: "http://test-endpoint",
+		Name:      "test-endpoint",
+	}
+
+	// Record failures to trip the circuit breaker
+	for i := range 3 {
+		unifier.RecordEndpointFailure(endpoint.URLString, fmt.Errorf("failure %d", i))
+	}
+
+	// Check circuit breaker stats
+	stats := unifier.GetCircuitBreakerStats()
+	assert.NotEmpty(t, stats)
+	assert.Equal(t, "open", stats[endpoint.URLString].State)
+
+	// UnifyModels should fail when circuit is open
+	_, err = unifier.UnifyModels(ctx, []*domain.ModelInfo{}, endpoint)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "circuit breaker open")
+
+	// Wait for circuit to transition to half-open
+	time.Sleep(150 * time.Millisecond)
+}
+
+func TestLifecycleUnifier_EndpointRemoval(t *testing.T) {
+	config := DefaultConfig()
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
+	endpoint1 := &domain.Endpoint{
+		URLString: "http://endpoint1",
+		Name:      "endpoint1",
+	}
+	endpoint2 := &domain.Endpoint{
+		URLString: "http://endpoint2",
+		Name:      "endpoint2",
+	}
+
+	// Add models from both endpoints
+	models := []*domain.ModelInfo{
+		{
+			Name: "shared-model",
+			Size: 1000,
+			Details: &domain.ModelDetails{
+				Digest: strPtr("shared123"),
+				State:  strPtr("loaded"),
+			},
+		},
+		{
+			Name: "unique-model",
+			Size: 2000,
+			Details: &domain.ModelDetails{
+				Digest: strPtr("unique123"),
+				State:  strPtr("loaded"),
+			},
+		},
+	}
+
+	// Register from endpoint1
+	unified1, err := unifier.UnifyModels(ctx, models, endpoint1)
+	assert.NoError(t, err)
+	assert.Len(t, unified1, 2)
+
+	// Register shared model from endpoint2
+	unified2, err := unifier.UnifyModels(ctx, models[:1], endpoint2)
+	assert.NoError(t, err)
+	assert.Len(t, unified2, 1)
+
+	// Verify shared model has both endpoints
+	sharedModel, err := unifier.ResolveModel(ctx, "shared-model")
+	assert.NoError(t, err)
+	assert.Len(t, sharedModel.SourceEndpoints, 2)
+
+	// Remove endpoint1
+	err = unifier.RemoveEndpoint(ctx, endpoint1.URLString)
+	assert.NoError(t, err)
+
+	// Shared model should still exist with only endpoint2
+	sharedModel, err = unifier.ResolveModel(ctx, "shared-model")
+	assert.NoError(t, err)
+	assert.Len(t, sharedModel.SourceEndpoints, 1)
+	assert.Equal(t, endpoint2.URLString, sharedModel.SourceEndpoints[0].EndpointURL)
+
+	// Unique model should be removed
+	uniqueModel, err := unifier.ResolveModel(ctx, "unique-model")
+	assert.Error(t, err)
+	assert.Nil(t, uniqueModel)
+}
+
+func TestLifecycleUnifier_StateTransitions(t *testing.T) {
+	config := DefaultConfig()
+	config.EnableStateTransitionLogging = true
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
