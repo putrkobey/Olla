@@ -191,3 +191,67 @@ func TestVLLMConverter_ConvertToFormat(t *testing.T) {
 		require.NoError(t, err)
 
 		response := result.(VLLMModelResponse)
+		model := response.Data[0]
+
+		// Permission ID should be deterministic based on model ID
+		assert.Contains(t, model.Permission[0].ID, "modelperm-olla-org-test-model")
+
+		// Verify permission timestamp is recent
+		assert.WithinDuration(t, time.Now(), time.Unix(model.Permission[0].Created, 0), 5*time.Second)
+	})
+}
+
+func TestVLLMConverter_GetFormatName(t *testing.T) {
+	converter := NewVLLMConverter()
+	assert.Equal(t, "vllm", converter.GetFormatName())
+}
+
+func TestVLLMConverter_determineOwner(t *testing.T) {
+	converter := NewVLLMConverter().(*VLLMConverter)
+
+	tests := []struct {
+		name     string
+		modelID  string
+		expected string
+	}{
+		{
+			name:     "extracts organisation from slash-separated name",
+			modelID:  "meta-llama/Meta-Llama-3.1-8B-Instruct",
+			expected: "meta-llama",
+		},
+		{
+			name:     "handles TinyLlama format",
+			modelID:  "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+			expected: "TinyLlama",
+		},
+		{
+			name:     "defaults to vllm for non-slash names",
+			modelID:  "llama3:latest",
+			expected: "vllm",
+		},
+		{
+			name:     "handles single word models",
+			modelID:  "gpt4",
+			expected: "vllm",
+		},
+		{
+			// hyphenated known-org fallback (now shared with the other
+			// converters via ExtractOwnerFromModelID)
+			name:     "hyphenated prefix with known organisation",
+			modelID:  "mistralai-mistral-7b-instruct",
+			expected: "mistralai",
+		},
+		{
+			name:     "hyphenated prefix with meta organisation",
+			modelID:  "meta-llama-3-8b",
+			expected: "meta",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := converter.determineOwner(tt.modelID)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
