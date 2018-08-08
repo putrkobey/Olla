@@ -44,18 +44,3 @@ func (p *sglangParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
 
 		// Set creation time if available
 		if model.Created > 0 {
-			createdTime := time.Unix(model.Created, 0)
-			details.ModifiedAt = &createdTime
-			hasDetails = true
-		}
-
-		// Extract publisher from OwnedBy field
-		if model.OwnedBy != "" && model.OwnedBy != "sglang" {
-			details.Publisher = &model.OwnedBy
-			hasDetails = true
-		}
-
-		// Set parent model if this is a fine-tuned model
-		if model.Parent != nil {
-			details.ParentModel = model.Parent
-			hasDetails = true
