@@ -40,24 +40,3 @@ discovery:
         priority: 100
         model_url: "/v1/models"
         health_check_url: "/health"
-        check_interval: 5s
-        check_timeout: 2s
-      - url: "http://127.0.0.1:18902"
-        name: "mock-ollama"
-        type: "ollama"
-        priority: 90
-        model_url: "/api/tags"
-        health_check_url: "/"
-        check_interval: 5s
-        check_timeout: 2s
-  model_discovery:
-    enabled: true
-    interval: 30s
-    timeout: 10s
-    concurrent_workers: 2
-    retry_attempts: 1
-    retry_backoff: 500ms
-
-model_registry:
-  type: "memory"
-  enable_unifier: true
