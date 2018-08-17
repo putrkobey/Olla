@@ -11,9 +11,3 @@
     new Date(getNow()).toLocaleTimeString('en-AU', { hour12: false })
   );
 </script>
-
-<div class="brand-row">
-  <div class="brand">
-    <a
-      class="brand-link"
-      href="https://tensorfoundry.io/products/olla"
