@@ -25,3 +25,30 @@
   --md-accent-fg-color--transparent: rgba(103, 183, 233, 0.1);
 }
 
+/* Custom styling for brand consistency */
+.md-header {
+  background: var(--olla-accent); /* Solid blue header */
+}
+
+/* Code blocks with brand accent */
+.md-typeset .highlight .gp {
+  color: var(--olla-accent);
+}
+
+/* Links with brand colors */
+.md-typeset a {
+  color: var(--olla-accent);
+}
+
+.md-typeset a:hover {
+  color: var(--olla-primary);
+}
+
+/* Navigation active states */
+.md-nav__link--active {
+  color: var(--olla-primary);
+}
+
+.md-nav__link:hover {
+  color: var(--olla-accent);
+}
