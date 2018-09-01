@@ -1,0 +1,131 @@
+# SGLang inference platform profile
+name: sglang
+home: "https://github.com/sgl-project/sglang"
+version: "1.0"
+display_name: "SGLang"
+description: "SGLang fast serving framework with RadixAttention and Frontend Language"
+
+# Routing configuration
+routing:
+  prefixes:
+    - sglang
+
+# API compatibility
+api:
+  openai_compatible: true
+
+  # SGLang v0.5.9+ serves the Anthropic Messages API natively (/v1/messages and
+  # /v1/messages/count_tokens, http_server.py), so requests bypass translation.
+  # Older releases answer 404 on /v1/messages. min_version is documentation only:
+  # Olla does not enforce it, so set enabled: false (in a local copy of this
+  # profile) if any SGLang in the fleet is older than 0.5.9.
+  anthropic_support:
+    enabled: true
+    messages_path: /v1/messages
+    token_count: true
+    min_version: "0.5.9"
+
+  paths:
+    # Health and system endpoints
+    - /health              # 0: health check
+    - /metrics             # 1: Prometheus metrics
+    - /version             # 2: SGLang version information
+
+    # Model management
+    - /v1/models           # 3: list models (OpenAI-compatible)
+
+    # Text generation endpoints (OpenAI-compatible)
+    - /v1/chat/completions # 4: chat completions
+    - /v1/completions      # 5: text completions
+
+    # Embeddings
+    - /v1/embeddings       # 6: embeddings API
+
+    # SGLang-specific frontend language endpoints
+    - /generate            # 7: SGLang native generation
+    - /batch               # 8: batch processing
+    - /extend              # 9: conversation extension
+
+    # Vision and multimodal (SGLang-specific)
+    - /v1/chat/completions/vision # 10: vision chat completions
+    # Anthropic paths need SGLang 0.5.9+; older releases 404. /v1/rerank only answers
+    # when the server is serving a reranker model.
+    - /v1/responses # 11: OpenAI Responses API
+    - /v1/messages # 12: Anthropic Messages API
+    - /v1/messages/count_tokens # 13: Anthropic token count
+    - /v1/rerank # 14: reranking API
+
+  model_discovery_path: /v1/models
+  health_check_path: /health
+  metrics_path: /metrics
+
+# Platform characteristics
+characteristics:
+  timeout: 2m
+  max_concurrent_requests: 150  # SGLang handles higher concurrency
+  default_priority: 85          # Slightly higher than vLLM due to efficiency
+  streaming_support: true
+
+# Detection hints for auto-discovery
+detection:
+  path_indicators:
+    - "/v1/models"
+    - "/health"
+    - "/generate"         # SGLang-specific
+    - "/batch"            # SGLang-specific
+  default_ports:
+    - 30000               # SGLang default (vs vLLM's 8000)
+  response_headers:
+    - "X-SGLang-Version"  # SGLang may add this
+
+# Request/response handling
+request:
+  model_field_paths:
+    - "model"
+  response_format: "sglang"
+  parsing_rules:
+    chat_completions_path: "/v1/chat/completions"
+    completions_path: "/v1/completions"
+    model_field_name: "model"
+    supports_streaming: true
+
+# Path indices for specific functions
+path_indices:
+  health: 0
+  metrics: 1
+  version: 2
+  models: 3
+  chat_completions: 4
+  completions: 5
+  embeddings: 6
+  generate: 7
+  batch: 8
+  extend: 9
+  vision_chat: 10
+
+# Model handling
+models:
+  name_format: "{{.Name}}"  # SGLang uses full model names like "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  capability_patterns:
+    chat:
+      - "*-Chat-*"
+      - "*-Instruct*"
+      - "*-chat-*"
+    embeddings:
+      - "*embedding*"
+      - "*-embed-*"
+    vision:
+      - "*vision*"
+      - "*llava*"
+      - "*multimodal*"
+    code:
+      - "*code*"
+      - "*Code*"
+  # Context window patterns for common SGLang models
+  context_patterns:
+    - pattern: "*llama-3.1*"
+      context: 131072
+    - pattern: "*llama-3*"
+      context: 8192
+    - pattern: "*mistral*"
+      context: 32768
