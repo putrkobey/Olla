@@ -17,12 +17,3 @@ type LMDeployModel struct {
 	ID         string                    `json:"id"`
 	Object     string                    `json:"object"`
 	OwnedBy    string                    `json:"owned_by"`
-	Permission []LMDeployModelPermission `json:"permission,omitempty"`
-	Created    int64                     `json:"created"`
-}
-
-// LMDeployModelPermission mirrors the OpenAI permission shape that LMDeploy exposes.
-type LMDeployModelPermission struct {
-	Group              *string `json:"group"`
-	ID                 string  `json:"id"`
-	Object             string  `json:"object"`
