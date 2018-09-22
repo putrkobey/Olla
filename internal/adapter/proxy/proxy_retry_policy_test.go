@@ -59,3 +59,34 @@ func healthyBackend(t *testing.T) (*httptest.Server, *atomic.Int32) {
 // the way the server builds them, against a backend that resets the connection
 // and a healthy second backend. It proves the proxy.retry policy reaches both
 // engines and that a started response is never replayed.
+func TestRetryPolicy_BothEngines(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		method      string
+		policy      proxyconfig.RetryPolicy
+		partial     string // bytes the failing backend sends before resetting
+		wantHitsB   int32
+		wantBody    string
+		wantErr     bool
+		wantDemoted bool
+	}{
+		{name: "defaults replay a POST after a pre-response reset", method: http.MethodPost, wantHitsB: 1, wantBody: "from-b", wantDemoted: true},
+		{name: "retry disabled is a single attempt", method: http.MethodPost, policy: proxyconfig.RetryPolicy{Disabled: true}, wantErr: true, wantDemoted: true},
+		{name: "max_attempts 1 is a single attempt", method: http.MethodGet, policy: proxyconfig.RetryPolicy{MaxAttempts: 1}, wantErr: true, wantDemoted: true},
+		{name: "non_idempotent off does not replay a POST", method: http.MethodPost, policy: proxyconfig.RetryPolicy{NoNonIdempotent: true}, wantErr: true, wantDemoted: true},
+		{name: "non_idempotent off still fails a GET over", method: http.MethodGet, policy: proxyconfig.RetryPolicy{NoNonIdempotent: true}, wantHitsB: 1, wantBody: "from-b", wantDemoted: true},
+		{name: "GET is not replayed once the response started", method: http.MethodGet, partial: "partial", wantErr: true, wantBody: "partial"},
+		{name: "POST is not replayed once the response started", method: http.MethodPost, partial: "partial", wantErr: true, wantBody: "partial"},
+	}
+
+	for _, engine := range []string{DefaultProxySherpa, DefaultProxyOlla} {
+		for _, tt := range tests {
+			t.Run(engine+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				srvA, hitsA := resetBackend(t, tt.partial)
+				srvB, hitsB := healthyBackend(t)
+				epA := createTestEndpoint("a", srvA.URL, domain.StatusHealthy)
+				epB := createTestEndpoint("b", srvB.URL, domain.StatusHealthy)

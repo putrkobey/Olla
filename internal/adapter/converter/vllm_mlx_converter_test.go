@@ -64,3 +64,69 @@ func TestVLLMMLXConverter_ConvertToFormat(t *testing.T) {
 		result, err := c.ConvertToFormat(models, ports.ModelFilters{})
 		require.NoError(t, err)
 
+		response, ok := result.(VLLMMLXResponse)
+		require.True(t, ok)
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, "llama3.2:3b-instruct", response.Data[0].ID)
+	})
+
+	t.Run("falls back to unified ID when no aliases", func(t *testing.T) {
+		t.Parallel()
+		models := []*domain.UnifiedModel{
+			{
+				ID:      "mlx-community/Llama-3.2-3B-Instruct-4bit",
+				Aliases: []domain.AliasEntry{},
+			},
+		}
+
+		result, err := c.ConvertToFormat(models, ports.ModelFilters{})
+		require.NoError(t, err)
+
+		response, ok := result.(VLLMMLXResponse)
+		require.True(t, ok)
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, "mlx-community/Llama-3.2-3B-Instruct-4bit", response.Data[0].ID)
+	})
+
+	t.Run("extracts owner from namespace/name format", func(t *testing.T) {
+		t.Parallel()
+		models := []*domain.UnifiedModel{
+			{
+				ID: "mlx-community/Llama-3.2-3B-Instruct-4bit",
+				Aliases: []domain.AliasEntry{
+					{Name: "mlx-community/Llama-3.2-3B-Instruct-4bit", Source: constants.ProviderTypeVLLMMLX},
+				},
+			},
+		}
+
+		result, err := c.ConvertToFormat(models, ports.ModelFilters{})
+		require.NoError(t, err)
+
+		response, ok := result.(VLLMMLXResponse)
+		require.True(t, ok)
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, "mlx-community", response.Data[0].OwnedBy)
+	})
+
+	t.Run("defaults owner for models without namespace", func(t *testing.T) {
+		t.Parallel()
+		models := []*domain.UnifiedModel{
+			{
+				ID: "simple-model",
+				Aliases: []domain.AliasEntry{
+					{Name: "simple-model", Source: constants.ProviderTypeVLLMMLX},
+				},
+			},
+		}
+
+		result, err := c.ConvertToFormat(models, ports.ModelFilters{})
+		require.NoError(t, err)
+
+		response, ok := result.(VLLMMLXResponse)
+		require.True(t, ok)
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, constants.ProviderTypeVLLMMLX, response.Data[0].OwnedBy)
+	})
+
+	t.Run("handles empty model list", func(t *testing.T) {
+		t.Parallel()
