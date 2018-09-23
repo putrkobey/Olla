@@ -9,15 +9,3 @@
   // that never took a request throws that history away exactly when an
   // operator needs it. Optional and backward-compatible - callers that omit
   // status get the original behaviour.
-  interface Props {
-    pct?: number;
-    hasData?: boolean;
-    status?: string;
-  }
-  let { pct = 0, hasData = false, status = '' }: Props = $props();
-
-  const DOWN = new Set(['offline', 'unhealthy', 'critical']);
-  const down = $derived(DOWN.has(status));
-  // We have a real figure but the endpoint is currently down: show the
-  // number (and its real fill width) but force the neutral bucket so it
-  // never reads as current, live health.
