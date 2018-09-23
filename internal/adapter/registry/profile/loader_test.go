@@ -41,3 +41,25 @@ func TestLoadProfiles_MalformedYAMLSurfacesWarning(t *testing.T) {
 	_, ok = loader.GetProfile("ollama")
 	assert.True(t, ok, "built-in ollama profile should still be present")
 }
+
+// TestLoadProfiles_CleanDirectoryHasNoWarnings guards against false
+// positives: a directory with only valid profiles must report zero warnings.
+func TestLoadProfiles_CleanDirectoryHasNoWarnings(t *testing.T) {
+	dir := t.TempDir()
+	valid := "name: custom-clean\nversion: \"1.0\"\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "clean.yaml"), []byte(valid), 0644))
+
+	loader := NewProfileLoader(dir)
+	require.NoError(t, loader.LoadProfiles())
+
+	assert.Empty(t, loader.LoadWarnings())
+}
+
+// TestLoadProfiles_ReloadClearsStaleWarnings ensures a fixed-then-reloaded
+// profile doesn't leave a stale warning behind.
+func TestLoadProfiles_ReloadClearsStaleWarnings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "flaky.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("name: flaky\nrouting: {prefixes: [broken\n"), 0644))
+
+	loader := NewProfileLoader(dir)

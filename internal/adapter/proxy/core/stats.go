@@ -26,3 +26,18 @@ func (s *ProxyStats) RecordSuccess(latency int64) {
 		oldMin := atomic.LoadInt64(&s.MinLatency)
 		if oldMin != 0 && oldMin <= latency {
 			break
+		}
+		if atomic.CompareAndSwapInt64(&s.MinLatency, oldMin, latency) {
+			break
+		}
+	}
+
+	// Update max latency
+	for {
+		oldMax := atomic.LoadInt64(&s.MaxLatency)
+		if oldMax >= latency {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&s.MaxLatency, oldMax, latency) {
+			break
+		}
