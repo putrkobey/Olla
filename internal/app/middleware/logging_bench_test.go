@@ -8,13 +8,3 @@ import (
 
 // benchNextHandler is the terminal handler both benchmarks wrap - representative
 // of a typical status/health handler, not the proxy hot path itself.
-func benchNextHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-}
-
-// BenchmarkLoggingMiddleware_Combined measures the fused replacement now wired
-// into application.go: one responseWriter wrap, one timer, feeding both the
-// console and access log outputs.
-func BenchmarkLoggingMiddleware_Combined(b *testing.B) {
