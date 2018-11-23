@@ -10,15 +10,3 @@ import ModelsPanel from './ModelsPanel.svelte';
 
 global.fetch = vi.fn(async () => ({
   status: 200,
-  ok: true,
-  headers: { get: () => null },
-  json: async () => ({}),
-}));
-
-let component: ReturnType<typeof mount> | undefined;
-afterEach(() => {
-  if (component) unmount(component);
-  component = undefined;
-  document.body.innerHTML = '';
-});
-
