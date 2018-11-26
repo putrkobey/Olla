@@ -8,14 +8,3 @@ import ModelsPanel from './ModelsPanel.svelte';
 // "No models discovered yet" empty-state copy - rendered right alongside
 // StatusBanner's error banner. An operator reading both at once sees "the
 // backends genuinely have no models" rather than "the request failed".
-
-let component: ReturnType<typeof mount> | undefined;
-afterEach(() => {
-  if (component) unmount(component);
-  document.body.innerHTML = '';
-});
-
-function emptyStateText() {
-  return [...document.querySelectorAll<HTMLElement>('.panel-intro')]
-    .map((el) => el.textContent!.trim())
-    .join(' ');
