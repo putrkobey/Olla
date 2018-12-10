@@ -21,26 +21,3 @@ type OpenAIModelData struct {
 	Created int64  `json:"created"`
 }
 
-// OpenAIConverter converts models to OpenAI-compatible format
-type OpenAIConverter struct {
-	*BaseConverter
-}
-
-// NewOpenAIConverter creates a new OpenAI format converter
-func NewOpenAIConverter() ports.ModelResponseConverter {
-	return &OpenAIConverter{
-		BaseConverter: NewBaseConverter("openai"),
-	}
-}
-
-func (c *OpenAIConverter) GetFormatName() string {
-	return "openai"
-}
-
-func (c *OpenAIConverter) ConvertToFormat(models []*domain.UnifiedModel, filters ports.ModelFilters) (interface{}, error) {
-	filtered := filterModels(models, filters)
-
-	data := make([]OpenAIModelData, 0, len(filtered))
-	for _, model := range filtered {
-		data = append(data, c.convertModel(model))
-	}
