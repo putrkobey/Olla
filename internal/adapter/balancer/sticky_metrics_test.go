@@ -32,38 +32,3 @@ func TestStickySessionWrapper_Stats_TracksMetrics(t *testing.T) {
 
 	// Second select: hit on the same key → Hits++.
 	ctx2, _ := injectKey(context.Background(), "stats-key:llama3", "session_header")
-	_, err = w.Select(ctx2, endpoints)
-	require.NoError(t, err)
-
-	stats := w.Stats()
-	assert.True(t, stats.Enabled, "Stats.Enabled must be true for an active wrapper")
-	assert.Equal(t, 1, stats.ActiveSessions, "one unique key should produce one active session")
-	assert.GreaterOrEqual(t, stats.Insertions, uint64(1), "insertion counter must be tracked by the underlying ttlcache")
-	assert.GreaterOrEqual(t, stats.Hits, uint64(1), "hit counter must be tracked by the underlying ttlcache")
-}
-
-// TestComputeStickyKey_PrefixHash_PromptFallback verifies that legacy completions
-// requests (which use "prompt" instead of "messages") still produce a sticky key
-// via the prefix_hash source. Without the fallback, /v1/completions and
-// llamaswap-style passthrough requests bypass sticky entirely and the metrics
-// counters never advance.
-func TestComputeStickyKey_PrefixHash_PromptFallback(t *testing.T) {
-	t.Parallel()
-
-	body := []byte(`{"model":"llama3","prompt":"why is the sky blue?","max_tokens":50}`)
-	req, _ := http.NewRequest(http.MethodPost, "/", nil)
-
-	cfg := config.StickySessionConfig{
-		KeySources:      []string{"prefix_hash"},
-		PrefixHashBytes: 512,
-	}
-	key, source := ComputeStickyKey(req, "llama3", cfg, body)
-
-	assert.Equal(t, "prefix_hash", source, "prompt-only body must still resolve via prefix_hash")
-	assert.NotEmpty(t, key, "prompt fallback must produce a non-empty key")
-}
-
-// TestComputeStickyKey_PrefixHash_PreferMessagesOverPrompt ensures the prompt
-// fallback does not accidentally override the canonical messages path when both
-// are present.
-func TestComputeStickyKey_PrefixHash_PreferMessagesOverPrompt(t *testing.T) {
