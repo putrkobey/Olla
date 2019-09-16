@@ -29,35 +29,3 @@ func TestEndpointModelsURLNotSerialised(t *testing.T) {
 
 	if strings.Contains(string(data), "192.168.1.100") {
 		t.Errorf("EndpointModels JSON contains endpoint URL: %s", data)
-	}
-	if strings.Contains(string(data), "endpoint_url") {
-		t.Errorf("EndpointModels JSON contains 'endpoint_url' key: %s", data)
-	}
-	// Sanity check: the model data is still present.
-	if !strings.Contains(string(data), "llama3") {
-		t.Errorf("EndpointModels JSON missing model data: %s", data)
-	}
-}
-
-// TestSourceEndpointURLNotSerialised asserts that SourceEndpoint.EndpointURL
-// is not emitted in JSON output. The field holds the backend URL used for
-// internal routing and must not surface in unified model API responses.
-func TestSourceEndpointURLNotSerialised(t *testing.T) {
-	t.Parallel()
-
-	se := domain.SourceEndpoint{
-		EndpointURL:  "http://admin:secret@gpu-host:8000",
-		EndpointName: "gpu-vllm",
-		NativeName:   "meta-llama/Llama-3.1-8B",
-	}
-
-	data, err := json.Marshal(se)
-	if err != nil {
-		t.Fatalf("marshal failed: %v", err)
-	}
-
-	if strings.Contains(string(data), "gpu-host") {
-		t.Errorf("SourceEndpoint JSON contains backend hostname: %s", data)
-	}
-	if strings.Contains(string(data), "admin") {
-		t.Errorf("SourceEndpoint JSON contains auth info: %s", data)
