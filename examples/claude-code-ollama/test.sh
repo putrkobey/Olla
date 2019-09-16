@@ -31,37 +31,3 @@ MODELS=$(curl -s "${ANTHROPIC_URL}/models")
 if echo "$MODELS" | jq -e '.data | length > 0' > /dev/null 2>&1; then
     echo -e "${GREEN}  Models available:${NC}"
     echo "$MODELS" | jq -r '.data[].id' | sed 's/^/    - /'
-else
-    echo -e "${RED}  No models available. Pull a model first:${NC}"
-    echo "    docker exec ollama ollama pull llama3.2:latest"
-    exit 1
-fi
-echo ""
-
-# Get first available model
-MODEL=$(echo "$MODELS" | jq -r '.data[0].id')
-echo -e "${YELLOW}Using model: ${MODEL}${NC}"
-echo ""
-
-# Test 3: Simple message (non-streaming)
-echo -e "${YELLOW}Test 3: Testing simple message (non-streaming)...${NC}"
-RESPONSE=$(curl -s -X POST "${ANTHROPIC_URL}/messages" \
-  -H "Content-Type: application/json" \
-  -H "anthropic-version: 2023-06-01" \
-  -d "{
-    \"model\": \"${MODEL}\",
-    \"max_tokens\": 100,
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"Say hello in exactly one sentence.\"}
-    ]
-  }")
-
-if echo "$RESPONSE" | jq -e '.content[0].text' > /dev/null 2>&1; then
-    echo -e "${GREEN}  Non-streaming message successful${NC}"
-    echo "  Response:"
-    echo "$RESPONSE" | jq -r '.content[0].text' | sed 's/^/    /'
-
-    # Show Olla routing headers
-    echo ""
-    echo "  Olla routing headers:"
-    curl -sI -X POST "${ANTHROPIC_URL}/messages" \
