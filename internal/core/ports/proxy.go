@@ -23,29 +23,3 @@ type ProxyStats struct {
 	SuccessfulRequests int64
 	FailedRequests     int64
 	AverageLatency     int64 // in milliseconds
-	MinLatency         int64
-	MaxLatency         int64
-}
-
-// ProxyConfiguration allows us to reuse the configuration across multiple proxy implementations
-type ProxyConfiguration interface {
-	GetProxyPrefix() string
-	GetConnectionTimeout() time.Duration
-	GetConnectionKeepAlive() time.Duration
-	GetResponseTimeout() time.Duration
-	GetReadTimeout() time.Duration
-	GetStreamBufferSize() int
-	GetProxyProfile() string
-}
-
-type ProxyFactory interface {
-	Create(proxyTpe string, discoveryService DiscoveryService, selector domain.EndpointSelector, config ProxyConfiguration) (ProxyService, error)
-	GetAvailableTypes() []string
-}
-
-type RequestStats struct {
-	StartTime time.Time
-	EndTime   time.Time
-
-	// Provider metrics extracted from response (best effort)
-	ProviderMetrics *domain.ProviderMetrics      `json:"provider_metrics,omitempty"`
