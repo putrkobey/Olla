@@ -24,29 +24,3 @@ func TestIsProxyRequest(t *testing.T) {
 			path:     "/olla/proxy/some/endpoint",
 			expected: true,
 		},
-		{
-			name:     "direct api path",
-			path:     "/api/chat",
-			expected: true,
-		},
-		{
-			name:     "api models path",
-			path:     "/api/models",
-			expected: true,
-		},
-
-		// Non-proxy requests
-		{
-			name:     "health check endpoint",
-			path:     "/internal/health",
-			expected: false,
-		},
-		{
-			name:     "status endpoint",
-			path:     "/internal/status",
-			expected: false,
-		},
-		{
-			name:     "version endpoint",
-			path:     "/version",
-			expected: false,
