@@ -21,27 +21,3 @@ var tokenPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
 // string. Expand never returns an error; use ExpandStrict when a missing
 // variable must be fatal.
 func Expand(s string) string {
-	if s == "" || !strings.Contains(s, "${") {
-		return s
-	}
-
-	return tokenPattern.ReplaceAllStringFunc(s, func(token string) string {
-		expr := token[2 : len(token)-1] // strip ${ and }
-		name, fallback, hasFallback := strings.Cut(expr, ":-")
-
-		v, set := os.LookupEnv(name)
-		// POSIX :- semantics: use default when the variable is unset OR empty.
-		// An explicitly set but empty variable still triggers the default, matching
-		// shell behaviour and making empty-string auth values detectable downstream.
-		if set && v != "" {
-			return v
-		}
-		if hasFallback {
-			return fallback
-		}
-		return ""
-	})
-}
-
-// ExpandStrict is like Expand but returns an error when a placeholder has no
-// environment value and no default. The error message names the variable but
