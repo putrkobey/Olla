@@ -31,36 +31,3 @@ func TestOllamaParser_CapabilitiesTyping(t *testing.T) {
 		},
 		{
 			name:     "completion plus vision is a generative vlm",
-			body:     `{"models":[{"name":"llava:13b","capabilities":["completion","vision"]}]}`,
-			wantType: "vlm",
-			wantCaps: []string{"vision"},
-		},
-		{
-			name:     "vision without a completion entry is still a vlm",
-			body:     `{"models":[{"name":"vision-only:latest","capabilities":["vision"]}]}`,
-			wantType: "vlm",
-			wantCaps: []string{"vision"},
-		},
-		{
-			name:     "completion plus tools has the capability but no kind",
-			body:     `{"models":[{"name":"llama3.1:8b","capabilities":["completion","tools"]}]}`,
-			wantCaps: []string{"function_calling"},
-		},
-		{
-			name:     "embedding plus vision stays embedding only",
-			body:     `{"models":[{"name":"odd:latest","capabilities":["embedding","vision"]}]}`,
-			wantType: "embeddings",
-		},
-		{
-			name: "missing capabilities (older Ollama) stays untyped",
-			body: `{"models":[{"name":"llama3:latest","digest":"abc","details":{"family":"llama"}}]}`,
-		},
-		{
-			name: "embedding plus completion stays untyped",
-			body: `{"models":[{"name":"hybrid:latest","details":{"family":"x"},"capabilities":["embedding","completion"]}]}`,
-		},
-		{
-			name:     "embedding plus unknown value is still embedding only",
-			body:     `{"models":[{"name":"rerank:latest","capabilities":["embedding","rerank"]}]}`,
-			wantType: "embeddings",
-		},
