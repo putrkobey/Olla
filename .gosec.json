@@ -1,7 +1,2 @@
 {
   "global": {
-    "nosec": false
-  },
-  "rules": {
-    "G101": {
-      "skip_files": [
