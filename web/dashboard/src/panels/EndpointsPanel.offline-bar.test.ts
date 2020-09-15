@@ -24,30 +24,3 @@ afterEach(() => {
   document.body.innerHTML = '';
 });
 
-function jsonResponse(body: unknown) {
-  return {
-    status: 200,
-    ok: true,
-    headers: { get: () => null },
-    json: async () => body,
-  };
-}
-
-async function refreshWith(endpoint: Record<string, unknown>) {
-  global.fetch = vi.fn(async () =>
-    jsonResponse({
-      endpoints: [endpoint],
-      total_count: 1,
-      healthy_count: 0,
-      routable_count: 0,
-    })
-  );
-  endpoints.refresh();
-  await vi.waitFor(() => expect(endpoints.data?.endpoints?.[0]?.name).toBe(endpoint.name));
-  flushSync();
-}
-
-// Tests assert existence via toBeTruthy before touching attributes; the
-// non-null assertions here just encode that the DOM is populated by the time
-// they run.
-const pctCell = () => document.querySelector('.pct-cell')!;
