@@ -10,27 +10,3 @@ import (
 
 type vllmMLXParser struct{}
 
-// Parse transforms vLLM-MLX /v1/models response into unified ModelInfo structures.
-// vLLM-MLX exclusively serves MLX models, so the format hint is always set to RecipeMLX.
-func (p *vllmMLXParser) Parse(data []byte) ([]*domain.ModelInfo, error) {
-	if len(data) == 0 {
-		return make([]*domain.ModelInfo, 0), nil
-	}
-
-	var response VLLMMLXResponse
-	if err := json.Unmarshal(data, &response); err != nil {
-		return nil, fmt.Errorf("failed to parse vLLM-MLX response: %w", err)
-	}
-
-	models := make([]*domain.ModelInfo, 0, len(response.Data))
-	now := time.Now()
-
-	for _, model := range response.Data {
-		if model.ID == "" {
-			continue
-		}
-
-		modelInfo := &domain.ModelInfo{
-			Name:     model.ID,
-			LastSeen: now,
-		}
