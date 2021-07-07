@@ -21,26 +21,3 @@ import (
 // that reads Aliases, SourceEndpoints or Metadata mid-mutation fails under -race
 // (or crashes the run with a map fatal without it).
 func TestUnifiedViewHandlers_ConcurrentWithRegistration(t *testing.T) {
-	t.Parallel()
-
-	newEndpoint := func(name string) *domain.Endpoint {
-		u, err := url.Parse("http://" + name + ":11434")
-		require.NoError(t, err)
-		return &domain.Endpoint{Name: name, URL: u, URLString: u.String(), Type: domain.ProfileOllama, Status: domain.StatusHealthy}
-	}
-	model := func(name string) []*domain.ModelInfo {
-		digest := "sha256:shared"
-		return []*domain.ModelInfo{{Name: name, Size: 100, Details: &domain.ModelDetails{Digest: &digest}}}
-	}
-
-	epA, epB := newEndpoint("a"), newEndpoint("b")
-	ctx := context.Background()
-
-	for range 30 {
-		reg := registry.NewUnifiedMemoryModelRegistry(&mockStyledLogger{}, nil, nil, nil)
-		reg.RegisterEndpoint(epA)
-		reg.RegisterEndpoint(epB)
-		require.NoError(t, reg.RegisterModelsWithEndpoint(ctx, epA, model("llama3:8b")))
-		reg.WaitForUnification()
-
-		app := &Application{
