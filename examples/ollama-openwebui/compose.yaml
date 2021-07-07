@@ -15,20 +15,3 @@ services:
       timeout: 5s
       interval: 30s
       retries: 3
-      start_period: 10s
-
-  # Open WebUI - the web interface
-  openwebui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: openwebui
-    restart: unless-stopped
-    ports:
-      - "3000:8080"
-    volumes:
-      - openwebui_data:/app/backend/data
-    environment:
-      # Point Open WebUI at Olla using the Ollama-compatible endpoint.
-      # Open WebUI appends /api/* paths itself; provide only the base URL.
-      - OLLAMA_BASE_URL=http://olla:40114/olla/ollama
-      # Optional: also expose Olla as an OpenAI-compatible connection.
-      # Open WebUI expects the full /v1 path for OpenAI-style endpoints.
