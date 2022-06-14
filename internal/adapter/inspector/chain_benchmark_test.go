@@ -33,39 +33,3 @@ func BenchmarkChain_WithAndWithoutBodyInspector(b *testing.B) {
 		chain.AddInspector(pathInspector)
 
 		b.ResetTimer()
-		for range b.N {
-			req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(requestBody)))
-			req.Header.Set("Content-Type", "application/json")
-
-			profile, err := chain.Inspect(ctx, req, "/v1/chat/completions")
-			if err != nil {
-				b.Fatal(err)
-			}
-			if profile.ModelName != "" {
-				b.Fatal("Expected no model name with path inspector only")
-			}
-		}
-	})
-
-	b.Run("WithPathAndBodyInspectors", func(b *testing.B) {
-		// Create chain with both inspectors
-		factory := NewFactory(profileFactory, styledLog)
-		chain := factory.CreateChain()
-		pathInspector := factory.CreatePathInspector()
-		bodyInspector, err := factory.CreateBodyInspector()
-		if err != nil {
-			b.Fatalf("Failed to create body inspector: %v", err)
-		}
-		chain.AddInspector(pathInspector)
-		chain.AddInspector(bodyInspector)
-
-		b.ResetTimer()
-		for range b.N {
-			req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader([]byte(requestBody)))
-			req.Header.Set("Content-Type", "application/json")
-
-			profile, err := chain.Inspect(ctx, req, "/v1/chat/completions")
-			if err != nil {
-				b.Fatal(err)
-			}
-			if profile.ModelName != "llama3.1:8b" {
