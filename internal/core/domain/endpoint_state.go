@@ -54,3 +54,60 @@ func (s EndpointState) IsTerminal() bool {
 func (s EndpointState) CanTransitionTo(target EndpointState) bool {
 	if s == EndpointStateRemoved {
 		return false
+	}
+
+	if target == EndpointStateRemoved {
+		return true
+	}
+
+	validTransitions := map[EndpointState][]EndpointState{
+		EndpointStateUnknown:  {EndpointStateOnline, EndpointStateOffline, EndpointStateDegraded},
+		EndpointStateOnline:   {EndpointStateOffline, EndpointStateDegraded, EndpointStateUnknown},
+		EndpointStateDegraded: {EndpointStateOnline, EndpointStateOffline, EndpointStateUnknown},
+		EndpointStateOffline:  {EndpointStateOnline, EndpointStateDegraded, EndpointStateUnknown},
+	}
+
+	allowed, exists := validTransitions[s]
+	if !exists {
+		return false
+	}
+
+	for _, state := range allowed {
+		if state == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (s ModelState) IsHealthy() bool {
+	return s == ModelStateAvailable || s == ModelStateLoaded || s == ModelStateLoading
+}
+
+func (s EndpointState) String() string {
+	return string(s)
+}
+
+func (s ModelState) String() string {
+	return string(s)
+}
+
+func (s EndpointState) Validate() error {
+	switch s {
+	case EndpointStateUnknown, EndpointStateOnline, EndpointStateDegraded,
+		EndpointStateOffline, EndpointStateRemoved:
+		return nil
+	default:
+		return fmt.Errorf("invalid endpoint state: %s", s)
+	}
+}
+
+func (s ModelState) Validate() error {
+	switch s {
+	case ModelStateUnknown, ModelStateAvailable, ModelStateLoaded,
+		ModelStateLoading, ModelStateOffline, ModelStateError:
+		return nil
+	default:
+		return fmt.Errorf("invalid model state: %s", s)
+	}
+}
