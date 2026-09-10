@@ -251,3 +251,257 @@ func (c *Collector) GetEndpointStats() map[string]ports.EndpointStats {
 
 		successRate := 0.0
 		if total > 0 {
+			successRate = float64(successful) / float64(total) * 100
+		}
+
+		minLatency := atomic.LoadInt64(&data.minLatency)
+		if minLatency == -1 {
+			minLatency = 0
+		}
+
+		stats[url] = ports.EndpointStats{
+			Name:               data.name,
+			URL:                data.url,
+			ActiveConnections:  atomic.LoadInt64(&data.activeConnections),
+			TotalRequests:      total,
+			SuccessfulRequests: successful,
+			FailedRequests:     failed,
+			TotalBytes:         data.totalBytes.Value(),
+			AverageLatency:     avgLatency,
+			MinLatency:         minLatency,
+			MaxLatency:         atomic.LoadInt64(&data.maxLatency),
+			LastUsedNano:       atomic.LoadInt64(&data.lastUsed),
+			SuccessRate:        successRate,
+		}
+		return true
+	})
+
+	return stats
+}
+
+func (c *Collector) GetSecurityStats() ports.SecurityStats {
+	c.securityMu.RLock()
+	uniqueIPs := len(c.uniqueRateLimitedIPs)
+	c.securityMu.RUnlock()
+
+	return ports.SecurityStats{
+		RateLimitViolations:  c.rateLimitViolations.Value(),
+		SizeLimitViolations:  c.sizeLimitViolations.Value(),
+		UniqueRateLimitedIPs: uniqueIPs,
+	}
+}
+
+func (c *Collector) GetConnectionStats() map[string]int64 {
+	stats := make(map[string]int64)
+
+	c.endpoints.Range(func(url string, data *endpointData) bool {
+		stats[url] = atomic.LoadInt64(&data.activeConnections)
+		return true
+	})
+
+	return stats
+}
+
+// GetConnectionCount returns the active connection count for a single endpoint,
+// keyed the same way as GetConnectionStats (endpoint URL string). Returns 0 for
+// an endpoint that has never recorded a connection, matching GetConnectionStats'
+// implicit-zero behaviour for missing keys.
+func (c *Collector) GetConnectionCount(endpoint string) int64 {
+	data, ok := c.endpoints.Load(endpoint)
+	if !ok {
+		return 0
+	}
+	return atomic.LoadInt64(&data.activeConnections)
+}
+
+func (c *Collector) RecordSecurityViolation(violation ports.SecurityViolation) {
+	switch violation.ViolationType {
+	case constants.ViolationRateLimit:
+		c.rateLimitViolations.Inc()
+		c.recordRateLimitedIP(violation.ClientID)
+	case constants.ViolationSizeLimit:
+		c.sizeLimitViolations.Inc()
+	}
+}
+
+func (c *Collector) recordRateLimitedIP(clientIP string) {
+	now := time.Now().UnixNano()
+
+	// Age-eviction scan runs at most once per ipCleanupInterval, not on every
+	// violation. The pre-check outside the lock avoids contention when the
+	// interval has not yet elapsed (the common case under a flood).
+	lastClean := atomic.LoadInt64(&c.lastIPCleanup)
+	if now-lastClean >= int64(ipCleanupInterval) {
+		c.cleanupOldRateLimitedIPs(now)
+	}
+
+	c.securityMu.Lock()
+	// Refuse new entries once the hard cap is reached. At cap, the periodic
+	// eviction will free space for the next cleanup cycle.
+	if len(c.uniqueRateLimitedIPs) < MaxUniqueRateLimitedIPs {
+		c.uniqueRateLimitedIPs[clientIP] = now
+	}
+	c.securityMu.Unlock()
+}
+
+// cleanupOldRateLimitedIPs removes IPs whose last-seen timestamp is older than
+// one hour. Uses a double-checked lock to avoid redundant scans when multiple
+// goroutines arrive at the interval boundary concurrently.
+func (c *Collector) cleanupOldRateLimitedIPs(now int64) {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+
+	// Second check after acquiring the cleanup lock.
+	if now-atomic.LoadInt64(&c.lastIPCleanup) < int64(ipCleanupInterval) {
+		return
+	}
+
+	cutoff := now - int64(time.Hour)
+
+	c.securityMu.Lock()
+	for ip, ts := range c.uniqueRateLimitedIPs {
+		if ts < cutoff {
+			delete(c.uniqueRateLimitedIPs, ip)
+		}
+	}
+	c.securityMu.Unlock()
+
+	atomic.StoreInt64(&c.lastIPCleanup, now)
+}
+
+func (c *Collector) updateEndpointStats(endpoint *domain.Endpoint, status string, latencyMs, bytes int64, now int64) {
+	data := c.getOrInitEndpoint(endpoint, now)
+
+	data.totalRequests.Inc()
+	data.totalBytes.Add(bytes)
+	atomic.StoreInt64(&data.lastUsed, now)
+
+	if status == StatusSuccess {
+		data.successfulRequests.Inc()
+		data.totalLatency.Add(latencyMs)
+		c.updateLatencyBounds(data, latencyMs)
+	} else {
+		data.failedRequests.Inc()
+	}
+}
+
+func (c *Collector) updateLatencyBounds(data *endpointData, latencyMs int64) {
+	for {
+		minLatency := atomic.LoadInt64(&data.minLatency)
+		if minLatency == -1 || latencyMs < minLatency {
+			if atomic.CompareAndSwapInt64(&data.minLatency, minLatency, latencyMs) {
+				break
+			}
+		} else {
+			break
+		}
+	}
+	for {
+		maxLatency := atomic.LoadInt64(&data.maxLatency)
+		if latencyMs > maxLatency {
+			if atomic.CompareAndSwapInt64(&data.maxLatency, maxLatency, latencyMs) {
+				break
+			}
+		} else {
+			break
+		}
+	}
+}
+
+func (c *Collector) getOrInitEndpoint(endpoint *domain.Endpoint, now int64) *endpointData {
+	key := endpoint.URLString
+	data, _ := c.endpoints.LoadOrCompute(key, func() (newValue *endpointData, cancel bool) {
+		return &endpointData{
+			url:                key,
+			name:               endpoint.Name,
+			lastUsed:           now,
+			minLatency:         -1,
+			totalRequests:      xsync.NewCounter(),
+			successfulRequests: xsync.NewCounter(),
+			failedRequests:     xsync.NewCounter(),
+			totalBytes:         xsync.NewCounter(),
+			totalLatency:       xsync.NewCounter(),
+		}, false
+	})
+	return data
+}
+
+func (c *Collector) tryCleanup(now int64) {
+	c.cleanupMu.Lock()
+	defer c.cleanupMu.Unlock()
+
+	if now-atomic.LoadInt64(&c.lastCleanup) < int64(CleanupInterval) {
+		return
+	}
+
+	c.cleanup(now)
+	atomic.StoreInt64(&c.lastCleanup, now)
+}
+
+func (c *Collector) cleanup(now int64) {
+	cutoff := now - int64(EndpointTTL)
+	var toRemove []string
+	var count int
+
+	c.endpoints.Range(func(url string, data *endpointData) bool {
+		count++
+		if atomic.LoadInt64(&data.lastUsed) < cutoff {
+			toRemove = append(toRemove, url)
+		}
+		return true
+	})
+
+	for _, url := range toRemove {
+		c.endpoints.Delete(url)
+	}
+
+	if count-len(toRemove) > MaxTrackedEndpoints {
+		type endpointAge struct {
+			url  string
+			time int64
+		}
+		var ages []endpointAge
+		c.endpoints.Range(func(url string, data *endpointData) bool {
+			ages = append(ages, endpointAge{url, atomic.LoadInt64(&data.lastUsed)})
+			return true
+		})
+		sort.Slice(ages, func(i, j int) bool {
+			return ages[i].time < ages[j].time
+		})
+		remove := len(ages) - MaxTrackedEndpoints + 100
+		for i := 0; i < remove && i < len(ages); i++ {
+			c.endpoints.Delete(ages[i].url)
+		}
+		c.logger.Debug("Cleaned up old endpoint stats", "removed", remove, "remaining", len(ages)-remove)
+	}
+}
+
+// Model-specific tracking methods
+
+func (c *Collector) RecordModelRequest(model string, endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
+	// Record in both regular stats and model-specific stats
+	c.RecordRequest(endpoint, status, latency, bytes)
+	c.modelCollector.RecordModelRequest(model, endpoint, status, latency, bytes)
+}
+
+func (c *Collector) RecordModelError(model string, endpoint *domain.Endpoint, errorType string) {
+	c.modelCollector.RecordModelError(model, endpoint, errorType)
+}
+
+func (c *Collector) GetModelStats() map[string]ports.ModelStats {
+	return c.modelCollector.GetModelStats()
+}
+
+func (c *Collector) GetModelEndpointStats() map[string]map[string]ports.EndpointModelStats {
+	return c.modelCollector.GetModelEndpointStats()
+}
+
+// Translator-specific tracking methods
+
+func (c *Collector) RecordTranslatorRequest(event ports.TranslatorRequestEvent) {
+	c.translatorCollector.Record(event)
+}
+
+func (c *Collector) GetTranslatorStats() map[string]ports.TranslatorStats {
+	return c.translatorCollector.GetStats()
+}
