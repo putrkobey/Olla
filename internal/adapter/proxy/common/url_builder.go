@@ -21,3 +21,75 @@ import (
 func BuildTargetURL(r *http.Request, endpoint *domain.Endpoint, proxyPrefix string) *url.URL {
 	targetPath := util.StripPrefix(r.URL.Path, proxyPrefix)
 	// A per-endpoint path is already the backend's own path: it carries no proxy prefix, and
+	// it replaces whatever path the request holds because that path was chosen for the fleet.
+	if paths, ok := r.Context().Value(constants.ContextEndpointPathMapKey).(map[string]string); ok {
+		if p, ok := paths[endpoint.GetURLString()]; ok && p != "" {
+			targetPath = p
+		}
+	}
+	if targetPath == "" {
+		targetPath = "/"
+	}
+
+	// preserve_path mode: ensure we don't let an absolute request path discard the endpoint prefix.
+	if endpoint.PreservePath && endpoint.URL.Path != "" && endpoint.URL.Path != "/" {
+		rel := strings.TrimPrefix(targetPath, "/") // avoid path.Join swallowing the base
+		joined := path.Join(endpoint.URL.Path, rel)
+
+		u := *endpoint.URL
+		u.Path = joined
+		u.RawQuery = r.URL.RawQuery
+		u.Fragment = ""
+		return &u
+	}
+
+	// Non-preserve mode: guard against traversal, including perbent-encoded dot segments.
+	// We accept that this also normalises repeated slashes.
+	if containsDotDot(targetPath) || containsEncodedDotDot(targetPath) {
+		// Clean relative to root to avoid escaping above it.
+		clean := path.Clean("/" + targetPath)
+		if clean == "" {
+			clean = "/"
+		}
+		targetPath = clean
+	}
+
+	// Fast path: endpoint has no base path.
+	if endpoint.URL.Path == "" || endpoint.URL.Path == "/" {
+		u := *endpoint.URL
+		u.Path = targetPath
+		u.RawQuery = r.URL.RawQuery
+		u.Fragment = ""
+		return &u
+	}
+
+	// Default: resolve against endpoint base.
+	u := endpoint.URL.ResolveReference(&url.URL{Path: targetPath})
+	u.RawQuery = r.URL.RawQuery // always copy; empty is fine
+	u.Fragment = ""
+	return u
+}
+
+// containsDotDot returns true if any decoded path segment is ".." or "."
+func containsDotDot(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." || seg == "." {
+			return true
+		}
+	}
+	return false
+}
+
+// containsEncodedDotDot detects %2e and %2E sequences forming "." or ".." segments.
+func containsEncodedDotDot(p string) bool {
+	// Fast check to avoid allocations when nothing is encoded.
+	if !strings.Contains(p, "%") {
+		return false
+	}
+	// Best-effort: decode once; if decoding fails, conservatively return true to trigger cleaning.
+	dec, err := url.PathUnescape(p)
+	if err != nil {
+		return true
+	}
+	return containsDotDot(dec)
+}
