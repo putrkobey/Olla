@@ -124,3 +124,129 @@ models:
       - "*Code*"
       - "*coder*"
   # Context window patterns for common Docker Hub models
+  context_patterns:
+    - pattern: "*llama-3.1*"
+      context: 131072
+    - pattern: "*llama-3*"
+      context: 8192
+    - pattern: "*smollm2*"
+      context: 8192
+    - pattern: "*gemma-2*"
+      context: 8192
+    - pattern: "*phi-3*"
+      context: 4096
+    - pattern: "*qwen*"
+      context: 32768
+    - pattern: "*mistral*"
+      context: 32768
+
+# Resource management — DMR uses llama.cpp/vLLM under the hood;
+# memory requirements mirror llama.cpp for GGUF models
+resources:
+  model_sizes:
+    - patterns: ["70b", "72b"]
+      min_memory_gb: 40
+      recommended_memory_gb: 48
+      min_gpu_memory_gb: 40
+      estimated_load_time_ms: 300000
+    - patterns: ["34b", "33b", "30b"]
+      min_memory_gb: 20
+      recommended_memory_gb: 24
+      min_gpu_memory_gb: 20
+      estimated_load_time_ms: 120000
+    - patterns: ["13b", "14b"]
+      min_memory_gb: 10
+      recommended_memory_gb: 16
+      min_gpu_memory_gb: 10
+      estimated_load_time_ms: 60000
+    # Checked before the 7b/8b bucket: "1.7b" contains "7b" on a word
+    # boundary (the "." counts as a separator), so it must resolve here
+    # first or it silently falls into the 7B bucket instead.
+    - patterns: ["1b", "1.5b", "1.7b"]
+      min_memory_gb: 2
+      recommended_memory_gb: 3
+      min_gpu_memory_gb: 2
+      estimated_load_time_ms: 10000
+    - patterns: ["7b", "8b"]
+      min_memory_gb: 6
+      recommended_memory_gb: 8
+      min_gpu_memory_gb: 6
+      estimated_load_time_ms: 30000
+    - patterns: ["3b"]
+      min_memory_gb: 3
+      recommended_memory_gb: 4
+      min_gpu_memory_gb: 3
+      estimated_load_time_ms: 15000
+
+  # Quantization multipliers (same as llama.cpp for GGUF models)
+  quantization:
+    multipliers:
+      q2: 0.35
+      q3: 0.45
+      q4: 0.50
+      q5: 0.625
+      q6: 0.75
+      q8: 0.875
+
+  defaults:
+    min_memory_gb: 4
+    recommended_memory_gb: 8
+    min_gpu_memory_gb: 4
+    requires_gpu: false  # Can run on CPU (Apple Silicon Metal or NVIDIA CUDA)
+    estimated_load_time_ms: 15000
+
+  concurrency_limits:
+    - min_memory_gb: 30
+      max_concurrent: 2
+    - min_memory_gb: 15
+      max_concurrent: 4
+    - min_memory_gb: 8
+      max_concurrent: 8
+    - min_memory_gb: 0
+      max_concurrent: 10
+
+  timeout_scaling:
+    base_timeout_seconds: 120
+    load_time_buffer: true
+
+# DMR-specific features
+features:
+  # Multi-engine support — DMR automatically routes GGUF models to llama.cpp
+  # and safetensors models to vLLM. Diffusers engine is available for image generation
+  # but not exposed via OpenAI-compatible paths.
+  multi_engine:
+    enabled: true
+    description: "Automatically routes GGUF to llama.cpp, safetensors to vLLM"
+    engines:
+      - llama.cpp
+      - vllm
+      # diffusers: image generation engine — no OpenAI-compatible API paths
+
+  # OCI model distribution
+  oci_distribution:
+    enabled: true
+    description: "Models distributed as OCI artifacts via Docker Hub"
+
+  # Hardware acceleration
+  hardware_acceleration:
+    enabled: true
+    backends:
+      - "Metal"   # Apple Silicon
+      - "CUDA"    # NVIDIA GPUs
+    description: "Automatic GPU acceleration when available"
+
+# Metrics extraction
+metrics:
+  extraction:
+    enabled: true
+    source: response_body
+    format: json
+    paths:
+      model: "$.model"
+      finish_reason: "$.choices[0].finish_reason"
+      input_tokens: "$.usage.prompt_tokens"
+      output_tokens: "$.usage.completion_tokens"
+      total_tokens: "$.usage.total_tokens"
+    calculations:
+      is_complete: 'len(finish_reason) > 0'
+      tokens_per_second: "total_ms > 0 ? (output_tokens * 1000.0) / total_ms : 0"

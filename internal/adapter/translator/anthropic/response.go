@@ -134,3 +134,139 @@ func (t *Translator) convertResponseContent(message map[string]interface{}, fini
 
 // map openai finish_reason to anthropic stop_reason
 // shared between normal and streaming paths
+func mapFinishReasonToStopReason(finishReason string) string {
+	switch finishReason {
+	case "stop":
+		return "end_turn"
+	case "tool_calls":
+		return contentTypeToolUse
+	case "length":
+		return "max_tokens"
+	default:
+		return "end_turn"
+	}
+}
+
+// convert openai tool_call to anthropic tool_use block
+// parses json args string into an object, logs errors but doesn't fail
+func (t *Translator) convertToToolUse(toolCall map[string]interface{}) *ContentBlock {
+	id, _ := toolCall["id"].(string)
+	function, ok := toolCall["function"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	name, _ := function["name"].(string)
+	argsStr, _ := function["arguments"].(string)
+
+	// openai sends args as json string, we need it as an object
+	var input map[string]interface{}
+	if err := json.Unmarshal([]byte(argsStr), &input); err != nil {
+		// use empty input if json is bad, don't fail the whole response
+		t.logger.Warn("Failed to parse tool arguments, using empty input",
+			"tool", name,
+			"tool_id", id,
+			"error", err,
+			"raw_arguments", util.TruncateString(argsStr, util.DefaultTruncateLengthPII),
+			"raw_arguments_len", len(argsStr))
+		input = make(map[string]interface{})
+	}
+
+	return &ContentBlock{
+		Type:  contentTypeToolUse,
+		ID:    id,
+		Name:  name,
+		Input: input,
+	}
+}
+
+// extractNonStreamingReasoning returns the non-empty reasoning text from an OpenAI message,
+// checking both field name variants used across backends:
+//   - "reasoning"         - Ollama, LM Studio, Lemonade
+//   - "reasoning_content" - vLLM, SGLang, DeepSeek
+func extractNonStreamingReasoning(message map[string]interface{}) string {
+	if v, ok := message["reasoning"].(string); ok && v != "" {
+		return v
+	}
+	if v, ok := message["reasoning_content"].(string); ok && v != "" {
+		return v
+	}
+	return ""
+}
+
+// map openai token counts to anthropic names
+func (t *Translator) convertUsage(usage map[string]interface{}) AnthropicUsage {
+	promptTokens := 0
+	completionTokens := 0
+
+	if pt, ok := usage["prompt_tokens"].(float64); ok {
+		promptTokens = int(pt)
+	}
+	if ct, ok := usage["completion_tokens"].(float64); ok {
+		completionTokens = int(ct)
+	}
+
+	return AnthropicUsage{
+		InputTokens:  promptTokens,
+		OutputTokens: completionTokens,
+	}
+}
+
+// grab model name from response, default to "unknown"
+func (t *Translator) extractModel(resp map[string]interface{}) string {
+	if model, ok := resp["model"].(string); ok {
+		return model
+	}
+	return "unknown"
+}
+
+// base58 charset, skips confusing chars like 0/O and I/l
+const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+// generate msg_01... ids like anthropic does
+// 16 random bytes encoded as base58 gives ~27-29 char ids
+func (t *Translator) generateMessageID() string {
+	randomBytes := make([]byte, 16)
+	if _, err := rand.Read(randomBytes); err != nil {
+		// crypto/rand shouldn't fail but just in case
+		t.logger.Warn("Failed to generate random bytes for message ID", "error", err)
+		return fmt.Sprintf("msg_01fallback%d", big.NewInt(0).SetBytes(randomBytes[:8]).Uint64())
+	}
+
+	encoded := encodeBase58(randomBytes)
+	return fmt.Sprintf("msg_01%s", encoded)
+}
+
+// encode bytes to base58, shorter and less ambigious than hex
+func encodeBase58(input []byte) string {
+	num := new(big.Int).SetBytes(input)
+
+	if num.Sign() == 0 {
+		return string(base58Alphabet[0])
+	}
+	var encoded []byte
+	base := big.NewInt(58)
+	zero := big.NewInt(0)
+	mod := new(big.Int)
+
+	for num.Cmp(zero) > 0 {
+		num.DivMod(num, base, mod)
+		encoded = append(encoded, base58Alphabet[mod.Int64()])
+	}
+
+	// preserve leading zeros as '1' chars
+	for _, b := range input {
+		if b == 0 {
+			encoded = append(encoded, base58Alphabet[0])
+		} else {
+			break
+		}
+	}
+
+	// reverse since we built it backwards
+	for i, j := 0, len(encoded)-1; i < j; i, j = i+1, j-1 {
+		encoded[i], encoded[j] = encoded[j], encoded[i]
+	}
+
+	return string(encoded)
+}
