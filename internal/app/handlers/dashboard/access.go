@@ -104,3 +104,110 @@ func accessMiddleware(cfg config.DashboardConfig, log logger.StyledLogger, next 
 	})
 }
 
+// hostAccepted: any Host that parses as an IP literal is accepted
+// unconditionally, regardless of allowed_hosts. A non-IP Host must appear in
+// the allowlist (case-insensitive, port-stripped on both sides).
+func hostAccepted(normalisedHost string, allowedHosts map[string]struct{}) bool {
+	if net.ParseIP(normalisedHost) != nil {
+		return true
+	}
+	_, ok := allowedHosts[normalisedHost]
+	return ok
+}
+
+// RegisterRoutes mounts the dashboard subtree on the registry, gated by
+// cfg.Enabled. When the dashboard is disabled the route is absent from the mux
+// entirely (default-mux 404), never registered-then-403, so external scanners
+// cannot discover the mount point. handler is the static-asset handler from
+// embed.go; it is wrapped by AccessMiddleware before registration so the policy
+// applies uniformly to /internal/ui/ and every sub-path.
+//
+// Both routes share one denial-log throttle, registered in set (nil is allowed) so
+// the caller can flush it at shutdown.
+//
+// Returns true if the dashboard was registered, false otherwise.
+func RegisterRoutes(registry *router.RouteRegistry, cfg config.DashboardConfig, log logger.StyledLogger, handler http.Handler, set *logger.ThrottleSet) bool {
+	if !cfg.Enabled {
+		return false
+	}
+	warnLog := newAccessWarnThrottle(log, nil, set)
+	guarded := accessMiddleware(cfg, log, handler, warnLog)
+	registry.RegisterWithMethod(DashboardRoute, http.HandlerFunc(guarded.ServeHTTP), "Admin dashboard (read-only)", "GET")
+
+	// Gated separately from DashboardRoute above: same policy, same security
+	// headers, but its own registration so ServeMux never gets the chance to
+	// answer this exact path before AccessMiddleware runs.
+	slashlessGuarded := accessMiddleware(cfg, log, http.HandlerFunc(redirectToDashboardRoot), warnLog)
+	registry.RegisterWithMethod(SlashlessDashboardRoute, http.HandlerFunc(slashlessGuarded.ServeHTTP), "Admin dashboard (redirect)", "GET")
+	return true
+}
+
+// redirectToDashboardRoot issues the canonical redirect to DashboardRoute for
+// a client AccessMiddleware has already approved. Security headers are set
+// explicitly because http.Redirect's response never passes through the
+// static-asset handler's own header-setting path.
+func redirectToDashboardRoot(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	http.Redirect(w, r, DashboardRoute, http.StatusTemporaryRedirect)
+}
+
+// normaliseHost strips a trailing :port from a host literal AND any IPv6
+// brackets, returning the bare host. SplitHostPort already drops brackets for
+// the IP:port case, but a bracketed literal with no port (e.g. an allowlist
+// entry "[::1]") reaches the fallback. Normalising both sides to the bare form
+// means a request Host of "[::1]:41141" compares equal to an allowlist entry of
+// "[::1]" or "::1" without the operator guessing which form the check expects.
+func normaliseHost(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		return host[1 : len(host)-1]
+	}
+	return host
+}
+
+// ipInAnyCIDR reports whether ip is inside any of the parsed CIDRs. A nil or
+// empty CIDR slice is a deny-all (Validate guarantees a non-empty slice when
+// enabled, but defence-in-depth: never silently allow).
+func ipInAnyCIDR(ip string, cidrs []*net.IPNet) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, c := range cidrs {
+		if c.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// reject writes the self-diagnosing 403 response. The body names the failed
+// check, echoes the rejected client IP and Host, and names the config keys to
+// adjust (dashboard.access_policy.allowed_hosts / allowed_cidrs), so the
+// operator reading the response (or a support transcript of it) can see
+// exactly what to fix without re-reading YAML. The matching Warn log line
+// carries the same detail for the observability path, plus configKey - the
+// single config key relevant to this specific reason (unlike the body, which
+// names both generically) - so the operator doesn't have to guess which of
+// the two policy knobs actually applies. Plain text, no JSON: this is an
+// operational diagnostic, not an API response.
+func reject(w http.ResponseWriter, log logger.StyledLogger, warnLog *logger.Throttle, reason, configKey, clientIP, host string) {
+	body := strings.NewReader("403 forbidden: " + reason + " (ip=" + clientIP + ", host=" + host + "). Adjust dashboard.access_policy.allowed_hosts (or allowed_cidrs) in your config.\n")
+	// Hardening headers apply to every dashboard response path, including
+	// this 403: the body is operator-facing text that must not be frameable,
+	// sniffable, or referrer-leaked. setSecurityHeaders is shared with
+	// embed.go so the policy is identical across the handler tree.
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = io.Copy(w, body)
+	if log != nil && warnLog.Allow(clientIP) {
+		log.Warn("dashboard access denied",
+			"reason", reason,
+			"config_key", configKey,
+			"client_ip", clientIP,
+			"host", host)
+	}
+}
