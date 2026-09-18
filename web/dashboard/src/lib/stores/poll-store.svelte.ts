@@ -78,3 +78,84 @@ export function createPollStore<T>(opts: PollStoreOptions<T>): PollStore<T> {
     }
 
     let body: T;
+    try {
+      body = (await resp.json()) as T;
+    } catch {
+      onFailure(new Error('invalid JSON from status API'));
+      return;
+    }
+
+    const newEtag = resp.headers.get('ETag');
+    if (newEtag) etag = newEtag;
+
+    onSuccess(body);
+  }
+
+  // Shared by the 200 and 304 branches. A null body (304 path) leaves the
+  // cached data untouched but still advances the success clock.
+  function onSuccess(body: T | null): void {
+    if (body !== null) data = body;
+    error = null;
+    status = 'ok';
+    lastUpdated = new Date();
+    lastSuccessAt = Date.now();
+    onTick?.(body, true);
+  }
+
+  function onFailure(err: Error): void {
+    error = err;
+    const hasPrior = data !== null;
+    const ageMs = Date.now() - lastSuccessAt;
+    // Once the last success is older than 3x the interval (several consecutive
+    // failures), escalate from error to stale.
+    if (hasPrior && ageMs > intervalMs * STALE_MULTIPLIER) {
+      status = 'stale';
+    } else {
+      // First-ever poll failed or still within the stale window: we want the
+      // panel to surface the error rather than sit on a blank skeleton.
+      status = 'error';
+    }
+    onTick?.(null, false);
+  }
+
+  // Register with the shared scheduler. Caller (App.svelte) starts it.
+  pollScheduler.register(name, intervalMs, tick);
+
+  return {
+    get name() {
+      return name;
+    },
+    get intervalMs() {
+      return intervalMs;
+    },
+    get data() {
+      return data;
+    },
+    get status() {
+      return status;
+    },
+    get error() {
+      return error;
+    },
+    get lastUpdated() {
+      return lastUpdated;
+    },
+    /** True if the store has at least one successful poll under its belt. */
+    get hasData() {
+      return data !== null;
+    },
+    /** Activate the scheduler job and fire an immediate tick. Called by the
+     *  owning panel on mount so a tab switch doesn't sit on stale data. */
+    start() {
+      pollScheduler.start(name);
+    },
+    /** Deactivate the scheduler job; in-flight ticks are aborted by the scheduler. */
+    stop() {
+      pollScheduler.stop(name);
+    },
+    /** Force an immediate refresh (used by "retry now" buttons). */
+    refresh() {
+      pollScheduler.refresh(name);
+    },
+  };
+}
