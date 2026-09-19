@@ -86,3 +86,179 @@
       if (b.family === 'unknown') return -1;
       return a.family < b.family ? -1 : a.family > b.family ? 1 : 0;
     });
+  }
+
+  // rowKey is the each-key for the flat path; domId is the DOM id attribute
+  // the grouped view sets manually below. Both use the collision-resistant stableId hash
+  // (lib/dom-id) rather than the old punctuation-stripping slug, so two
+  // model names that collide once slugged ("qwen3:8b" vs a hypothetical
+  // "qwen3-8b") cannot resolve to the same DOM id. SortableTable additionally
+  // disambiguates any each-key collision as a last line of defence.
+  function rowKey(m: ModelRow): string {
+    return m.name;
+  }
+  function domId(m: ModelRow): string {
+    return `model-${stableId(m.name)}`;
+  }
+
+  const orderedGroups = $derived(groupOrder(groups));
+
+  // Empty rows literal typed against ModelRow so the generic table infers
+  // Row = ModelRow. Without this, `rows={[]}` collapses inference to `never`
+  // and the groupSnippet's sortRows(list: never[]) cannot accept the
+  // normalised model list.
+  const emptyRows: ModelRow[] = [];
+  const flatInitialSort: SortState = { key: 'name', dir: 'asc' };
+</script>
+
+<div
+  id="panel-models"
+  class="panel is-active"
+  role="tabpanel"
+  aria-labelledby="tab-models"
+  tabindex="0"
+>
+  <StatusBanner store={models} />
+
+  <!-- data-state lives on this inner wrapper, not the panel root: opacity/
+       filter on an ancestor compound down the subtree, so putting it on the
+       root would also dim the StatusBanner and its retry control - the UI
+       the operator needs most during an outage. -->
+  <div
+    class="panel-data"
+    data-state={models.status === 'error' || models.status === 'stale' ? models.status : null}
+  >
+  {#if loading}
+    <div class="table-scroll"><div class="scroll-hint">loading…</div>
+      {#each Array(6) as _, i}<div class="skeleton row-skel" style="margin:6px 10px"></div>{/each}
+    </div>
+  {:else if orderedGroups.length}
+    <SortableTable
+      {columns}
+      rows={emptyRows}
+      initialSort={null}
+      showScrollHint={true}
+    >
+      {#snippet groupSnippet({ sortRows, cellClass })}
+        <!-- The grouped layout is rendered by iterating families here; each
+             group's own row list is run through sortRows() so a header click
+             (which flips the table's aria-sort) actually reorders rows,
+             instead of only flipping the indicator. -->
+        {#each orderedGroups as group (group.family)}
+          {@const normalised = group.models.map(normalise)}
+          {@const sorted = sortRows(normalised)}
+          <tr class="family-row">
+            <th colspan={columns.length} scope="rowgroup">
+              {group.family}
+              <span class="family-count">{group.model_count} model{group.model_count === 1 ? '' : 's'} · {group.endpoints.length} endpoint{group.endpoints.length === 1 ? '' : 's'}</span>
+            </th>
+          </tr>
+          {#each sorted as m (m.name)}
+            <tr id={domId(m)}>
+              <td class="col-sticky">
+                <strong>{m.name}</strong>
+                {#if m.aliases?.length}
+                  <div class="model-aliases">{m.aliases.join(', ')}</div>
+                {/if}
+              </td>
+              <td>{m.params || '—'}</td>
+              <td>{m.quant || '—'}</td>
+              <td class={cellClass('size_bytes')}>{m.size || '—'}</td>
+              <td class={cellClass('endpoints_count')}>
+                {#if m.endpoints?.length}
+                  <div class="endpoint-pills">
+                    {#each m.endpoints as ep, i}
+                      {@const id = m.endpoint_ids?.[i]}
+                      {#if id}
+                        <button
+                          type="button"
+                          class="pill pill-link"
+                          data-endpoint-id={id}
+                          title="Open {ep} in the Endpoints panel"
+                          onclick={() => jumpToEndpoint(id)}
+                        >{ep}</button>
+                      {:else}
+                        <span class="pill">{ep}</span>
+                      {/if}
+                    {/each}
+                  </div>
+                {:else}
+                  <span class="dash">0</span>
+                {/if}
+              </td>
+              <td>{fmtAgo(m.last_seen_at, now) || 'never'}</td>
+            </tr>
+          {/each}
+        {/each}
+      {/snippet}
+    </SortableTable>
+  {:else if flatRecent.length}
+    <SortableTable {columns} rows={flatRecent.map(normalise)} initialSort={flatInitialSort} rowId={rowKey}>
+      {#snippet rowSnippet({ row: m, cellClass })}
+        <td class="col-sticky">
+          <strong>{m.name}</strong>
+          {#if m.aliases?.length}
+            <div class="model-aliases">{m.aliases.join(', ')}</div>
+          {/if}
+        </td>
+        <td>{m.params || '—'}</td>
+        <td>{m.quant || '—'}</td>
+        <td class={cellClass('size_bytes')}>{m.size || '—'}</td>
+        <td class={cellClass('endpoints_count')}>
+          {#if m.endpoints?.length}
+            <div class="endpoint-pills">
+              {#each m.endpoints as ep, i}
+                {@const id = m.endpoint_ids?.[i]}
+                {#if id}
+                  <button
+                    type="button"
+                    class="pill pill-link"
+                    data-endpoint-id={id}
+                    title="Open {ep} in the Endpoints panel"
+                    onclick={() => jumpToEndpoint(id)}
+                  >{ep}</button>
+                {:else}
+                  <span class="pill">{ep}</span>
+                {/if}
+              {/each}
+            </div>
+          {:else}<span class="dash">0</span>{/if}
+        </td>
+        <td>{fmtAgo(m.last_seen_at, now) || 'never'}</td>
+      {/snippet}
+    </SortableTable>
+  {:else if models.hasData}
+    <!-- Gated on hasData (data !== null), not just "groups/flatRecent are
+         empty": a failed fetch also leaves both empty, and without this
+         guard the empty-state copy rendered alongside StatusBanner's error,
+         telling the operator "no models" when the real story was "the
+         request failed". -->
+    <p class="panel-intro">No models discovered yet. Once backends respond to discovery, models will appear here.</p>
+  {/if}
+  </div>
+</div>
+
+<style>
+  /* Clickable pill: visually identical to the plain span pill at rest, with a
+     quiet accent hover and the shared focus ring so keyboard users see where
+     focus landed. Background/font reset because <button> ships its own. */
+  .pill-link {
+    cursor: pointer;
+    background: transparent;
+    font: inherit;
+  }
+  .pill-link:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .pill-link:focus-visible {
+    outline: var(--focus-ring);
+    outline-offset: 1px;
+  }
+  /* Quiet alias subtext under the model name in the sticky cell. */
+  .model-aliases {
+    font-size: 0.65rem;
+    color: var(--text-faint);
+    font-weight: normal;
+  }
+</style>
