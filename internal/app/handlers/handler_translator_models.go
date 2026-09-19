@@ -105,3 +105,111 @@ func (a *Application) translatorModelsHandler(trans translator.RequestTranslator
 		} else {
 			a.writeTranslatorModelsError(w, trans, "unified models not supported")
 			return
+		}
+
+		// skip unhealthy models for endpoint response
+		healthyModels, err := a.filterModelsByHealth(ctx, unifiedModels)
+		if err != nil {
+			a.writeTranslatorModelsError(w, trans, "failed to filter models by health")
+			return
+		}
+
+		// Cache hit: the model set has not changed since the last build.
+		// GetUnifiedModels + filterModelsByHealth above are still called on every
+		// request so we always have fresh health data for the fingerprint, but the
+		// expensive JSON encoding and map allocation are skipped on a hit.
+		fp := modelSetFingerprint(healthyModels)
+		if body := cache.get(fp); body != nil {
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
+		}
+
+		// Cache miss: build the Anthropic-format response and store it.
+		response := a.convertModelsToAnthropicFormat(healthyModels)
+		body, err := json.Marshal(response)
+		if err != nil {
+			a.writeTranslatorModelsError(w, trans, "failed to encode models response")
+			return
+		}
+		cache.set(fp, body)
+
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}
+}
+
+// convertModelsToAnthropicFormat emits the Anthropic GET /v1/models wire format.
+// The SDK uses "type" as a deserialise discriminator so it must be "model", not "chat".
+// "display_name" and "created_at" (RFC3339) match the published Anthropic spec.
+func (a *Application) convertModelsToAnthropicFormat(models []*domain.UnifiedModel) map[string]interface{} {
+	data := make([]map[string]interface{}, 0, len(models))
+
+	for _, model := range models {
+		// prefer the first alias as the canonical id clients send back to us
+		modelID := model.ID
+		if len(model.Aliases) > 0 {
+			modelID = model.Aliases[0].Name
+		}
+
+		entry := map[string]interface{}{
+			"type":         "model",
+			"id":           modelID,
+			"display_name": modelID,
+			"created_at":   processStartTime,
+		}
+
+		data = append(data, entry)
+	}
+
+	// first_id / last_id are null when the list is empty
+	var firstID, lastID interface{}
+	if len(data) > 0 {
+		firstID = data[0]["id"]
+		lastID = data[len(data)-1]["id"]
+	}
+
+	return map[string]interface{}{
+		"data":     data,
+		"has_more": false,
+		"first_id": firstID,
+		"last_id":  lastID,
+	}
+}
+
+// send error response for models endpoint. All failure paths here are 500s —
+// either the registry is unavailable or JSON encoding failed, both of which are
+// internal failures rather than client errors.
+func (a *Application) writeTranslatorModelsError(w http.ResponseWriter, trans translator.RequestTranslator, message string) {
+	a.logger.Error("Translator models request failed",
+		"translator", trans.Name(),
+		"error", message)
+
+	// use custom error format or fallback to generic
+	if errorWriter, ok := trans.(translator.ErrorWriter); ok {
+		errorWriter.WriteError(w, err{message: message}, http.StatusInternalServerError)
+		return
+	}
+
+	errorResp := map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": message,
+			"type":    "models_error",
+		},
+	}
+
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.WriteHeader(http.StatusInternalServerError)
+	json.NewEncoder(w).Encode(errorResp)
+}
+
+// minimal error type for response handling
+type err struct {
+	message string
+}
+
+func (e err) Error() string {
+	return e.message
+}
