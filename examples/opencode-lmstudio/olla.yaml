@@ -49,3 +49,54 @@ discovery:
       # LM Studio endpoint - adjust URL based on your platform
       #
       # Windows/Mac: use host.docker.internal to reach the host
+      - url: "http://host.docker.internal:1234"
+        name: "lm-studio"
+        type: "lm-studio"
+        priority: 100
+        model_url: "/api/v0/models"
+        health_check_url: "/v1/models"
+        check_interval: 2s
+        check_timeout: 1s
+
+      # Linux: use the Docker bridge IP (uncomment and comment above if on Linux)
+      # - url: "http://172.17.0.1:1234"
+      #   name: "lm-studio"
+      #   type: "lm-studio"
+      #   priority: 100
+      #   model_url: "/api/v0/models"
+      #   health_check_url: "/v1/models"
+      #   check_interval: 2s
+      #   check_timeout: 1s
+
+      # Note: LM Studio typically runs on port 1234.
+      # Enable the server in Developer -> Server -> Start Server.
+
+  model_discovery:
+    enabled: true
+    interval: 5m
+    timeout: 30s
+    concurrent_workers: 5
+    retry_attempts: 3
+    retry_backoff: 1s
+
+model_registry:
+  type: "memory"
+  enable_unifier: true
+  unification:
+    stale_threshold: 24h  # how long to keep models in memory after last seen
+    cleanup_interval: 10m  # how often to check for stale models
+
+# Anthropic Messages API translation (enabled by default).
+# Leave this on so the /olla/anthropic/v1 endpoint is also available.
+translators:
+  anthropic:
+    enabled: true
+    max_message_size: 10485760  # 10MB - Anthropic API limit
+
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json"  # json, text
+  output: "stdout"  # stdout, file
+
+engineering:
+  show_nerdstats: false
