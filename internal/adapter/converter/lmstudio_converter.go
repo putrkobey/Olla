@@ -41,3 +41,46 @@ func (c *LMStudioConverter) GetFormatName() string {
 }
 
 func (c *LMStudioConverter) ConvertToFormat(models []*domain.UnifiedModel, filters ports.ModelFilters) (interface{}, error) {
+	filtered := filterModels(models, filters)
+
+	data := make([]LMStudioModelData, 0, len(filtered))
+	for _, model := range filtered {
+		lmModel := c.convertModel(model)
+		if lmModel != nil {
+			data = append(data, *lmModel)
+		}
+	}
+
+	return LMStudioModelResponse{
+		Object: "list",
+		Data:   data,
+	}, nil
+}
+
+func (c *LMStudioConverter) convertModel(model *domain.UnifiedModel) *LMStudioModelData {
+	helper := c.BaseConverter.NewConversionHelper(model)
+
+	if helper.ShouldSkip() {
+		return nil
+	}
+
+	// Determine model type
+	modelType := helper.GetModelType("llm")
+
+	// Extract publisher from metadata
+	publisher := helper.GetMetadataString("publisher")
+	if publisher == "" {
+		publisher = helper.GetMetadataString("vendor")
+	}
+
+	return &LMStudioModelData{
+		ID:               helper.Alias,
+		Object:           "model",
+		Type:             modelType,
+		Publisher:        publisher,
+		Arch:             model.Family,
+		Quantization:     denormalizeQuantization(model.Quantization),
+		State:            helper.GetState("not-loaded"),
+		MaxContextLength: model.MaxContextLength,
+	}
+}
