@@ -18,3 +18,23 @@
 
   interface Props {
     columns: Column[];
+    groups: FixtureGroup[];
+  }
+  let { columns, groups }: Props = $props();
+</script>
+
+<SortableTable {columns} rows={[] as FixtureRow[]} initialSort={null} showScrollHint={false}>
+  {#snippet groupSnippet({ sortRows })}
+    {#each groups as group (group.id)}
+      <tr class="family-row" data-testid="group-header" data-group={group.id}>
+        <th colspan={columns.length}>{group.id}</th>
+      </tr>
+      {#each sortRows(group.rows) as row (row.id)}
+        <tr data-testid="row" data-group={group.id} data-id={row.id}>
+          <td>{row.name}</td>
+          <td class="num">{row.n}</td>
+        </tr>
+      {/each}
+    {/each}
+  {/snippet}
+</SortableTable>
