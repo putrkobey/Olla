@@ -74,3 +74,155 @@ markdown_extensions:
   - abbr
   - admonition
   - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.magiclink:
+      normalize_issue_symbols: true
+      repo_url_shorthand: true
+      user: thushan
+      repo: olla
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets:
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+plugins:
+  - search:
+      separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+  - minify:
+      minify_html: true
+
+nav:
+  - Home: 
+      - Overview: index.md
+      - Demo: demo.md
+      - FAQ: faq.md
+      - Notes: notes/overview.md
+      - Usage: usage.md
+      - Release Notes: about/release-notes.md
+      - About: about.md
+      - Compare:
+        - Overview: compare/overview.md
+        - Patterns: compare/integration-patterns.md
+        - vs GpuStack: compare/gpustack.md
+        - vs LiteLLM: compare/litellm.md
+        - vs LocalAI: compare/localai.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quick Start: getting-started/quickstart.md
+      - Configuration: configuration/overview.md
+  - Concepts:
+      - Overview: concepts/overview.md
+      - Load Balancing: concepts/load-balancing.md
+      - Sticky Sessions: concepts/sticky-sessions.md
+      - Model Routing: concepts/model-routing.md
+      - Model Aliases: concepts/model-aliases.md
+      - Model Unification: concepts/model-unification.md
+      - Health Checking: concepts/health-checking.md
+      - API Translation: concepts/api-translation.md
+      - Proxy Engines:
+          - Overview: concepts/proxy-engines.md
+          - Proxy Profiles: concepts/proxy-profiles.md
+      - Profile System:
+          - Overview: concepts/profile-system.md
+          - Provider Metrics: concepts/provider-metrics.md
+  - Configuration:
+      - Overview: configuration/overview.md
+      - Admin Dashboard: configuration/dashboard.md
+      - Endpoint Auth: configuration/endpoint-auth.md
+      - Remote Backends (Experimental): configuration/endpoint-auth-remote.md
+      - Filters: configuration/filters.md
+      - Reference: configuration/reference.md
+      - Examples: configuration/examples.md
+      - Best Practices:
+          - Overview: configuration/practices/overview.md
+          - Configuration: configuration/practices/configuration.md
+          - Security: configuration/practices/security.md
+          - Rate Limits: configuration/practices/rate-limits.md
+          - Performance: configuration/practices/performance.md
+          - Monitoring: configuration/practices/monitoring.md
+  - Integrations:
+        - Overview: integrations/overview.md
+        - Backends:
+            - Ollama: integrations/backend/ollama.md
+            - LM Studio: integrations/backend/lmstudio.md
+            - LMDeploy: integrations/backend/lmdeploy.md
+            - vLLM: integrations/backend/vllm.md
+            - vLLM-MLX: integrations/backend/vllm-mlx.md
+            - SGLang: integrations/backend/sglang.md
+            - Lemonade SDK: integrations/backend/lemonade.md
+            - LiteLLM: integrations/backend/litellm.md
+            - llama.cpp: integrations/backend/llamacpp.md
+            - Docker Model Runner: integrations/backend/docker-model-runner.md
+            - oMLX: integrations/backend/omlx.md
+            - Text Embeddings Inference: integrations/backend/text-embeddings-inference.md
+        - Frontends:
+            - OpenWebUI + Ollama: integrations/frontend/openwebui.md
+            - OpenWebUI + OpenAI: integrations/frontend/openwebui-openai.md
+        - Agents:
+            - Claude Code: integrations/frontend/claude-code.md
+            - OpenCode: integrations/frontend/opencode.md
+            - Crush CLI: integrations/frontend/crush-cli.md
+            - Hermes Agent: integrations/frontend/hermes-agent.md
+        - API Translation:
+            - Anthropic: integrations/api-translation/anthropic.md
+  - Development:
+      - Overview: development/overview.md
+      - Setup: development/setup.md
+      - Architecture: development/architecture.md
+      - Patterns: development/patterns.md
+      - Circuit Breaker: development/circuit-breaker.md
+      - Contributing: development/contributing.md
+      - Testing: development/testing.md
+      - Validation Harness: development/validation.md
+      - Benchmarking: development/benchmarking.md
+      - Notes:
+          - Anthropic Inspector: notes/anthropic-inspector.md
+  - API Reference:
+      - Overview: api-reference/overview.md
+      - System Endpoints: api-reference/system.md
+      - Unified Models: api-reference/models.md
+      - Provider APIs:
+          - Ollama: api-reference/ollama.md
+          - LM Studio: api-reference/lmstudio.md
+          - LMDeploy: api-reference/lmdeploy.md
+          - vLLM: api-reference/vllm.md
+          - vLLM-MLX: api-reference/vllm-mlx.md
+          - SGLang: api-reference/sglang.md
+          - Lemonade SDK: api-reference/lemonade.md
+          - LiteLLM: api-reference/litellm.md
+          - llama.cpp: api-reference/llamacpp.md
+          - Docker Model Runner: api-reference/docker-model-runner.md
+          - oMLX: api-reference/omlx.md
+          - OpenAI: api-reference/openai.md
+          - Text Embeddings Inference: api-reference/text-embeddings-inference.md
+      - Translated APIs:
+          - Anthropic Messages: api-reference/anthropic.md
