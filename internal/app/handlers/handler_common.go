@@ -43,3 +43,93 @@ func extractProviderFromPath(path string) (provider string, remainingPath string
 
 	provider = withoutPrefix[:slashIdx]
 	remainingPath = withoutPrefix[slashIdx:]
+
+	// normalise the provider name to canonical form
+	provider = NormaliseProviderType(provider)
+
+	return provider, remainingPath, true
+}
+
+// modifyRequestPath updates the request path for backend routing.
+// preserves the original path in context for logging/debugging
+func (a *Application) modifyRequestPath(r *http.Request, newPath string) *http.Request {
+	// store original path for reference
+	ctx := context.WithValue(r.Context(), constants.ContextOriginalPathKey, r.URL.Path)
+
+	// update path
+	r.URL.Path = newPath
+	if r.URL.RawPath != "" {
+		r.URL.RawPath = newPath
+	}
+
+	return r.WithContext(ctx)
+}
+
+// staticSupportedProviders is the single source of truth for provider types
+// recognised when the profile factory isn't available - test contexts and the
+// hardcoded route registration in registerStaticProviderRoutes. Production
+// always goes through the profile factory (loaded from config/profiles/*.yaml);
+// this list only matters for that fallback path.
+//
+// Three call sites used to each keep their own copy of this list - getStaticProviders
+// (server_routes.go), isProviderSupported's fallback (below) and createProviderProfile's
+// OpenAI-compatible fallback (handler_provider_common.go) - and they drifted:
+// LMDeploy, SGLang, DMR and OMLX were inconsistently present across the three.
+var staticSupportedProviders = []string{
+	constants.ProviderTypeLemonade,
+	constants.ProviderTypeOllama,
+	constants.ProviderTypeLMStudio,
+	constants.ProviderTypeOpenAI,
+	constants.ProviderTypeLMDeploy,
+	constants.ProviderTypeSGLang,
+	constants.ProviderTypeVLLM,
+	constants.ProviderTypeOMLX,
+	constants.ProviderTypeDockerMR,
+	constants.ProviderTypeTextEmbeddingsInference,
+}
+
+// isStaticSupportedProvider reports whether provider (already normalised) is
+// one of staticSupportedProviders.
+func isStaticSupportedProvider(provider string) bool {
+	for _, p := range staticSupportedProviders {
+		if p == provider {
+			return true
+		}
+	}
+	return false
+}
+
+// isProviderSupported checks if a provider type is valid using the profile factory
+func (a *Application) isProviderSupported(provider string) bool {
+	// normalise first to handle variations
+	normalised := NormaliseProviderType(provider)
+
+	// use profile factory to validate if this is a known provider type
+	if a.profileFactory != nil {
+		return a.profileFactory.ValidateProfileType(normalised)
+	}
+
+	// fallback for tests when profile factory is not available
+	return isStaticSupportedProvider(normalised)
+}
+
+// getProviderPrefix returns the canonical /olla/<provider> prefix (no trailing slash) for strip-and-forward routing.
+func getProviderPrefix(provider string) string {
+	return constants.DefaultOllaProxyPathPrefix + provider
+}
+
+// getRawProviderPrefix extracts the /olla/<provider> prefix (no trailing slash) from the incoming request path.
+// Unlike getProviderPrefix, this preserves the original spelling used by the caller
+// (e.g., /olla/lmstudio rather than /olla/lm-studio) so that path stripping works
+// even when the caller uses an alias spelling.
+func getRawProviderPrefix(path string) string {
+	if !strings.HasPrefix(path, constants.DefaultOllaProxyPathPrefix) {
+		return constants.DefaultOllaProxyPathPrefix
+	}
+	withoutBase := strings.TrimPrefix(path, constants.DefaultOllaProxyPathPrefix)
+	slashIdx := strings.Index(withoutBase, constants.DefaultPathPrefix)
+	if slashIdx == -1 {
+		return constants.DefaultOllaProxyPathPrefix + withoutBase
+	}
+	return constants.DefaultOllaProxyPathPrefix + withoutBase[:slashIdx]
+}

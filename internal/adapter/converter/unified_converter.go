@@ -69,3 +69,146 @@ func (c *UnifiedConverter) ConvertToFormat(models []*domain.UnifiedModel, filter
 	return UnifiedModelResponse{
 		Object: "list",
 		Data:   data,
+	}, nil
+}
+
+func (c *UnifiedConverter) convertModel(model *domain.UnifiedModel) UnifiedModelData {
+	availability := make([]EndpointStatus, 0, len(model.SourceEndpoints))
+	for _, ep := range model.SourceEndpoints {
+		availability = append(availability, EndpointStatus{
+			Endpoint: ep.EndpointName, // Use endpoint name instead of URL
+			State:    ep.State,
+		})
+	}
+	// OLLA-85: [Unification] Models with different digests fail to unify correctly.
+	// we need to use first alas as ID for routing compatibility
+	// to make sure the returned model ID can be used for requests
+	modelID := model.ID
+	if len(model.Aliases) > 0 {
+		modelID = model.Aliases[0].Name
+	}
+
+	return UnifiedModelData{
+		ID:      modelID,
+		Object:  "model",
+		Created: time.Now().Unix(),
+		OwnedBy: "olla",
+		Olla: &OllaExtensions{
+			Family:           model.Family,
+			Variant:          model.Variant,
+			Type:             ModelKind(model),
+			ParameterSize:    model.ParameterSize,
+			Quantization:     model.Quantization,
+			Aliases:          model.GetAliasStrings(),
+			Availability:     availability,
+			Capabilities:     model.Capabilities,
+			MaxContextLength: model.MaxContextLength,
+			PromptTemplateID: model.PromptTemplateID,
+		},
+	}
+}
+
+// filterModels applies the specified filters to the models
+func filterModels(models []*domain.UnifiedModel, filters ports.ModelFilters) []*domain.UnifiedModel {
+	if filters.Endpoint == "" && filters.Available == nil && filters.Family == "" && filters.Type == "" && filters.Capability == "" {
+		return models
+	}
+
+	filtered := make([]*domain.UnifiedModel, 0, len(models))
+	for _, model := range models {
+		if !matchesFilters(model, filters) {
+			continue
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
+}
+
+// matchesFilters checks if a model matches all specified filters
+func matchesFilters(model *domain.UnifiedModel, filters ports.ModelFilters) bool {
+	if !matchesEndpointFilter(model, filters.Endpoint) {
+		return false
+	}
+
+	if !matchesAvailabilityFilter(model, filters.Available) {
+		return false
+	}
+
+	if !matchesFamilyFilter(model, filters.Family) {
+		return false
+	}
+
+	if !matchesTypeFilter(model, filters.Type) {
+		return false
+	}
+
+	if !matchesCapabilityFilter(model, filters.Capability) {
+		return false
+	}
+
+	return true
+}
+
+func matchesEndpointFilter(model *domain.UnifiedModel, endpoint string) bool {
+	if endpoint == "" {
+		return true
+	}
+
+	for _, ep := range model.SourceEndpoints {
+		if ep.EndpointURL == endpoint {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAvailabilityFilter(model *domain.UnifiedModel, available *bool) bool {
+	if available == nil {
+		return true
+	}
+
+	isAvailable := false
+	for _, ep := range model.SourceEndpoints {
+		if ep.State == "loaded" {
+			isAvailable = true
+			break
+		}
+	}
+	return *available == isAvailable
+}
+
+func matchesFamilyFilter(model *domain.UnifiedModel, family string) bool {
+	return family == "" || model.Family == family
+}
+
+// matchesTypeFilter selects on the same ModelKind the response reports as
+// olla.type, so the filter and the field it filters on cannot disagree. Capability
+// matching on top of that would only contradict the reported kind: an embedder
+// that picks up "chat" from an "instruct" name would still be listed under llm.
+func matchesTypeFilter(model *domain.UnifiedModel, filterType string) bool {
+	return filterType == "" || ModelKind(model) == filterType
+}
+
+// matchesCapabilityFilter is deliberately wider than the kind filter: "chat"
+// matches every model that can chat or complete, vision models included.
+func matchesCapabilityFilter(model *domain.UnifiedModel, capability string) bool {
+	switch capability {
+	case "":
+		return true
+	case "chat":
+		// text-generation is what a vision model carries instead of chat
+		return hasCapability(model.Capabilities, "chat") || hasCapability(model.Capabilities, "completion") ||
+			hasCapability(model.Capabilities, "text-generation")
+	default:
+		return hasCapability(model.Capabilities, capability)
+	}
+}
+
+func hasCapability(capabilities []string, capability string) bool {
+	for _, c := range capabilities {
+		if c == capability {
+			return true
+		}
+	}
+	return false
+}
