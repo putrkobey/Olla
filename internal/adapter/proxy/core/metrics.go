@@ -42,3 +42,47 @@ func ExtractProviderMetrics(
 	// Minimal debug logging for metrics extraction results
 	// The logger implementation will handle whether to actually log based on level
 	if stats.ProviderMetrics != nil {
+		pm := stats.ProviderMetrics
+		rlog.Debug("Metrics extracted",
+			"engine", engineName,
+			"tokens", pm.TotalTokens)
+	}
+}
+
+// AppendProviderMetricsToLog appends provider metrics fields to log fields array.
+// Used by both proxy engines for consistent logging.
+func AppendProviderMetricsToLog(logFields []interface{}, pm *domain.ProviderMetrics) []interface{} {
+	if pm == nil {
+		return logFields
+	}
+
+	if pm.InputTokens > 0 {
+		logFields = append(logFields, "input_tokens", pm.InputTokens)
+	}
+	if pm.OutputTokens > 0 {
+		logFields = append(logFields, "output_tokens", pm.OutputTokens)
+	}
+	if pm.TotalTokens > 0 {
+		logFields = append(logFields, "total_tokens", pm.TotalTokens)
+	}
+	if pm.TokensPerSecond > 0 {
+		logFields = append(logFields, "tokens_per_sec", pm.TokensPerSecond)
+	}
+	if pm.TTFTMs > 0 {
+		logFields = append(logFields, "ttft_ms", pm.TTFTMs)
+	}
+	if pm.PromptMs > 0 {
+		logFields = append(logFields, "prompt_ms", pm.PromptMs)
+	}
+	if pm.GenerationMs > 0 {
+		logFields = append(logFields, "generation_ms", pm.GenerationMs)
+	}
+	if pm.Model != "" {
+		logFields = append(logFields, "provider_model", pm.Model)
+	}
+	if pm.FinishReason != "" {
+		logFields = append(logFields, "finish_reason", pm.FinishReason)
+	}
+
+	return logFields
+}
