@@ -208,3 +208,844 @@ func TestCopyHeaders_ProxyHeaders(t *testing.T) {
 			expectedRealIP:         "", // Should not be set due to error
 		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create original request
+			originalReq := httptest.NewRequest("GET", "http://example.com/test", nil)
+			originalReq.Host = "example.com"
+			originalReq.RemoteAddr = tt.remoteAddr
+
+			if tt.tls {
+				originalReq.TLS = &tls.ConnectionState{}
+			}
+
+			// Add headers
+			for k, values := range tt.originalHeaders {
+				for _, v := range values {
+					originalReq.Header.Add(k, v)
+				}
+			}
+
+			// Create proxy request
+			proxyReq := httptest.NewRequest("GET", "http://backend.com/test", nil)
+
+			// Copy headers
+			CopyHeaders(proxyReq, originalReq, nil)
+
+			// Check forwarded headers
+			if tt.expectedForwardedFor != "" {
+				assert.Equal(t, tt.expectedForwardedFor, proxyReq.Header.Get("X-Forwarded-For"))
+			}
+
+			if tt.expectedForwardedProto != "" {
+				assert.Equal(t, tt.expectedForwardedProto, proxyReq.Header.Get("X-Forwarded-Proto"))
+			}
+
+			if tt.expectedForwardedHost != "" {
+				assert.Equal(t, tt.expectedForwardedHost, proxyReq.Header.Get("X-Forwarded-Host"))
+			}
+
+			if tt.expectedRealIP != "" {
+				assert.Equal(t, tt.expectedRealIP, proxyReq.Header.Get("X-Real-IP"))
+			}
+
+			if tt.expectedVia != "" {
+				assert.Equal(t, tt.expectedVia, proxyReq.Header.Get("Via"))
+			}
+		})
+	}
+}
+
+func TestSetResponseHeaders(t *testing.T) {
+	tests := []struct {
+		name            string
+		stats           *ports.RequestStats
+		endpoint        *domain.Endpoint
+		expectedHeaders map[string]string
+		checkTrailer    bool
+	}{
+		{
+			name: "all_fields_set",
+			stats: &ports.RequestStats{
+				RequestID: "test-request-123",
+				Model:     "gpt-4",
+				StartTime: time.Now().Add(-100 * time.Millisecond),
+			},
+			endpoint: &domain.Endpoint{
+				Name: "backend-1",
+				Type: "openai",
+			},
+			expectedHeaders: map[string]string{
+				"X-Olla-Request-ID":   "test-request-123",
+				"X-Olla-Endpoint":     "backend-1",
+				"X-Olla-Backend-Type": "openai",
+				"X-Olla-Model":        "gpt-4",
+				// X-Olla-Response-Time will be checked separately as it's dynamic
+			},
+			checkTrailer: true,
+		},
+		{
+			name: "minimal_fields",
+			stats: &ports.RequestStats{
+				RequestID: "test-request-456",
+			},
+			endpoint: &domain.Endpoint{
+				Name: "backend-2",
+				Type: "ollama",
+			},
+			expectedHeaders: map[string]string{
+				"X-Olla-Request-ID":   "test-request-456",
+				"X-Olla-Endpoint":     "backend-2",
+				"X-Olla-Backend-Type": "ollama",
+			},
+			checkTrailer: true,
+		},
+		{
+			name:  "nil_stats",
+			stats: nil,
+			endpoint: &domain.Endpoint{
+				Name: "backend-3",
+				Type: "lmstudio",
+			},
+			expectedHeaders: map[string]string{
+				"X-Olla-Endpoint":     "backend-3",
+				"X-Olla-Backend-Type": "lmstudio",
+			},
+			checkTrailer: false,
+		},
+		{
+			name: "nil_endpoint",
+			stats: &ports.RequestStats{
+				RequestID: "test-request-789",
+			},
+			endpoint: nil,
+			expectedHeaders: map[string]string{
+				"X-Olla-Request-ID": "test-request-789",
+			},
+			checkTrailer: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+
+			SetResponseHeaders(w, tt.stats, tt.endpoint)
+
+			// Check standard headers
+			assert.NotEmpty(t, w.Header().Get("X-Served-By"))
+			assert.NotEmpty(t, w.Header().Get("Via"))
+
+			// Check expected headers
+			for k, v := range tt.expectedHeaders {
+				assert.Equal(t, v, w.Header().Get(k), "Header %s should be set correctly", k)
+			}
+
+			// Check X-Olla-Response-Time header when StartTime is set
+			if tt.stats != nil && !tt.stats.StartTime.IsZero() {
+				responseTimeHeader := w.Header().Get("X-Olla-Response-Time")
+				assert.NotEmpty(t, responseTimeHeader, "X-Olla-Response-Time should be set when StartTime is present")
+				// Verify itss in milliseconds format (e.g., "123ms")
+				assert.Contains(t, responseTimeHeader, "ms", "X-Olla-Response-Time should be in milliseconds format")
+				// Verify it'ss still parseable as a duration
+				_, err := time.ParseDuration(responseTimeHeader)
+				assert.NoError(t, err, "X-Olla-Response-Time should be a valid duration")
+			} else {
+				// When StartTime is not set, the header should not be present
+				assert.Empty(t, w.Header().Get("X-Olla-Response-Time"), "X-Olla-Response-Time should not be set when StartTime is zero")
+			}
+
+			// Note: Trailer header is set by the proxy implementation, not SetResponseHeaders
+		})
+	}
+}
+
+func TestGetClientIP(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteAddr string
+		headers    map[string]string
+		expectedIP string
+	}{
+		{
+			name:       "basic_remote_addr",
+			remoteAddr: "192.168.1.100:12345",
+			headers:    map[string]string{},
+			expectedIP: "192.168.1.100",
+		},
+		{
+			name:       "x_forwarded_for_single",
+			remoteAddr: "192.168.1.100:12345",
+			headers: map[string]string{
+				"X-Forwarded-For": "10.0.0.1",
+			},
+			expectedIP: "10.0.0.1",
+		},
+		{
+			name:       "x_forwarded_for_multiple",
+			remoteAddr: "192.168.1.100:12345",
+			headers: map[string]string{
+				"X-Forwarded-For": "10.0.0.1, 10.0.0.2, 10.0.0.3",
+			},
+			expectedIP: "10.0.0.1",
+		},
+		{
+			name:       "x_real_ip",
+			remoteAddr: "192.168.1.100:12345",
+			headers: map[string]string{
+				"X-Real-IP": "10.0.0.5",
+			},
+			expectedIP: "10.0.0.5",
+		},
+		{
+			name:       "prefer_x_forwarded_for",
+			remoteAddr: "192.168.1.100:12345",
+			headers: map[string]string{
+				"X-Forwarded-For": "10.0.0.1",
+				"X-Real-IP":       "10.0.0.5",
+			},
+			expectedIP: "10.0.0.1",
+		},
+		{
+			name:       "malformed_remote_addr",
+			remoteAddr: "invalid-addr",
+			headers:    map[string]string{},
+			expectedIP: "invalid-addr", // Falls back to RemoteAddr when split fails
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://example.com/test", nil)
+			req.RemoteAddr = tt.remoteAddr
+
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+
+			ip := extractClientIP(req)
+			assert.Equal(t, tt.expectedIP, ip)
+		})
+	}
+}
+
+func TestIsHopByHopHeader(t *testing.T) {
+	tests := []struct {
+		header   string
+		expected bool
+	}{
+		{"Connection", true},
+		{"connection", true}, // Case insensitive
+		{"Keep-Alive", true},
+		{"Proxy-Authenticate", true},
+		{"Proxy-Authorization", true},
+		{"TE", true},
+		{"Trailer", true},
+		{"Transfer-Encoding", true},
+		{"Upgrade", true},
+		{"Content-Type", false},
+		{"Authorization", false},
+		{"X-Custom-Header", false},
+		{"Accept", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.header, func(t *testing.T) {
+			result := isHopByHopHeader(tt.header)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestProxyHeaderConstants(t *testing.T) {
+	// Test that proxy header functions return non-empty values
+	assert.NotEmpty(t, GetProxiedByHeader())
+	assert.Contains(t, GetProxiedByHeader(), "/")
+
+	assert.NotEmpty(t, GetViaHeader())
+	assert.Contains(t, GetViaHeader(), "1.1")
+}
+
+func TestHeaderConstants(t *testing.T) {
+	// Test that header constants are defined
+	assert.Equal(t, "X-Olla-Request-ID", constants.HeaderXOllaRequestID)
+	assert.Equal(t, "X-Olla-Endpoint", constants.HeaderXOllaEndpoint)
+	assert.Equal(t, "X-Olla-Backend-Type", constants.HeaderXOllaBackendType)
+	assert.Equal(t, "X-Olla-Model", constants.HeaderXOllaModel)
+	assert.Equal(t, "X-Olla-Response-Time", constants.HeaderXOllaResponseTime)
+}
+
+// TestCopyHeaders_ExistingHeaders tests the edge case where proxyReq.Header has pre-existing entries
+// This verifies that the current fix handles the scenario correctly even when the map is not nil
+func TestCopyHeaders_ExistingHeaders(t *testing.T) {
+	tests := []struct {
+		name             string
+		existingHeaders  map[string][]string
+		originalHeaders  map[string][]string
+		expectedHeaders  map[string][]string
+		shouldClearExist bool
+		description      string
+	}{
+		{
+			name: "pre_existing_headers_overwritten",
+			existingHeaders: map[string][]string{
+				"X-Existing": {"old-value"},
+			},
+			originalHeaders: map[string][]string{
+				"X-Existing": {"new-value"},
+				"X-New-1":    {"value1"},
+				"X-New-2":    {"value2"},
+			},
+			expectedHeaders: map[string][]string{
+				"X-Existing": {"new-value"},
+				"X-New-1":    {"value1"},
+				"X-New-2":    {"value2"},
+			},
+			shouldClearExist: false,
+			description:      "Headers with same name should be overwritten from source",
+		},
+		{
+			name: "pre_existing_different_headers",
+			existingHeaders: map[string][]string{
+				"X-Pre-Existing-1": {"pre1"},
+				"X-Pre-Existing-2": {"pre2"},
+			},
+			originalHeaders: map[string][]string{
+				"X-New-1": {"new1"},
+				"X-New-2": {"new2"},
+			},
+			expectedHeaders: map[string][]string{
+				// Pre-existing headers remain because CopyHeaders doesn't clear the map
+				"X-Pre-Existing-1": {"pre1"},
+				"X-Pre-Existing-2": {"pre2"},
+				"X-New-1":          {"new1"},
+				"X-New-2":          {"new2"},
+			},
+			shouldClearExist: false,
+			description:      "Pre-existing headers with different names persist alongside new headers",
+		},
+		{
+			name: "many_pre_existing_few_new",
+			existingHeaders: map[string][]string{
+				"X-Exist-1":  {"e1"},
+				"X-Exist-2":  {"e2"},
+				"X-Exist-3":  {"e3"},
+				"X-Exist-4":  {"e4"},
+				"X-Exist-5":  {"e5"},
+				"X-Exist-6":  {"e6"},
+				"X-Exist-7":  {"e7"},
+				"X-Exist-8":  {"e8"},
+				"X-Exist-9":  {"e9"},
+				"X-Exist-10": {"e10"},
+			},
+			originalHeaders: map[string][]string{
+				"Content-Type": {"application/json"},
+				"Accept":       {"text/html"},
+			},
+			expectedHeaders: map[string][]string{
+				"X-Exist-1":    {"e1"},
+				"X-Exist-2":    {"e2"},
+				"X-Exist-3":    {"e3"},
+				"X-Exist-4":    {"e4"},
+				"X-Exist-5":    {"e5"},
+				"X-Exist-6":    {"e6"},
+				"X-Exist-7":    {"e7"},
+				"X-Exist-8":    {"e8"},
+				"X-Exist-9":    {"e9"},
+				"X-Exist-10":   {"e10"},
+				"Content-Type": {"application/json"},
+				"Accept":       {"text/html"},
+			},
+			shouldClearExist: false,
+			description:      "Edge case: many existing entries, few new ones - tests potential rehashing",
+		},
+		{
+			name:            "empty_existing_map_normal_operation",
+			existingHeaders: map[string][]string{
+				// Empty but non-nil map (len=0)
+			},
+			originalHeaders: map[string][]string{
+				"Content-Type": {"application/json"},
+				"X-New-1":      {"value1"},
+				"X-New-2":      {"value2"},
+			},
+			expectedHeaders: map[string][]string{
+				"Content-Type": {"application/json"},
+				"X-New-1":      {"value1"},
+				"X-New-2":      {"value2"},
+			},
+			shouldClearExist: false,
+			description:      "Normal case: empty but non-nil map (mimics http.NewRequestWithContext)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create original request with headers
+			originalReq := httptest.NewRequest("GET", "http://example.com/test", nil)
+			for k, values := range tt.originalHeaders {
+				for _, v := range values {
+					originalReq.Header.Add(k, v)
+				}
+			}
+
+			// Create proxy request with pre-existing headers
+			proxyReq := httptest.NewRequest("GET", "http://backend.com/test", nil)
+			for k, values := range tt.existingHeaders {
+				for _, v := range values {
+					proxyReq.Header.Add(k, v)
+				}
+			}
+
+			// Record initial state for debugging
+			initialLen := len(proxyReq.Header)
+			t.Logf("Test: %s - Initial header count: %d", tt.description, initialLen)
+
+			// Copy headers
+			CopyHeaders(proxyReq, originalReq, nil)
+
+			// Verify expected headers (excluding proxy-specific headers)
+			for k, expectedValues := range tt.expectedHeaders {
+				actualValues := proxyReq.Header[k]
+				assert.Equal(t, expectedValues, actualValues,
+					"Header %s should have expected value for: %s", k, tt.description)
+			}
+
+			// Verify proxy-specific headers are always added
+			assert.NotEmpty(t, proxyReq.Header.Get("X-Proxied-By"))
+			assert.NotEmpty(t, proxyReq.Header.Get("Via"))
+
+			t.Logf("Final header count: %d", len(proxyReq.Header))
+		})
+	}
+}
+
+// TestCopyHeaders_MapPreSizingOptimization verifies the optimization behaviour
+// This test documents the behaviour but doesn't fail if optimization isn't perfect
+func TestCopyHeaders_MapPreSizingOptimization(t *testing.T) {
+	t.Run("verify_http_request_creates_empty_map", func(t *testing.T) {
+		// This test verifies that http.NewRequestWithContext creates an empty (len=0) map
+		// which means our nil check will pass and we'll create a pre-sized map
+		req := httptest.NewRequest("GET", "http://example.com/test", nil)
+
+		assert.NotNil(t, req.Header, "http.Request.Header should not be nil")
+		assert.Empty(t, req.Header, "http.Request.Header should be empty (len=0)")
+
+		// Since len=0 but Header != nil, our current optimization won't apply
+		// But this is fine because an empty map doesn't cause rehashing issues
+	})
+
+	t.Run("verify_current_fix_handles_nil", func(t *testing.T) {
+		// Test that nil header maps are handled correctly
+		var req *http.Request
+		req = &http.Request{
+			Method: "GET",
+			Header: nil, // Explicitly nil
+		}
+
+		originalReq := httptest.NewRequest("GET", "http://example.com/test", nil)
+		originalReq.Header.Set("X-Test", "value")
+
+		// This should work without panic
+		CopyHeaders(req, originalReq, nil)
+
+		assert.Equal(t, "value", req.Header.Get("X-Test"))
+	})
+}
+
+func BenchmarkCopyHeaders(b *testing.B) {
+	// Create original request with typical headers
+	originalReq := httptest.NewRequest("GET", "http://example.com/test", nil)
+	originalReq.Header.Set("Content-Type", "application/json")
+	originalReq.Header.Set("Accept", "application/json")
+	originalReq.Header.Set("User-Agent", "test-agent/1.0")
+	originalReq.Header.Set("X-Custom-Header", "custom-value")
+	originalReq.RemoteAddr = "192.168.1.100:12345"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		proxyReq := httptest.NewRequest("GET", "http://backend.com/proxy", nil)
+		CopyHeaders(proxyReq, originalReq, nil)
+	}
+}
+
+// BenchmarkCopyHeaders_WithExistingHeaders benchmarks the edge case
+func BenchmarkCopyHeaders_WithExistingHeaders(b *testing.B) {
+	// Create original request with typical headers
+	originalReq := httptest.NewRequest("GET", "http://example.com/test", nil)
+	originalReq.Header.Set("Content-Type", "application/json")
+	originalReq.Header.Set("Accept", "application/json")
+	originalReq.Header.Set("User-Agent", "test-agent/1.0")
+	originalReq.Header.Set("X-Custom-Header", "custom-value")
+	originalReq.RemoteAddr = "192.168.1.100:12345"
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		proxyReq := httptest.NewRequest("GET", "http://backend.com/proxy", nil)
+		// Pre-populate with some headers (edge case)
+		proxyReq.Header.Set("X-Pre-Existing-1", "value1")
+		proxyReq.Header.Set("X-Pre-Existing-2", "value2")
+		CopyHeaders(proxyReq, originalReq, nil)
+	}
+}
+
+func TestSetStickySessionHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		outcome         *domain.StickyOutcome
+		sessionIDHeader string // value of X-Olla-Session-ID on the request
+		expectSession   string // expected X-Olla-Sticky-Session header value
+		expectSource    string // expected X-Olla-Sticky-Key-Source header value
+		expectSessionID string // expected X-Olla-Session-ID echo in response
+	}{
+		{
+			name:          "nil_outcome_no_op",
+			outcome:       nil,
+			expectSession: "",
+			expectSource:  "",
+		},
+		{
+			name:            "hit_with_session_header_source",
+			outcome:         &domain.StickyOutcome{Result: "hit", Source: "session_header"},
+			sessionIDHeader: "my-session-123",
+			expectSession:   "hit",
+			expectSource:    "session_header",
+			expectSessionID: "my-session-123",
+		},
+		{
+			name:          "miss_with_prefix_hash_source",
+			outcome:       &domain.StickyOutcome{Result: "miss", Source: "prefix_hash"},
+			expectSession: "miss",
+			expectSource:  "prefix_hash",
+		},
+		{
+			name:          "repin_with_ip_source",
+			outcome:       &domain.StickyOutcome{Result: "repin", Source: "ip"},
+			expectSession: "repin",
+			expectSource:  "ip",
+		},
+		{
+			name:          "disabled_source_none_skips_key_source_header",
+			outcome:       &domain.StickyOutcome{Result: "disabled", Source: "none"},
+			expectSession: "disabled",
+			expectSource:  "", // "none" must not be written
+		},
+		{
+			name:    "session_header_source_without_session_id_skips_echo",
+			outcome: &domain.StickyOutcome{Result: "hit", Source: "session_header"},
+			// no X-Olla-Session-ID on request
+			sessionIDHeader: "",
+			expectSession:   "hit",
+			expectSource:    "session_header",
+			expectSessionID: "", // nothing to echo
+		},
+		{
+			name:          "empty_result_skips_sticky_session_header",
+			outcome:       &domain.StickyOutcome{Result: "", Source: "ip"},
+			expectSession: "",
+			expectSource:  "ip",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequest(http.MethodPost, "/test", nil)
+			if tt.sessionIDHeader != "" {
+				req.Header.Set(constants.HeaderXOllaSessionID, tt.sessionIDHeader)
+			}
+
+			if tt.outcome != nil {
+				ctx := context.WithValue(req.Context(), constants.ContextStickyOutcomeKey, tt.outcome)
+				req = req.WithContext(ctx)
+			}
+
+			w := httptest.NewRecorder()
+			SetStickySessionHeaders(w, req)
+
+			assert.Equal(t, tt.expectSession, w.Header().Get(constants.HeaderXOllaStickySession))
+			assert.Equal(t, tt.expectSource, w.Header().Get(constants.HeaderXOllaStickyKeySource))
+			assert.Equal(t, tt.expectSessionID, w.Header().Get(constants.HeaderXOllaSessionID))
+		})
+	}
+}
+
+// TestCopyHeaders_DoesNotPropagateInboundHost verifies that the inbound client Host is never
+// forwarded to the backend. Go's transport uses req.URL.Host when req.Host is empty, which is
+// the correct backend address. Propagating the inbound Host breaks HTTPS backends behind strict
+// nginx server_name rules and is a Host-header injection vector.
+func TestCopyHeaders_DoesNotPropagateInboundHost(t *testing.T) {
+	t.Parallel()
+
+	originalReq := httptest.NewRequest("POST", "http://olla.example.com/api/generate", nil)
+	originalReq.Host = "olla.example.com"
+
+	proxyReq := httptest.NewRequest("POST", "http://backend.internal:11434/api/generate", nil)
+	proxyReq.Host = "" // Transport will use URL.Host when this is empty
+
+	CopyHeaders(proxyReq, originalReq, nil)
+
+	// Host must remain unset so Go's transport derives it from URL.Host (the backend address).
+	assert.Empty(t, proxyReq.Host, "outbound Host must not be overridden with the inbound client Host")
+
+	// The original host must still be available to backends via X-Forwarded-Host.
+	assert.Equal(t, "olla.example.com", proxyReq.Header.Get("X-Forwarded-Host"),
+		"X-Forwarded-Host must carry the original inbound Host")
+}
+
+// TestCopyResponseHeaders_StripsSensitiveHeaders verifies that headers a
+// compromised or misconfigured backend should never reflect to clients are
+// removed, while safe headers pass through unchanged.
+func TestCopyResponseHeaders_StripsSensitiveHeaders(t *testing.T) {
+	t.Parallel()
+
+	sensitiveHeaders := []string{
+		"Authorization",
+		"Proxy-Authorization",
+		"X-Api-Key",
+		"X-Auth-Token",
+		"Set-Cookie",
+	}
+
+	for _, header := range sensitiveHeaders {
+		t.Run("strips_"+header, func(t *testing.T) {
+			t.Parallel()
+
+			src := http.Header{}
+			src.Set(header, "must-not-appear")
+			src.Set("Content-Type", "application/json")
+
+			dst := http.Header{}
+			CopyResponseHeaders(dst, src, nil)
+
+			if got := dst.Get(header); got != "" {
+				t.Errorf("CopyResponseHeaders forwarded sensitive header %q = %q, want empty", header, got)
+			}
+			if got := dst.Get("Content-Type"); got == "" {
+				t.Error("CopyResponseHeaders dropped Content-Type header; safe headers must pass through")
+			}
+		})
+	}
+}
+
+// TestCopyResponseHeaders_PassesThroughSafeHeaders verifies that non-sensitive
+// headers from the upstream response are forwarded to the client unchanged.
+func TestCopyResponseHeaders_PassesThroughSafeHeaders(t *testing.T) {
+	t.Parallel()
+
+	src := http.Header{}
+	src.Set("Content-Type", "text/event-stream")
+	src.Set("X-Custom-Header", "custom-value")
+	src.Set("Cache-Control", "no-cache")
+
+	dst := http.Header{}
+	CopyResponseHeaders(dst, src, nil)
+
+	for _, h := range []string{"Content-Type", "X-Custom-Header", "Cache-Control"} {
+		if dst.Get(h) == "" {
+			t.Errorf("CopyResponseHeaders dropped safe header %q", h)
+		}
+	}
+}
+
+// TestCopyResponseHeaders_StripsEndpointAuthHeader verifies that an endpoint's
+// configured auth header name is stripped from the upstream response, preventing
+// a backend that reflects it from leaking credentials to the client.
+func TestCopyResponseHeaders_StripsEndpointAuthHeader(t *testing.T) {
+	t.Parallel()
+
+	endpoint := &domain.Endpoint{
+		AuthHeaderName: "X-Custom-Auth",
+	}
+
+	src := http.Header{}
+	src.Set("X-Custom-Auth", "leaked-secret")
+	src.Set("Content-Encoding", "gzip")
+
+	dst := http.Header{}
+	CopyResponseHeaders(dst, src, endpoint)
+
+	if got := dst.Get("X-Custom-Auth"); got != "" {
+		t.Errorf("endpoint auth header leaked to client: X-Custom-Auth = %q, want empty", got)
+	}
+	if got := dst.Get("Content-Encoding"); got == "" {
+		t.Error("CopyResponseHeaders dropped safe header Content-Encoding")
+	}
+}
+
+// TestCopyResponseHeaders_StripsEndpointConfiguredHeaders verifies that every
+// header named in endpoint.Headers is stripped from the upstream response. The
+// rule is consistent: anything the operator names is denied on the way back,
+// regardless of whether the header looks benign.
+func TestCopyResponseHeaders_StripsEndpointConfiguredHeaders(t *testing.T) {
+	t.Parallel()
+
+	endpoint := &domain.Endpoint{
+		Headers: map[string]string{
+			"X-Foo": "bar",
+			"X-Bar": "baz",
+		},
+	}
+
+	src := http.Header{}
+	src.Set("X-Foo", "upstream-value")
+	src.Set("X-Bar", "upstream-value")
+	src.Set("Content-Type", "application/json")
+
+	dst := http.Header{}
+	CopyResponseHeaders(dst, src, endpoint)
+
+	for _, h := range []string{"X-Foo", "X-Bar"} {
+		if got := dst.Get(h); got != "" {
+			t.Errorf("endpoint configured header %q leaked to client = %q, want empty", h, got)
+		}
+	}
+	if got := dst.Get("Content-Type"); got == "" {
+		t.Error("CopyResponseHeaders dropped safe header Content-Type")
+	}
+}
+
+// TestCopyResponseHeaders_StripsBenignLookingEndpointHeader proves that
+// operator-configured headers are always stripped on the return path, even when
+// the header name looks benign (e.g. Content-Type). Consistency matters more than
+// semantic judgement about what "looks safe".
+func TestCopyResponseHeaders_StripsBenignLookingEndpointHeader(t *testing.T) {
+	t.Parallel()
+
+	endpoint := &domain.Endpoint{
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+	}
+
+	src := http.Header{}
+	src.Set("Content-Type", "text/plain")
+	src.Set("Content-Encoding", "gzip")
+
+	dst := http.Header{}
+	CopyResponseHeaders(dst, src, endpoint)
+
+	if got := dst.Get("Content-Type"); got != "" {
+		t.Errorf("operator-configured Content-Type was not stripped: got %q, want empty", got)
+	}
+	// A header not in any deny list must still pass through.
+	if got := dst.Get("Content-Encoding"); got == "" {
+		t.Error("CopyResponseHeaders dropped Content-Encoding which is not in any deny list")
+	}
+}
+
+// TestCopyResponseHeaders_PassesThroughUndeniedHeader confirms that a normal
+// response header not mentioned in any deny list reaches the client unchanged.
+func TestCopyResponseHeaders_PassesThroughUndeniedHeader(t *testing.T) {
+	t.Parallel()
+
+	endpoint := &domain.Endpoint{
+		AuthHeaderName: "X-Custom-Auth",
+		Headers:        map[string]string{"X-Foo": "bar"},
+	}
+
+	src := http.Header{}
+	src.Set("Content-Encoding", "gzip")
+	src.Set("X-Custom-Auth", "secret")
+	src.Set("X-Foo", "value")
+
+	dst := http.Header{}
+	CopyResponseHeaders(dst, src, endpoint)
+
+	if got := dst.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q", got, "gzip")
+	}
+}
+
+// TestCopyResponseHeaders_StripsBackendSpoofedXOllaHeaders verifies that any
+// X-Olla-* header a backend injects into its response is stripped before it
+// reaches the client. Olla is the sole authority for X-Olla-* response headers;
+// a spoofed value from a compromised backend would mislead clients relying on
+// them for routing decisions or session affinity.
+func TestCopyResponseHeaders_StripsBackendSpoofedXOllaHeaders(t *testing.T) {
+	t.Parallel()
+
+	spoofedHeaders := []string{
+		"X-Olla-Endpoint",
+		"X-Olla-Model",
+		"X-Olla-Backend-Type",
+		"X-Olla-Request-ID",
+		"X-Olla-Response-Time",
+		"X-Olla-Routing-Strategy",
+		"X-Olla-Sticky-Session",
+		"X-Olla-Mode",
+		"X-Olla-Custom-Unknown", // unknown future header, must also be stripped
+	}
+
+	for _, header := range spoofedHeaders {
+
+		t.Run("strips_"+header, func(t *testing.T) {
+			t.Parallel()
+
+			src := http.Header{}
+			src.Set(header, "spoofed-value")
+			src.Set("Content-Type", "application/json") // safe header must pass through
+
+			dst := http.Header{}
+			CopyResponseHeaders(dst, src, nil)
+
+			if got := dst.Get(header); got != "" {
+				t.Errorf("CopyResponseHeaders forwarded spoofed %q = %q to client, want empty", header, got)
+			}
+			if got := dst.Get("Content-Type"); got == "" {
+				t.Error("CopyResponseHeaders stripped safe Content-Type header")
+			}
+		})
+	}
+}
+
+// TestCopyResponseHeaders_OllaSetsThenCopiesAreNotDoubled proves that when Olla
+// sets its own X-Olla-Endpoint on dst before calling CopyResponseHeaders, the
+// backend spoof does not create a second value (dst.Add would append; stripping
+// prevents this entirely).
+func TestCopyResponseHeaders_OllaSetsThenCopiesAreNotDoubled(t *testing.T) {
+	t.Parallel()
+
+	src := http.Header{}
+	src.Set("X-Olla-Endpoint", "spoofed-backend")
+	src.Set("Content-Type", "application/json")
+
+	dst := http.Header{}
+	dst.Set("X-Olla-Endpoint", "olla-real-value")
+
+	CopyResponseHeaders(dst, src, nil)
+
+	vals := dst.Values("X-Olla-Endpoint")
+	if len(vals) != 1 {
+		t.Fatalf("expected exactly 1 X-Olla-Endpoint value, got %d: %v", len(vals), vals)
+	}
+	if vals[0] != "olla-real-value" {
+		t.Errorf("X-Olla-Endpoint = %q, want %q", vals[0], "olla-real-value")
+	}
+}
+
+// BenchmarkSetResponseHeaders benchmarks the SetResponseHeaders function
+func BenchmarkSetResponseHeaders(b *testing.B) {
+	stats := &ports.RequestStats{
+		RequestID: "test-request-123",
+		Model:     "gpt-4",
+		StartTime: time.Now().Add(-100 * time.Millisecond),
+	}
+	endpoint := &domain.Endpoint{
+		Name: "backend-1",
+		Type: "openai",
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		w := httptest.NewRecorder()
+		SetResponseHeaders(w, stats, endpoint)
+	}
+}
