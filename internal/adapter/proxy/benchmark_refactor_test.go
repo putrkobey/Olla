@@ -140,3 +140,289 @@ func benchmarkRefactoredErrorHandling(b *testing.B, proxyType string) {
 	}
 }
 
+func benchmarkRefactoredHeaderProcessing(b *testing.B, proxyType string) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Echo back headers
+		for k, v := range r.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("test", upstream.URL, domain.StatusHealthy)
+	proxy, err := createRefactoredProxy(proxyType, []*domain.Endpoint{endpoint})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		// Add multiple headers
+		for j := range 10 {
+			req.Header.Add(fmt.Sprintf("X-Custom-%d", j), fmt.Sprintf("value-%d", j))
+		}
+
+		w := httptest.NewRecorder()
+		stats := &ports.RequestStats{
+			RequestID: fmt.Sprintf("bench-%d", i),
+			StartTime: time.Now(),
+		}
+
+		err := proxy.ProxyRequest(context.Background(), w, req, stats, createTestLogger())
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkRefactoredStreamingResponse(b *testing.B, proxyType string) {
+	// 10KB response
+	responseData := strings.Repeat("x", 10*1024)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+
+		// Stream in chunks
+		for range 10 {
+			w.Write([]byte(responseData[:1024]))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("test", upstream.URL, domain.StatusHealthy)
+	proxy, err := createRefactoredProxy(proxyType, []*domain.Endpoint{endpoint})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		req := httptest.NewRequest("GET", "/api/test", nil)
+		w := &discardResponseWriter{header: make(http.Header)}
+		stats := &ports.RequestStats{
+			RequestID: fmt.Sprintf("bench-%d", i),
+			StartTime: time.Now(),
+		}
+
+		err := proxy.ProxyRequest(context.Background(), w, req, stats, createTestLogger())
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func benchmarkRefactoredConfigUpdates(b *testing.B, proxyType string) {
+	proxy, err := createRefactoredProxy(proxyType, []*domain.Endpoint{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	// Create a simple config that implements ProxyConfiguration interface
+	configs := make([]*Configuration, 10)
+	for i := range 10 {
+		configs[i] = &Configuration{
+			ResponseTimeout:  time.Duration(i+1) * time.Second,
+			ReadTimeout:      time.Duration(i+1) * time.Second,
+			StreamBufferSize: 8192 * (i + 1),
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		configIndex := i % len(configs)
+		proxy.UpdateConfig(configs[configIndex])
+	}
+}
+
+func benchmarkRefactoredStatsCollection(b *testing.B, proxyType string) {
+	proxy, err := createRefactoredProxy(proxyType, []*domain.Endpoint{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		_, err := proxy.GetStats(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEventBusPublish benchmarks the EventBus publish performance
+func BenchmarkEventBusPublish(b *testing.B) {
+	bus := eventbus.New[core.ProxyEvent]()
+	defer bus.Shutdown()
+
+	// Create some subscribers
+	for range 10 {
+		ch, cleanup := bus.Subscribe(context.Background())
+		defer cleanup()
+
+		// Drain events in background
+		go func() {
+			for range ch {
+				// Discard
+			}
+		}()
+	}
+
+	event := core.ProxyEvent{
+		Type: core.EventType("test.event"),
+		Metadata: core.ProxyEventMetadata{
+			Counter: 1,
+			Message: "test",
+		},
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		bus.Publish(event)
+	}
+}
+
+// BenchmarkPoolGetPut benchmarks the LitePool performance
+func BenchmarkPoolGetPut(b *testing.B) {
+	type testStruct struct {
+		data []byte
+	}
+
+	pool, err := pool.NewLitePool(func() *testStruct {
+		return &testStruct{
+			data: make([]byte, 8192),
+		}
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		obj, err := pool.Get()
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Use the object
+		obj.data[0] = byte(i)
+		pool.Put(obj)
+	}
+}
+
+// Specific benchmarks for Olla features
+func BenchmarkOllaCircuitBreaker(b *testing.B) {
+	proxy, err := createRefactoredProxy("olla", []*domain.Endpoint{})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	// Type assert to access Olla-specific features
+	ollaProxy, ok := proxy.(*olla.Service)
+	if !ok {
+		b.Fatal("expected Olla proxy")
+	}
+
+	cb := ollaProxy.GetCircuitBreaker("test-endpoint")
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		// Alternate between checking state and recording success/failure
+		if i%3 == 0 {
+			cb.RecordFailure(0)
+		} else if i%3 == 1 {
+			cb.RecordSuccess(0)
+		} else {
+			_, _ = cb.IsOpen(olla.HalfOpenStaleness)
+		}
+	}
+}
+
+// BenchmarkOllaObjectPools benchmarks Olla's object pool usage
+func BenchmarkOllaObjectPools(b *testing.B) {
+	b.Run("BufferPool", func(b *testing.B) {
+		bufferPool, err := pool.NewLitePool(func() *[]byte {
+			buf := make([]byte, 64*1024)
+			return &buf
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for range b.N {
+			buf, err := bufferPool.Get()
+			if err != nil {
+				b.Fatal(err)
+			}
+			bufferPool.Put(buf)
+		}
+	})
+
+	b.Run("RequestContextPool", func(b *testing.B) {
+		type requestContext struct {
+			requestID string
+			startTime time.Time
+			endpoint  string
+			targetURL string
+		}
+
+		reqPool, err := pool.NewLitePool(func() *requestContext {
+			return &requestContext{}
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for range b.N {
+			ctx, err := reqPool.Get()
+			if err != nil {
+				b.Fatal(err)
+			}
+			reqPool.Put(ctx)
+		}
+	})
+}
+
+// discardResponseWriter is a ResponseWriter that discards all output
+type discardResponseWriter struct {
+	header http.Header
+	code   int
+}
+
+func (d *discardResponseWriter) Header() http.Header {
+	return d.header
+}
+
+func (d *discardResponseWriter) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
+func (d *discardResponseWriter) WriteHeader(statusCode int) {
+	d.code = statusCode
+}
