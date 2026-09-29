@@ -102,3 +102,213 @@ func TestProviderCompatibility(t *testing.T) {
 		},
 		{
 			name:         "lmstudio provider rejects openai",
+			endpointType: "openai",
+			providerType: "lmstudio",
+			compatible:   false,
+		},
+		// vLLM provider should only accept vllm endpoints
+		{
+			name:         "vllm provider accepts vllm",
+			endpointType: "vllm",
+			providerType: "vllm",
+			compatible:   true,
+		},
+		{
+			name:         "vllm provider rejects ollama",
+			endpointType: "ollama",
+			providerType: "vllm",
+			compatible:   false,
+		},
+		// Lemonade provider should only accept lemonade endpoints
+		{
+			name:         "lemonade provider accepts lemonade",
+			endpointType: "lemonade",
+			providerType: "lemonade",
+			compatible:   true,
+		},
+		{
+			name:         "lemonade provider rejects ollama",
+			endpointType: "ollama",
+			providerType: "lemonade",
+			compatible:   false,
+		},
+		{
+			name:         "lemonade provider rejects vllm",
+			endpointType: "vllm",
+			providerType: "lemonade",
+			compatible:   false,
+		},
+		// oMLX provider should only accept omlx endpoints
+		{
+			name:         "omlx provider accepts omlx",
+			endpointType: "omlx",
+			providerType: "omlx",
+			compatible:   true,
+		},
+		{
+			name:         "omlx provider rejects ollama",
+			endpointType: "ollama",
+			providerType: "omlx",
+			compatible:   false,
+		},
+		{
+			name:         "omlx provider rejects vllm",
+			endpointType: "vllm",
+			providerType: "omlx",
+			compatible:   false,
+		},
+		// Unknown provider should reject everything
+		{
+			name:         "unknown provider rejects ollama",
+			endpointType: "ollama",
+			providerType: "unknown",
+			compatible:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// create a profile for the provider type
+			profile := app.createProviderProfile(tt.providerType)
+
+			// Normalise endpoint type to match what would be in the system
+			normalizedEndpoint := NormaliseProviderType(tt.endpointType)
+
+			result := profile.IsCompatibleWith(normalizedEndpoint)
+			assert.Equal(t, tt.compatible, result, "Expected %v for %s -> %s", tt.compatible, tt.endpointType, tt.providerType)
+		})
+	}
+}
+
+// TestProviderCompatibility_RealFactory exercises createProviderProfile against
+// a real profile factory loaded from YAML. The nil-factory path (used by the
+// test above) masked issue #148 because it hardcodes "openai" into SupportedBy
+// directly, bypassing the IsCompatibleWith alias logic entirely.
+//
+// This test represents the production code path: an endpoint configured
+// type:"openai" must appear in GET /olla/openai/v1/models results.
+func TestProviderCompatibility_RealFactory(t *testing.T) {
+	t.Parallel()
+
+	factory, err := profile.NewFactory("../../../config/profiles")
+	if err != nil {
+		t.Fatalf("failed to load profile factory from YAML: %v", err)
+	}
+
+	app := &Application{profileFactory: factory}
+
+	tests := []struct {
+		name         string
+		providerType string
+		endpointType string
+		wantCompat   bool
+	}{
+		// The production failure: an endpoint with type:"openai" must be included
+		// when the client calls GET /olla/openai/v1/models.
+		{
+			name:         "openai provider accepts openai-typed endpoint (issue #148)",
+			providerType: "openai",
+			endpointType: "openai",
+			wantCompat:   true,
+		},
+		{
+			name:         "openai provider accepts openai-compatible-typed endpoint",
+			providerType: "openai",
+			endpointType: "openai-compatible",
+			wantCompat:   true,
+		},
+		{
+			name:         "openai provider accepts ollama-typed endpoint",
+			providerType: "openai",
+			endpointType: "ollama",
+			wantCompat:   true,
+		},
+		{
+			name:         "openai provider accepts lm-studio-typed endpoint",
+			providerType: "openai",
+			endpointType: "lm-studio",
+			wantCompat:   true,
+		},
+		{
+			name:         "openai-compatible provider accepts openai-typed endpoint",
+			providerType: "openai-compatible",
+			endpointType: "openai",
+			wantCompat:   true,
+		},
+		// oMLX is OpenAI-compatible — openai provider must include it
+		{
+			name:         "openai provider accepts omlx-typed endpoint",
+			providerType: "openai",
+			endpointType: "omlx",
+			wantCompat:   true,
+		},
+		// oMLX provider stays scoped to its own endpoints
+		{
+			name:         "omlx provider accepts omlx-typed endpoint",
+			providerType: "omlx",
+			endpointType: "omlx",
+			wantCompat:   true,
+		},
+		{
+			name:         "omlx provider rejects ollama-typed endpoint",
+			providerType: "omlx",
+			endpointType: "ollama",
+			wantCompat:   false,
+		},
+		// Provider-specific routes must stay scoped.
+		{
+			name:         "ollama provider rejects openai-typed endpoint",
+			providerType: "ollama",
+			endpointType: "openai",
+			wantCompat:   false,
+		},
+		// TEI provider stays scoped to its own endpoints; the short "tei" URL
+		// alias must resolve to the same profile as the canonical name.
+		{
+			name:         "text-embeddings-inference provider accepts text-embeddings-inference-typed endpoint",
+			providerType: "text-embeddings-inference",
+			endpointType: "text-embeddings-inference",
+			wantCompat:   true,
+		},
+		{
+			name:         "tei alias resolves to the same profile as the canonical name",
+			providerType: "tei",
+			endpointType: "text-embeddings-inference",
+			wantCompat:   true,
+		},
+		{
+			name:         "text-embeddings-inference provider rejects ollama-typed endpoint",
+			providerType: "text-embeddings-inference",
+			endpointType: "ollama",
+			wantCompat:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			requestProfile := app.createProviderProfile(tt.providerType)
+			normalised := NormaliseProviderType(tt.endpointType)
+
+			got := requestProfile.IsCompatibleWith(normalised)
+			assert.Equal(t, tt.wantCompat, got,
+				"createProviderProfile(%q).IsCompatibleWith(%q)", tt.providerType, tt.endpointType)
+		})
+	}
+}
+
+// TestIsCompatibleWith_OpenAIAlias verifies the domain-level alias directly.
+// This is the smallest possible regression test: revert the routing.go change
+// and this test fails.
+func TestIsCompatibleWith_OpenAIAlias(t *testing.T) {
+	t.Parallel()
+
+	p := domain.NewRequestProfile("/v1/models")
+	p.AddSupportedProfile(domain.ProfileOpenAICompatible)
+
+	if !p.IsCompatibleWith(domain.ProfileOpenAI) {
+		t.Errorf("IsCompatibleWith(%q) should return true when SupportedBy contains %q",
+			domain.ProfileOpenAI, domain.ProfileOpenAICompatible)
+	}
+}

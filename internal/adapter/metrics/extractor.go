@@ -112,3 +112,233 @@ func (e *Extractor) ValidateProfile(profile domain.InferenceProfile) error {
 		"calculations", len(metricsConfig.Calculations))
 
 	return nil
+}
+
+// ExtractMetrics extracts metrics from response data and headers.
+// gjson parsing is synchronous and sub-millisecond for typical payloads,
+// so we call doExtract directly rather than racing against a goroutine timeout,
+// which is unreliable under scheduler pressure and causes spurious nil returns.
+func (e *Extractor) ExtractMetrics(ctx context.Context, data []byte, headers http.Header, providerName string) *domain.ProviderMetrics {
+	if len(data) == 0 && headers == nil {
+		return nil
+	}
+
+	// Bail early if the caller's context is already done.
+	select {
+	case <-ctx.Done():
+		e.failures.Add(1)
+		e.logger.Debug("Metrics extraction skipped: context cancelled", "provider", providerName)
+		return nil
+	default:
+	}
+
+	e.extractionCount.Add(1)
+	return e.doExtract(data, headers, providerName)
+}
+
+// ExtractFromChunk extracts metrics from a response chunk
+func (e *Extractor) ExtractFromChunk(ctx context.Context, chunk []byte, providerName string) *domain.ProviderMetrics {
+	return e.ExtractMetrics(ctx, chunk, nil, providerName)
+}
+
+// doExtract performs the actual extraction using gjson for speed
+func (e *Extractor) doExtract(data []byte, headers http.Header, providerName string) *domain.ProviderMetrics {
+	if len(data) == 0 && headers == nil {
+		return nil
+	}
+
+	profile, err := e.profileFactory.GetProfile(providerName)
+	if err != nil || profile == nil {
+		return nil
+	}
+
+	config := profile.GetConfig()
+	if config == nil || !config.Metrics.Extraction.Enabled {
+		return nil
+	}
+
+	// Ensure profile is validated (only validate once per profile)
+	profileName := profile.GetName()
+	if _, validated := e.validatedProfiles.Load(profileName); !validated {
+		if err := e.ValidateProfile(profile); err == nil {
+			e.validatedProfiles.Store(profileName, true)
+		}
+	}
+
+	metricsConfig := config.Metrics.Extraction
+	metrics := &domain.ProviderMetrics{}
+
+	// Parse JSON once using gjson (much faster than encoding/json)
+	var jsonResult gjson.Result
+	if len(data) > 0 && metricsConfig.Source != "response_headers" {
+		jsonResult = gjson.ParseBytes(data)
+		if !jsonResult.Exists() {
+			return nil
+		}
+	}
+
+	// Extract values using cached gjson paths
+	values := make(map[string]interface{})
+	for field := range metricsConfig.Paths {
+		cacheKey := fmt.Sprintf("%s:%s", profile.GetName(), field)
+		if pathObj, ok := e.fieldPaths.Load(cacheKey); ok {
+			path, ok := pathObj.(string)
+			if !ok {
+				continue
+			}
+			result := jsonResult.Get(path)
+			if result.Exists() {
+				// Store the raw value for calculations
+				values[field] = result.Value()
+
+				// Also map directly to metrics fields
+				e.mapFieldToMetrics(field, result, metrics)
+			}
+		}
+	}
+
+	// Execute pre-compiled calculations
+	e.runCalculations(profile.GetName(), values, metricsConfig.Calculations, metrics)
+
+	// Extract from headers if configured
+	if headers != nil && len(metricsConfig.Headers) > 0 {
+		e.extractFromHeaders(headers, metricsConfig, metrics)
+	}
+
+	return metrics
+}
+
+// mapFieldToMetrics maps extracted field values directly to metrics struct
+func (e *Extractor) mapFieldToMetrics(field string, result gjson.Result, metrics *domain.ProviderMetrics) {
+	switch field {
+	case "input_tokens":
+		metrics.InputTokens = util.SafeInt32(result.Int())
+	case "output_tokens":
+		metrics.OutputTokens = util.SafeInt32(result.Int())
+	case "total_tokens":
+		metrics.TotalTokens = util.SafeInt32(result.Int())
+	case "model":
+		metrics.Model = result.String()
+	case "finish_reason":
+		metrics.FinishReason = result.String()
+	case "done", "is_complete":
+		metrics.IsComplete = result.Bool()
+	case "prompt_duration_ns", "prompt_eval_duration":
+		ms := result.Int() / 1_000_000
+		metrics.PromptMs = util.SafeInt32(ms)
+		metrics.TTFTMs = metrics.PromptMs // TTFT approximation
+	case "eval_duration_ns", "eval_duration":
+		ms := result.Int() / 1_000_000
+		metrics.GenerationMs = util.SafeInt32(ms)
+	case "total_duration_ns":
+		ms := result.Int() / 1_000_000
+		metrics.TotalMs = util.SafeInt32(ms)
+	case "load_duration_ns":
+		ms := result.Int() / 1_000_000
+		metrics.ModelLoadMs = util.SafeInt32(ms)
+	}
+}
+
+// runCalculations executes pre-compiled expr expressions
+func (e *Extractor) runCalculations(profileName string, values map[string]interface{}, calculations map[string]string, metrics *domain.ProviderMetrics) {
+	// Convert all values to float64 for calculations
+	env := make(map[string]interface{})
+	for k, v := range values {
+		switch val := v.(type) {
+		case float64:
+			env[k] = val
+		case float32:
+			env[k] = float64(val)
+		case int:
+			env[k] = float64(val)
+		case int32:
+			env[k] = float64(val)
+		case int64:
+			env[k] = float64(val)
+		default:
+			env[k] = 0.0
+		}
+	}
+
+	// Execute each pre-compiled calculation
+	for field := range calculations {
+		cacheKey := fmt.Sprintf("%s:%s", profileName, field)
+		if programObj, ok := e.compiledExprs.Load(cacheKey); ok {
+			program, ok := programObj.(*vm.Program)
+			if !ok {
+				continue
+			}
+
+			result, err := expr.Run(program, env)
+			if err == nil {
+				if val, ok := result.(float64); ok {
+					switch field {
+					case "tokens_per_second":
+						metrics.TokensPerSecond = util.SafeFloat32(val)
+					case "ttft_ms":
+						metrics.TTFTMs = util.SafeInt32(int64(val))
+					case "total_ms":
+						metrics.TotalMs = util.SafeInt32(int64(val))
+					case "model_load_ms":
+						metrics.ModelLoadMs = util.SafeInt32(int64(val))
+					}
+				}
+			}
+		}
+	}
+
+	// Calculate tokens per second if we have the data and no calculation provided
+	if metrics.TokensPerSecond == 0 && metrics.OutputTokens > 0 && metrics.GenerationMs > 0 {
+		tps := float64(metrics.OutputTokens) * 1000.0 / float64(metrics.GenerationMs)
+		metrics.TokensPerSecond = util.SafeFloat32(tps)
+	}
+
+	// Ensure total tokens is set if we have input and output
+	if metrics.TotalTokens == 0 && metrics.InputTokens > 0 && metrics.OutputTokens > 0 {
+		metrics.TotalTokens = metrics.InputTokens + metrics.OutputTokens
+	}
+}
+
+// extractFromHeaders extracts metrics from response headers
+func (e *Extractor) extractFromHeaders(headers http.Header, config domain.MetricsExtractionConfig, _ *domain.ProviderMetrics) {
+	// Implementation remains similar
+	for field, headerName := range config.Headers {
+		if value := headers.Get(headerName); value != "" {
+			// Parse and store header values as needed
+			_ = field // TODO: Map header fields to metrics
+		}
+	}
+}
+
+// convertToGjsonPath converts JSONPath to gjson syntax
+// gjson uses simpler dot notation: $.foo.bar becomes foo.bar
+func convertToGjsonPath(jsonPath string) string {
+	if jsonPath == "$" || jsonPath == "" {
+		return ""
+	}
+
+	s := jsonPath
+
+	// remove the leasing "$." or "$"
+	if strings.HasPrefix(s, "$.") {
+		s = s[2:]
+	} else if strings.HasPrefix(s, "$") {
+		s = s[1:]
+	}
+
+	// convert bracket array indices: foo[0].bar -> foo.0.bar
+	s = regexp.MustCompile(`\[(\d+)\]`).ReplaceAllString(s, `.$1`)
+
+	// convert bracket keys: ['field'] -> .field
+	s = regexp.MustCompile(`\['([^']+)'\]`).ReplaceAllString(s, `.$1`)
+
+	// trim any accidental leading dots, this sometimes happens in our lab
+	s = strings.TrimPrefix(s, ".")
+
+	return s
+}
+
+// GetStats returns extraction statistics
+func (e *Extractor) GetStats() (int64, int64) {
+	return e.extractionCount.Load(), e.failures.Load()
+}
