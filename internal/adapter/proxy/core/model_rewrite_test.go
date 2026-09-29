@@ -105,3 +105,327 @@ func TestRewriteModelForAlias_NonJSONBody(t *testing.T) {
 	endpoint := &domain.Endpoint{URLString: "http://ollama:11434"}
 	RewriteModelForAlias(ctx, r, endpoint)
 
+	// Body should be unchanged since it's not valid JSON
+	resultBody, _ := io.ReadAll(r.Body)
+	if string(resultBody) != body {
+		t.Errorf("non-JSON body should be unchanged, got %s", string(resultBody))
+	}
+}
+
+func TestRewriteModelForAlias_NoModelField(t *testing.T) {
+	aliasMap := map[string]string{
+		"http://ollama:11434": "gpt-oss:120b",
+	}
+	ctx := context.WithValue(context.Background(), constants.ContextModelAliasMapKey, aliasMap)
+	body := `{"messages": [{"role": "user", "content": "hello"}]}`
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
+
+	endpoint := &domain.Endpoint{URLString: "http://ollama:11434"}
+	RewriteModelForAlias(ctx, r, endpoint)
+
+	// Body should be unchanged since there's no model field
+	resultBody, _ := io.ReadAll(r.Body)
+	if string(resultBody) != body {
+		t.Errorf("body without model field should be unchanged, got %s", string(resultBody))
+	}
+}
+
+func TestRewriteModelForAlias_UpdatesContentLength(t *testing.T) {
+	aliasMap := map[string]string{
+		"http://ollama:11434": "a-much-longer-model-name-than-the-original",
+	}
+	ctx := context.WithValue(context.Background(), constants.ContextModelAliasMapKey, aliasMap)
+	body := `{"model": "short"}`
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
+	originalLength := r.ContentLength
+
+	endpoint := &domain.Endpoint{URLString: "http://ollama:11434"}
+	RewriteModelForAlias(ctx, r, endpoint)
+
+	resultBody, _ := io.ReadAll(r.Body)
+	if r.ContentLength == originalLength {
+		t.Error("content length should have been updated")
+	}
+	if r.ContentLength != int64(len(resultBody)) {
+		t.Errorf("content length %d should match body length %d", r.ContentLength, len(resultBody))
+	}
+}
+
+func TestRewriteModelField(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		newModel  string
+		wantModel string
+	}{
+		{
+			name:      "simple replacement",
+			body:      `{"model": "old-model"}`,
+			newModel:  "new-model",
+			wantModel: "new-model",
+		},
+		{
+			name:      "model with colon (ollama format)",
+			body:      `{"model": "gpt-oss-120b"}`,
+			newModel:  "gpt-oss:120b",
+			wantModel: "gpt-oss:120b",
+		},
+		{
+			name:      "preserves other fields",
+			body:      `{"model": "old", "temperature": 0.7, "messages": []}`,
+			newModel:  "new",
+			wantModel: "new",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := rewriteModelField([]byte(tt.body), tt.newModel)
+
+			var parsed map[string]json.RawMessage
+			if err := json.Unmarshal(result, &parsed); err != nil {
+				t.Fatalf("failed to parse result: %v", err)
+			}
+
+			var modelName string
+			if err := json.Unmarshal(parsed["model"], &modelName); err != nil {
+				t.Fatalf("failed to parse model: %v", err)
+			}
+
+			if modelName != tt.wantModel {
+				t.Errorf("expected model %q, got %q", tt.wantModel, modelName)
+			}
+		})
+	}
+}
+
+func TestRewriteModelField_PreservesKeyOrder(t *testing.T) {
+	// The body has keys in a specific order with specific formatting
+	body := `{"messages": [{"role": "user", "content": "hello"}], "model": "gpt-oss-120b", "temperature": 0.7, "stream": true}`
+	expected := `{"messages": [{"role": "user", "content": "hello"}], "model": "gpt-oss:120b", "temperature": 0.7, "stream": true}`
+
+	result := rewriteModelField([]byte(body), "gpt-oss:120b")
+
+	if string(result) != expected {
+		t.Errorf("expected byte-identical output except model name:\n  got:  %s\n  want: %s", string(result), expected)
+	}
+}
+
+func TestRewriteModelField_PreservesWhitespace(t *testing.T) {
+	// Pretty-printed JSON should stay pretty-printed
+	body := `{
+  "model": "original-model",
+  "messages": [
+    {"role": "user", "content": "hello"}
+  ],
+  "temperature": 0.7
+}`
+	expected := `{
+  "model": "rewritten-model",
+  "messages": [
+    {"role": "user", "content": "hello"}
+  ],
+  "temperature": 0.7
+}`
+
+	result := rewriteModelField([]byte(body), "rewritten-model")
+
+	if string(result) != expected {
+		t.Errorf("expected whitespace-preserved output:\n  got:  %s\n  want: %s", string(result), expected)
+	}
+}
+
+func TestRewriteModelField_PreservesExactBytes(t *testing.T) {
+	// Verify that the output is byte-identical to input except for the model name
+	body := `{"model":"alias-name","messages":[{"role":"user","content":"hello world"}],"temperature":0.7,"max_tokens":100,"stream":true}`
+	expected := `{"model":"actual-model","messages":[{"role":"user","content":"hello world"}],"temperature":0.7,"max_tokens":100,"stream":true}`
+
+	result := rewriteModelField([]byte(body), "actual-model")
+
+	if string(result) != expected {
+		t.Errorf("output should be byte-identical except model name:\n  got:  %s\n  want: %s", string(result), expected)
+	}
+}
+
+func TestRewriteModelField_ModelInNestedContent(t *testing.T) {
+	// The word "model" appears inside a message string — the rewriter must only
+	// touch the top-level "model" key, not text buried in nested values.
+	body := `{"messages": [{"role": "system", "content": "Use model: \"gpt-4\""}], "model": "alias-name"}`
+	expected := `{"messages": [{"role": "system", "content": "Use model: \"gpt-4\""}], "model": "actual-model"}`
+
+	result := rewriteModelField([]byte(body), "actual-model")
+
+	if string(result) != expected {
+		t.Errorf("nested model reference should not be touched:\n  got:  %s\n  want: %s", string(result), expected)
+	}
+}
+
+func TestRewriteModelField_ModelKeyInNestedObject(t *testing.T) {
+	// A nested object also has a "model" key — only the top-level one should change.
+	body := `{"config": {"model": "inner-model"}, "model": "alias-name"}`
+	result := rewriteModelField([]byte(body), "new-top-model")
+
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		t.Fatalf("failed to parse result: %v", err)
+	}
+
+	var topModel string
+	if err := json.Unmarshal(parsed["model"], &topModel); err != nil {
+		t.Fatalf("failed to parse top-level model: %v", err)
+	}
+	if topModel != "new-top-model" {
+		t.Errorf("top-level model should be rewritten, got %q", topModel)
+	}
+
+	// The nested model must be untouched.
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(parsed["config"], &cfg); err != nil {
+		t.Fatalf("failed to parse config: %v", err)
+	}
+	var innerModel string
+	if err := json.Unmarshal(cfg["model"], &innerModel); err != nil {
+		t.Fatalf("failed to parse inner model: %v", err)
+	}
+	if innerModel != "inner-model" {
+		t.Errorf("nested model should be unchanged, got %q", innerModel)
+	}
+}
+
+func TestRewriteModelField_SpecialCharacters(t *testing.T) {
+	// Model names with characters that require JSON escaping must round-trip correctly.
+	tests := []struct {
+		name     string
+		newModel string
+	}{
+		{"backslash", `path\to\model`},
+		{"double-quote", `model"v2`},
+		{"unicode", "模型/llama3"},
+		{"tab and newline", "model\twith\nnewlines"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := `{"model": "original"}`
+			result := rewriteModelField([]byte(body), tt.newModel)
+
+			var parsed map[string]json.RawMessage
+			if err := json.Unmarshal(result, &parsed); err != nil {
+				t.Fatalf("result is not valid JSON: %v — body: %s", err, result)
+			}
+			var got string
+			if err := json.Unmarshal(parsed["model"], &got); err != nil {
+				t.Fatalf("failed to decode model field: %v", err)
+			}
+			if got != tt.newModel {
+				t.Errorf("want %q, got %q", tt.newModel, got)
+			}
+		})
+	}
+}
+
+func TestRewriteModelField_InvalidJSON(t *testing.T) {
+	body := []byte("not json")
+	result := rewriteModelField(body, "new-model")
+	if !bytes.Equal(result, body) {
+		t.Error("invalid JSON should return unchanged body")
+	}
+}
+
+func TestRewriteModelField_NoModelField(t *testing.T) {
+	body := []byte(`{"messages": []}`)
+	result := rewriteModelField(body, "new-model")
+	if !bytes.Equal(result, body) {
+		t.Error("body without model field should return unchanged")
+	}
+}
+
+func TestRewriteModelForAlias_WithEmptyBody(t *testing.T) {
+	aliasMap := map[string]string{
+		"http://ollama:11434": "gpt-oss:120b",
+	}
+	ctx := context.WithValue(context.Background(), constants.ContextModelAliasMapKey, aliasMap)
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(""))
+	r.ContentLength = 0
+
+	endpoint := &domain.Endpoint{URLString: "http://ollama:11434"}
+	// Should not panic
+	RewriteModelForAlias(ctx, r, endpoint)
+}
+
+func TestRewriteModelForAlias_WithEmptyAliasMap(t *testing.T) {
+	aliasMap := map[string]string{}
+	ctx := context.WithValue(context.Background(), constants.ContextModelAliasMapKey, aliasMap)
+	body := `{"model": "test-model"}`
+	r := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(body))
+
+	endpoint := &domain.Endpoint{URLString: "http://ollama:11434"}
+	RewriteModelForAlias(ctx, r, endpoint)
+
+	// Body should be unchanged because alias map is empty
+	resultBody, _ := io.ReadAll(r.Body)
+	if string(resultBody) != body {
+		t.Errorf("body should be unchanged with empty alias map, got %s", string(resultBody))
+	}
+}
+
+// Ensure the http.Request's Body can be read after rewrite
+func TestRewriteModelForAlias_BodyReadableAfterRewrite(t *testing.T) {
+	aliasMap := map[string]string{
+		"http://ollama:11434": "rewritten-model",
+	}
+	ctx := context.WithValue(context.Background(), constants.ContextModelAliasMapKey, aliasMap)
+	body := `{"model": "original-model"}`
+	r, _ := http.NewRequestWithContext(ctx, "POST", "/v1/chat/completions", bytes.NewBufferString(body))
+	r.ContentLength = int64(len(body))
+
+	endpoint := &domain.Endpoint{URLString: "http://ollama:11434"}
+	RewriteModelForAlias(ctx, r, endpoint)
+
+	// Read body first time
+	body1, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("first read failed: %v", err)
+	}
+	if len(body1) == 0 {
+		t.Error("first read should return non-empty body")
+	}
+}
+
+func TestResolvedModelName(t *testing.T) {
+	t.Parallel()
+
+	endpoint := &domain.Endpoint{URLString: "http://ollama-1:11434"}
+	withCanonical := context.WithValue(context.Background(), constants.ContextCanonicalModelKey,
+		CanonicalModel{Requested: "all-minilm", Native: "all-minilm:latest"})
+	withAlias := context.WithValue(withCanonical, constants.ContextModelAliasMapKey,
+		map[string]string{endpoint.URLString: "aliased:7b"})
+
+	withTargets := context.WithValue(context.Background(), constants.ContextModelAliasMapKey,
+		map[string]string{endpoint.URLString: "all-minilm"})
+	withTargets = context.WithValue(withTargets, constants.ContextCanonicalModelKey,
+		CanonicalModel{Requested: "embed", Targets: map[string]string{"all-minilm": "all-minilm:latest"}})
+
+	tests := []struct {
+		ctx       context.Context
+		endpoint  *domain.Endpoint
+		name      string
+		requested string
+		want      string
+	}{
+		{withTargets, endpoint, "a bare alias target is labelled with its native name", "embed", "all-minilm:latest"},
+		{context.Background(), endpoint, "nothing in context keeps the request", "all-minilm", "all-minilm"},
+		{withCanonical, endpoint, "bare name is labelled with its native name", "all-minilm", "all-minilm:latest"},
+		{withCanonical, nil, "the label does not need an endpoint", "all-minilm", "all-minilm:latest"},
+		{withCanonical, endpoint, "a different requested name is left alone", "other", "other"},
+		{withAlias, endpoint, "an alias map entry for the endpoint wins", "all-minilm", "aliased:7b"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := ResolvedModelName(tt.ctx, tt.endpoint, tt.requested); got != tt.want {
+				t.Errorf("ResolvedModelName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
