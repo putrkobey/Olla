@@ -102,3 +102,419 @@ func (a *Application) mountDashboard() {
 			"route", dashboard.DashboardRoute)
 		return
 	}
+	if _, exists := routes[dashboard.SlashlessDashboardRoute]; exists {
+		a.logger.Error("dashboard route collision; skipping mount",
+			"route", dashboard.SlashlessDashboardRoute)
+		return
+	}
+	if !a.Config.Dashboard.Enabled {
+		return
+	}
+	dashboard.RegisterRoutes(a.routeRegistry, a.Config.Dashboard, a.logger, dashboardHandlerFactory(), a.throttles)
+}
+
+// translatorRejectWriter returns the writer that formats a security rejection in the
+// translator's own error schema, or nil (plain text) when it has none. The quiet variant
+// is preferred: the rate limiter already reports the rejection through its sampled log.
+func translatorRejectWriter(trans translator.RequestTranslator) security.RejectFunc {
+	var write func(w http.ResponseWriter, err error, statusCode int)
+	switch ew := trans.(type) {
+	case translator.QuietErrorWriter:
+		write = ew.WriteErrorQuiet
+	case translator.ErrorWriter:
+		write = ew.WriteError
+	default:
+		return nil
+	}
+	return func(w http.ResponseWriter, status int, message string) {
+		// The access-log middleware that assigns the request ID sits behind the security
+		// chain, so a rejection has none yet; SDKs read request-id for correlation.
+		if w.Header().Get(constants.HeaderXOllaRequestID) == "" {
+			w.Header().Set(constants.HeaderXOllaRequestID, util.GenerateRequestID())
+		}
+		write(w, errors.New(message), status)
+	}
+}
+
+// registerTranslatorRoutes dynamically registers routes for all translators
+// Translators that implement PathProvider interface provide their own API paths
+// This enables adding new translators without modifying the routing code
+func (a *Application) registerTranslatorRoutes() {
+	if a.translatorRegistry == nil {
+		a.logger.Warn("Translator registry not available, skipping translator routes")
+		return
+	}
+
+	translators := a.translatorRegistry.GetAll()
+	a.logger.InfoWithCount("Starting registering translator routes", len(translators))
+
+	for name, trans := range translators {
+		// Check if translator implements PathProvider for dynamic route registration
+		// Translators without PathProvider must be registered manually
+		if pathProvider, ok := trans.(translator.PathProvider); ok {
+			path := pathProvider.GetAPIPath()
+			handler := a.translationHandler(trans)
+			reject := translatorRejectWriter(trans)
+			bodyLimit := translatorBodyLimit(trans)
+
+			// Translator routes are inference entry points (Claude Code's main path), so
+			// they register through RegisterTranslatorRoute to sit behind the rate and
+			// size limits like proxy routes. A translator added later is covered too.
+			a.routeRegistry.RegisterTranslatorRoute(
+				path,
+				handler,
+				name+" Messages API",
+				"POST",
+				reject,
+				bodyLimit,
+			)
+
+			// Register models endpoint for translators
+			// Uses base path from translator + "/models" (e.g., /olla/anthropic/v1/models)
+			modelsPath := extractBasePath(path) + "/models"
+			modelsHandler := a.translatorModelsHandler(trans)
+
+			a.routeRegistry.RegisterTranslatorRoute(
+				modelsPath,
+				modelsHandler,
+				name+" Models API",
+				"GET",
+				reject,
+				bodyLimit,
+			)
+
+			// Register token counting endpoint for translators that support it
+			// Uses message path + "_count_tokens" (e.g., /olla/anthropic/v1/messages/count_tokens)
+			if _, ok := trans.(translator.TokenCounter); ok {
+				tokenCountPath := path + "/count_tokens"
+				tokenCountHandler := a.tokenCountHandler(trans)
+
+				a.routeRegistry.RegisterTranslatorRoute(
+					tokenCountPath,
+					tokenCountHandler,
+					name+" Token Count API",
+					"POST",
+					reject,
+					bodyLimit,
+				)
+
+				a.logger.Debug("Registered translator routes",
+					"translator", name,
+					"messages_path", path,
+					"models_path", modelsPath,
+					"token_count_path", tokenCountPath)
+
+				a.logger.InfoWithEndpoint(" ", name, "path", path)
+			} else {
+				a.logger.Debug("Registered translator routes",
+					"translator", name,
+					"messages_path", path,
+					"models_path", modelsPath)
+			}
+		} else {
+			a.logger.Debug("Translator does not implement PathProvider, skipping route registration",
+				"translator", name)
+		}
+	}
+
+	a.logger.InfoWithCount("Finished registering translator routes", len(translators))
+}
+
+// extractBasePath extracts the base path from a translator's API path
+// For example: "/olla/anthropic/v1/messages" -> "/olla/anthropic/v1"
+// Handles trailing slashes: "/olla/anthropic/v1/messages/" -> "/olla/anthropic/v1"
+func extractBasePath(path string) string {
+	// Remove any trailing slashes first
+	path = strings.TrimRight(path, "/")
+
+	// Find the last slash and return everything before it
+	for i := len(path) - 1; i >= 0; i-- {
+		if path[i] == '/' {
+			return path[:i]
+		}
+	}
+	return path
+}
+
+// registerProviderRoutes builds HTTP paths from provider YAML configurations.
+// Falls back to static registration in test environments without profile loading.
+func (a *Application) registerProviderRoutes() {
+	if a.profileFactory == nil {
+		a.logger.Warn("Profile factory not available, using static route registration")
+		a.registerStaticProviderRoutes()
+		return
+	}
+
+	// Need all profiles for complete route coverage
+	profiles := a.profileFactory.GetAvailableProfiles()
+
+	// openai-compatible is special - it's a routing target but not listed as a provider
+	profiles = append(profiles, "openai-compatible")
+
+	a.logger.Info("Registering provider routes from profiles", "count", len(profiles))
+
+	for _, profileName := range profiles {
+		profile, err := a.profileFactory.GetProfile(profileName)
+		if err != nil {
+			// openai-compatible might not exist in minimal test setups
+			if profileName != "openai-compatible" {
+				a.logger.Warn("Failed to get profile", "profile", profileName, "error", err)
+			}
+			continue
+		}
+
+		config := profile.GetConfig()
+		if config == nil || len(config.Routing.Prefixes) == 0 {
+			a.logger.Debug("Profile has no routing prefixes", "profile", profileName)
+			continue
+		}
+
+		// Each prefix becomes a distinct URL namespace (e.g., /olla/lmstudio/, /olla/lm-studio/)
+		a.logger.Debug("Profile has routing prefixes", "profile", profileName, "prefixes", config.Routing.Prefixes)
+		for _, prefix := range config.Routing.Prefixes {
+			a.registerProviderPrefixRoutes(prefix, profileName, config)
+		}
+	}
+}
+
+// hasModelListingFormat reports whether a converter exists for a profile's
+// response format, i.e. whether Olla can answer a native model listing in it.
+func (a *Application) hasModelListingFormat(format string) bool {
+	return format != "" && a.converterFactory != nil && slices.Contains(a.converterFactory.GetSupportedFormats(), format)
+}
+
+// routeMethodAny labels a route that answers every HTTP method. The registry only
+// records Method for the startup table, so a specific verb there would misstate it.
+const routeMethodAny = "ANY"
+
+// registerProviderPrefixRoutes creates the full routing table for one provider prefix.
+// This handles both native endpoints (e.g., Ollama's /api/tags) and OpenAI compatibility.
+func (a *Application) registerProviderPrefixRoutes(prefix, profileName string, config *domain.ProfileConfig) {
+	basePath := constants.DefaultOllaProxyPathPrefix + prefix + constants.DefaultPathPrefix
+
+	a.logger.Debug("Registering routes for provider", "prefix", prefix, "profile", profileName)
+
+	// Model discovery varies by provider - some use /api/tags, others /v1/models
+	if config.API.ModelDiscoveryPath != "" {
+		// Provider's native API format
+		nativePath := basePath + strings.TrimPrefix(config.API.ModelDiscoveryPath, constants.DefaultPathPrefix)
+
+		// Ollama has unique endpoints beyond standard model discovery
+		if profileName == constants.ProviderTypeOllama {
+			a.routeRegistry.RegisterWithMethod(nativePath,
+				a.ollamaModelsHandler,
+				prefix+" models listing", "GET")
+
+			// Loaded state lives on each instance, so /api/ps is fanned out and merged
+			// rather than forwarded to whichever instance the balancer picks.
+			// It fans out to every Ollama host, so it takes the proxy route's rate-limit
+			// chain (the registry applies that to proxy routes only), as it did when it
+			// was forwarded through the proxy.
+			a.routeRegistry.RegisterProxyRoute(basePath+"api/ps",
+				a.ollamaRunningModelsHandler,
+				prefix+" running models", "GET")
+			a.routeRegistry.RegisterWithMethod(basePath+"api/show",
+				a.ollamaModelShowHandler,
+				prefix+" model details", routeMethodAny)
+
+			// Model management would require persistent storage - explicitly unsupported.
+			// RouteRegistry.WireUp does not filter by method, so these answer 501 to every
+			// method (HEAD and OPTIONS included); routeMethodAny says so in the route table.
+			a.routeRegistry.RegisterWithMethod(basePath+"api/pull", a.unsupportedModelManagementHandler, "Model pull (unsupported)", routeMethodAny)
+			a.routeRegistry.RegisterWithMethod(basePath+"api/push", a.unsupportedModelManagementHandler, "Model push (unsupported)", routeMethodAny)
+			a.routeRegistry.RegisterWithMethod(basePath+"api/create", a.unsupportedModelManagementHandler, "Model create (unsupported)", routeMethodAny)
+			a.routeRegistry.RegisterWithMethod(basePath+"api/copy", a.unsupportedModelManagementHandler, "Model copy (unsupported)", routeMethodAny)
+			a.routeRegistry.RegisterWithMethod(basePath+"api/delete", a.unsupportedModelManagementHandler, "Model delete (unsupported)", routeMethodAny)
+			// blob upload is the first step of api/create, so it is refused with it
+			a.routeRegistry.RegisterWithMethod(basePath+"api/blobs/", a.unsupportedModelManagementHandler, "Model blobs (unsupported)", routeMethodAny)
+		} else if a.hasModelListingFormat(config.Request.ResponseFormat) {
+			// Serve the discovery path from the registry in the profile's own
+			// response format. A format with no converter means the discovery
+			// path is not a model listing Olla can reproduce (TEI's /info is
+			// model metadata), so the route is left to the catch-all proxy and
+			// forwarded verbatim to the backend.
+			a.routeRegistry.RegisterWithMethod(nativePath,
+				a.genericProviderModelsHandler(prefix, config.Request.ResponseFormat),
+				prefix+" models", "GET")
+		}
+	}
+
+	// OpenAI compatibility enables cross-provider client support
+	if config.API.OpenAICompatible {
+		openAIPath := basePath + "v1/models"
+
+		// Provider-specific handlers optimise for their unique response formats
+		switch profileName {
+		case constants.ProviderTypeOllama:
+			a.routeRegistry.RegisterWithMethod(openAIPath,
+				a.ollamaOpenAIModelsHandler,
+				prefix+" models (OpenAI format)", "GET")
+		case constants.ProviderTypeLMStudio:
+			a.routeRegistry.RegisterWithMethod(openAIPath,
+				a.lmstudioOpenAIModelsHandler,
+				prefix+" models (OpenAI format)", "GET")
+			// LM Studio uses multiple OpenAI paths for different client versions
+			a.routeRegistry.RegisterWithMethod(basePath+"api/v1/models",
+				a.lmstudioOpenAIModelsHandler,
+				prefix+" models (OpenAI format alt path)", "GET")
+			// v0 provides richer model metadata than standard OpenAI
+			a.routeRegistry.RegisterWithMethod(basePath+"api/v0/models",
+				a.lmstudioEnhancedModelsHandler,
+				prefix+" enhanced models", "GET")
+		case constants.ProviderTypeOpenAICompat:
+			// openai-compatible.yaml owns the "openai" URL prefix as well as its
+			// own name — so profileName here is always "openai-compatible", but the
+			// prefix variable can be "openai". We dispatch on prefix, not profileName,
+			// so /olla/openai/... gets the full openaiModelsHandler while other
+			// openai-compatible prefixes (e.g. a custom alias) get the generic one.
+			if prefix == constants.ProviderTypeOpenAI {
+				a.routeRegistry.RegisterWithMethod(openAIPath,
+					a.openaiModelsHandler,
+					"OpenAI-compatible models", "GET")
+			} else {
+				a.routeRegistry.RegisterWithMethod(openAIPath,
+					a.genericProviderModelsHandler(prefix, constants.ProviderTypeOpenAI),
+					prefix+" models (OpenAI format)", "GET")
+			}
+		default:
+			// Unknown providers still get OpenAI compatibility
+			a.routeRegistry.RegisterWithMethod(openAIPath,
+				a.genericProviderModelsHandler(prefix, constants.ProviderTypeOpenAI),
+				prefix+" models (OpenAI format)", "GET")
+		}
+	}
+
+	// Catch-all must come last - forwards everything else to the backend
+	a.routeRegistry.RegisterProxyRoute(basePath, a.providerProxyHandler, prefix+" proxy", "")
+}
+
+// getStaticProviders defines minimal routing for tests without YAML configs.
+// This duplicates some YAML content but ensures tests can run independently.
+func getStaticProviders(a *Application) map[string]staticProvider {
+	return map[string]staticProvider{
+		constants.ProviderTypeLemonade: {
+			prefixes: []string{constants.ProviderTypeLemonade},
+			routes: []staticRoute{
+				{path: "api/v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeLemonade, constants.ProviderTypeOpenAI), description: "Lemonade models (OpenAI format)", method: "GET"},
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeLemonade, constants.ProviderTypeOpenAI), description: "Lemonade models (OpenAI format alt path)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "Lemonade proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeOllama: {
+			prefixes: []string{constants.ProviderTypeOllama},
+			routes: []staticRoute{
+				{path: "api/tags", handler: a.ollamaModelsHandler, description: "models listing", method: "GET"},
+				{path: "v1/models", handler: a.ollamaOpenAIModelsHandler, description: "models (OpenAI format)", method: "GET"},
+				{path: "api/ps", handler: a.ollamaRunningModelsHandler, description: "running models", method: "GET", rateLimited: true},
+				{path: "api/show", handler: a.ollamaModelShowHandler, description: "model details", method: routeMethodAny},
+				{path: "api/pull", handler: a.unsupportedModelManagementHandler, description: "Model pull (unsupported)", method: routeMethodAny},
+				{path: "api/push", handler: a.unsupportedModelManagementHandler, description: "Model push (unsupported)", method: routeMethodAny},
+				{path: "api/create", handler: a.unsupportedModelManagementHandler, description: "Model create (unsupported)", method: routeMethodAny},
+				{path: "api/copy", handler: a.unsupportedModelManagementHandler, description: "Model copy (unsupported)", method: routeMethodAny},
+				{path: "api/delete", handler: a.unsupportedModelManagementHandler, description: "Model delete (unsupported)", method: routeMethodAny},
+				{path: "api/blobs/", handler: a.unsupportedModelManagementHandler, description: "Model blobs (unsupported)", method: routeMethodAny},
+				{path: "", handler: a.providerProxyHandler, description: "proxy", isProxy: true},
+			},
+		},
+		constants.ProviderPrefixLMStudio2: {
+			// Mirror the prefixes from lmstudio.yaml for consistency
+			prefixes: []string{constants.ProviderPrefixLMStudio1, constants.ProviderPrefixLMStudio2, constants.ProviderPrefixLMStudio3},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.lmstudioOpenAIModelsHandler, description: "models (OpenAI format)", method: "GET"},
+				{path: "api/v1/models", handler: a.lmstudioOpenAIModelsHandler, description: "models (OpenAI format alt path)", method: "GET"},
+				{path: "api/v0/models", handler: a.lmstudioEnhancedModelsHandler, description: "enhanced models", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeOpenAI: {
+			prefixes: []string{constants.ProviderTypeOpenAI},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.openaiModelsHandler, description: "OpenAI-compatible models", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "OpenAI-compatible proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeLMDeploy: {
+			prefixes: []string{constants.ProviderTypeLMDeploy},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeLMDeploy, constants.ProviderTypeOpenAI), description: "LMDeploy models (OpenAI format)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "LMDeploy proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeSGLang: {
+			prefixes: []string{constants.ProviderTypeSGLang},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeSGLang, constants.ProviderTypeOpenAI), description: "SGLang models (OpenAI format)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "SGLang proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeVLLM: {
+			prefixes: []string{constants.ProviderTypeVLLM},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeVLLM, constants.ProviderTypeOpenAI), description: "vLLM models (OpenAI format)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "vLLM proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeOMLX: {
+			prefixes: []string{constants.ProviderPrefixOMLX},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeOMLX, constants.ProviderTypeOpenAI), description: "oMLX models (OpenAI format)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "oMLX proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeDockerMR: {
+			prefixes: []string{constants.ProviderPrefixDockerMR},
+			routes: []staticRoute{
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeDockerMR, constants.ProviderTypeOpenAI), description: "Docker Model Runner models (OpenAI format)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "Docker Model Runner proxy", isProxy: true},
+			},
+		},
+		constants.ProviderTypeTextEmbeddingsInference: {
+			prefixes: []string{constants.ProviderPrefixTextEmbeddingsInference1, constants.ProviderPrefixTextEmbeddingsInference2},
+			routes: []staticRoute{
+				// /info is TEI's discovery path - model metadata, not a listing -
+				// so it is left to the catch-all proxy and forwarded verbatim.
+				{path: "v1/models", handler: a.genericProviderModelsHandler(constants.ProviderTypeTextEmbeddingsInference, constants.ProviderTypeOpenAI), description: "Text Embeddings Inference models (OpenAI format)", method: "GET"},
+				{path: "", handler: a.providerProxyHandler, description: "Text Embeddings Inference proxy", isProxy: true},
+			},
+		},
+	}
+}
+
+// registerStaticProviderRoutes provides hardcoded routing for test isolation.
+// Production always uses profile-based routing from YAML.
+func (a *Application) registerStaticProviderRoutes() {
+	providers := getStaticProviders(a)
+
+	// Build routes for all static providers
+	for providerName, provider := range providers {
+		for _, prefix := range provider.prefixes {
+			basePath := fmt.Sprintf("%s%s/", constants.DefaultOllaProxyPathPrefix, prefix)
+
+			// Human-readable names for logging and debugging
+			displayName := providerName
+			if providerName == constants.ProviderTypeLMStudio {
+				displayName = constants.ProviderDisplayLMStudio
+				if prefix != constants.ProviderPrefixLMStudio1 {
+					displayName += fmt.Sprintf(" (%s)", prefix)
+				}
+			} else if providerName == constants.ProviderTypeOllama {
+				displayName = constants.ProviderDisplayOllama
+			}
+
+			// Add all routes for this prefix
+			for _, route := range provider.routes {
+				fullPath := basePath + route.path
+				desc := fmt.Sprintf("%s %s", displayName, route.description)
+
+				switch {
+				case route.isProxy:
+					a.routeRegistry.RegisterProxyRoute(basePath, route.handler, desc, "")
+				case route.rateLimited:
+					a.routeRegistry.RegisterProxyRoute(fullPath, route.handler, desc, route.method)
+				default:
+					a.routeRegistry.RegisterWithMethod(fullPath, route.handler, desc, route.method)
+				}
+			}
+		}
+	}
+}

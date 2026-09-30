@@ -177,3 +177,182 @@ func TestCleanupLoop_ExitsCleanly(t *testing.T) {
 		return runtime.NumGoroutine()-initialGoroutines <= 2 // allow small variance
 	}, pollCeiling, pollInterval, "goroutine leak detected after cleanup loops stopped")
 }
+
+// TestNewService_StartsCleanupGoroutine verifies cleanup goroutine starts
+func TestNewService_StartsCleanupGoroutine(t *testing.T) {
+	// Get initial goroutine count
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	initialGoroutines := runtime.NumGoroutine()
+
+	// Create mock dependencies
+	discovery := &mockDiscoveryService{}
+	selector := &mockEndpointSelector{}
+	collector := &mockStatsCollector{}
+	logger := createTestLogger()
+
+	config := &Configuration{}
+	config.StreamBufferSize = 8192
+
+	// Create service
+	service, err := NewService(discovery, selector, config, collector, nil, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that we have one more goroutine (the cleanup loop)
+	require.Eventually(t, func() bool {
+		return runtime.NumGoroutine() > initialGoroutines
+	}, pollCeiling, pollInterval, "cleanup goroutine not started")
+
+	// Cleanup should stop the goroutine
+	service.Cleanup()
+
+	// Check goroutines returned to initial count
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine()-initialGoroutines <= 2 // allow small variance
+	}, pollCeiling, pollInterval, "goroutine leak after Cleanup")
+}
+
+// Mock types for testing
+
+type mockDiscoveryService struct{}
+
+func (m *mockDiscoveryService) GetEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	return []*domain.Endpoint{}, nil
+}
+
+func (m *mockDiscoveryService) GetHealthyEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	return []*domain.Endpoint{}, nil
+}
+
+func (m *mockDiscoveryService) RefreshEndpoints(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockDiscoveryService) UpdateEndpointStatus(ctx context.Context, endpoint *domain.Endpoint) error {
+	return nil
+}
+
+type mockEndpointSelector struct{}
+
+func (m *mockEndpointSelector) Select(ctx context.Context, endpoints []*domain.Endpoint) (*domain.Endpoint, error) {
+	if len(endpoints) == 0 {
+		return nil, errors.New("no endpoints")
+	}
+	return endpoints[0], nil
+}
+
+func (m *mockEndpointSelector) Name() string {
+	return "mock"
+}
+
+func (m *mockEndpointSelector) IncrementConnections(endpoint *domain.Endpoint) {}
+func (m *mockEndpointSelector) DecrementConnections(endpoint *domain.Endpoint) {}
+
+type mockStatsCollector struct{}
+
+func (m *mockStatsCollector) RecordRequest(endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
+}
+func (m *mockStatsCollector) RecordConnection(endpoint *domain.Endpoint, delta int)     {}
+func (m *mockStatsCollector) RecordSecurityViolation(violation ports.SecurityViolation) {}
+func (m *mockStatsCollector) RecordDiscovery(endpoint *domain.Endpoint, success bool, latency time.Duration) {
+}
+func (m *mockStatsCollector) RecordModelRequest(model string, endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
+}
+func (m *mockStatsCollector) RecordModelError(model string, endpoint *domain.Endpoint, errorType string) {
+}
+func (m *mockStatsCollector) GetModelStats() map[string]ports.ModelStats { return nil }
+func (m *mockStatsCollector) GetModelEndpointStats() map[string]map[string]ports.EndpointModelStats {
+	return nil
+}
+func (m *mockStatsCollector) RecordTranslatorRequest(event ports.TranslatorRequestEvent) {}
+func (m *mockStatsCollector) GetTranslatorStats() map[string]ports.TranslatorStats {
+	return nil
+}
+func (m *mockStatsCollector) GetProxyStats() ports.ProxyStats                  { return ports.ProxyStats{} }
+func (m *mockStatsCollector) GetEndpointStats() map[string]ports.EndpointStats { return nil }
+func (m *mockStatsCollector) GetSecurityStats() ports.SecurityStats            { return ports.SecurityStats{} }
+func (m *mockStatsCollector) GetConnectionStats() map[string]int64             { return nil }
+func (m *mockStatsCollector) GetConnectionCount(endpoint string) int64         { return 0 }
+
+// TestCleanupLoop_SurvivesTick_Panic verifies that a panic inside
+// cleanupUnusedResources does not kill the cleanupLoop goroutine. Before the
+// per-tick inner recover was added, a single panic would permanently stop cleanup.
+func TestCleanupLoop_SurvivesTick_Panic(t *testing.T) {
+	t.Parallel()
+
+	s := &Service{
+		BaseProxyComponents: &core.BaseProxyComponents{
+			Logger: createTestLogger(),
+		},
+		endpointPools:   *xsync.NewMap[string, *connectionPool](),
+		circuitBreakers: *xsync.NewMap[string, *circuitBreaker](),
+		cleanupTicker:   time.NewTicker(20 * time.Millisecond),
+		cleanupStop:     make(chan struct{}),
+	}
+	s.configuration.Store(&Configuration{})
+
+	// Insert a pool whose transport is nil — CloseIdleConnections() will panic
+	// when cleanupUnusedResources tries to close it (staleThreshold check passes
+	// because lastUsed == 0, which is always in the past).
+	s.endpointPools.Store("bad-endpoint", &connectionPool{
+		transport: nil, // nil dereference in CloseIdleConnections
+		lastUsed:  0,   // triggers cleanup immediately
+		healthy:   1,
+	})
+
+	go s.cleanupLoop()
+
+	// Wait for the first (panicking) tick to have actually run:
+	// cleanupUnusedResources deletes the map entry before calling
+	// CloseIdleConnections (the nil-transport call that panics), so its
+	// disappearance is a real signal the panicking tick fired and was
+	// recovered - not just an elapsed-time guess.
+	require.Eventually(t, func() bool {
+		_, exists := s.endpointPools.Load("bad-endpoint")
+		return !exists
+	}, pollCeiling, pollInterval, "first (panicking) tick never ran")
+
+	// Liveness probe: an alive loop is parked in its select and receives this
+	// send (then exits). A dead goroutine never receives it.
+	select {
+	case s.cleanupStop <- struct{}{}:
+		// Expected: loop survived the panic and took the stop signal.
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanupLoop did not receive stop signal; goroutine died after tick panic")
+	}
+
+	// Shut down cleanly.
+	s.Cleanup()
+}
+
+// TestCleanup_DoubleInvoke verifies that calling Cleanup twice does not panic.
+// Previously, the second call would close an already-closed channel.
+func TestCleanup_DoubleInvoke(t *testing.T) {
+	t.Parallel()
+
+	s := &Service{
+		BaseProxyComponents: &core.BaseProxyComponents{
+			Logger: createTestLogger(),
+		},
+		endpointPools:   *xsync.NewMap[string, *connectionPool](),
+		circuitBreakers: *xsync.NewMap[string, *circuitBreaker](),
+		cleanupTicker:   time.NewTicker(time.Hour),
+		cleanupStop:     make(chan struct{}),
+	}
+	s.configuration.Store(&Configuration{})
+
+	go s.cleanupLoop()
+
+	// Neither call should panic.
+	s.Cleanup()
+	s.Cleanup()
+}
+
+func createTestLogger() logger.StyledLogger {
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	return logger.NewPlainStyledLogger(log)
+}
