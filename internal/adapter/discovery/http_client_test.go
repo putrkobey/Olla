@@ -337,3 +337,682 @@ func TestDiscoverModelsAutoDetection(t *testing.T) {
                         "type": "vlm",
                         "arch": "qwen3_vl",
                         "compatibility_type": "mlx",
+                        "quantization": "4bit",
+                        "max_context_length": 32768
+                    }
+                ]
+            }`,
+				},
+				"/v1/models": { // Add this as 404 to prevent OpenAI fallback
+					status: 404,
+					body:   `{"error": "not found"}`,
+				},
+			},
+			expectedModels: 1,
+			expectedError:  false,
+			validateResult: func(t *testing.T, models []*domain.ModelInfo) {
+				if len(models) != 1 {
+					t.Fatalf("Expected 1 model, got %d", len(models))
+				}
+				model := models[0]
+				if model.Details == nil {
+					t.Fatal("Expected LM Studio model to have details")
+				}
+				if model.Details.Family == nil || *model.Details.Family != "qwen3_vl" {
+					t.Error("Expected family to be 'qwen3_vl'")
+				}
+				if model.Details.QuantizationLevel == nil || *model.Details.QuantizationLevel != "4bit" {
+					t.Error("Expected quantization_level to be '4bit'")
+				}
+			},
+		},
+		{
+			name: "OpenAI Compatible fallback success",
+			serverResponses: map[string]serverResponse{
+				"/api/tags": {
+					status: 404,
+					body:   `{"error": "not found"}`,
+				},
+				"/v1/models": {
+					status: 200,
+					body: `{
+						"object": "list",
+						"data": [
+							{
+								"id": "text-davinci-003",
+								"object": "model",
+								"created": 1669599635,
+								"owned_by": "openai-internal"
+							}
+						]
+					}`,
+				},
+			},
+			expectedModels: 1,
+			expectedError:  false,
+			validateResult: func(t *testing.T, models []*domain.ModelInfo) {
+				if len(models) != 1 {
+					t.Fatalf("Expected 1 model, got %d", len(models))
+				}
+				model := models[0]
+				if model.Name != "text-davinci-003" {
+					t.Errorf("Expected name 'text-davinci-003', got %s", model.Name)
+				}
+				// OpenAI compatible should have minimal metadata
+				if model.Details != nil && model.Details.ModifiedAt != nil {
+					expectedTime := time.Unix(1669599635, 0)
+					if !model.Details.ModifiedAt.Equal(expectedTime) {
+						t.Error("Expected created timestamp to be parsed")
+					}
+				}
+			},
+		},
+		{
+			name: "All profiles fail",
+			serverResponses: map[string]serverResponse{
+				"/api/tags":  {status: 404, body: `{"error": "not found"}`},
+				"/v1/models": {status: 404, body: `{"error": "not found"}`},
+			},
+			expectedError: true,
+		},
+		{
+			name: "Parse error followed by no matching profile",
+			serverResponses: map[string]serverResponse{
+				"/api/tags": {
+					status: 200,
+					body:   `{"models": [`, // Invalid JSON
+				},
+				"/v1/models": {
+					status: 404,
+					body:   `{"error": "not found"}`,
+				},
+			},
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Logf("Request received: %s %s", r.Method, r.URL.Path)
+				response, exists := tt.serverResponses[r.URL.Path]
+				if !exists {
+					t.Logf("Path not found: %s", r.URL.Path)
+					w.WriteHeader(404)
+					w.Write([]byte(`{"error": "path not found"}`))
+					return
+				}
+
+				t.Logf("Responding with status %d for path %s", response.status, r.URL.Path)
+				w.WriteHeader(response.status)
+				w.Write([]byte(response.body))
+			}))
+			defer server.Close()
+
+			// Use auto detection
+			endpoint := createTestEndpoint(server.URL, domain.ProfileAuto)
+			t.Logf("Created endpoint with URL: %s, Type: %s", endpoint.URLString, endpoint.Type)
+
+			client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+			ctx := context.Background()
+			models, err := client.DiscoverModels(ctx, endpoint)
+
+			if tt.expectedError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				} else {
+					t.Logf("Got expected error: %v", err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if len(models) != tt.expectedModels {
+				t.Errorf("Expected %d models, got %d", tt.expectedModels, len(models))
+			} else {
+				t.Logf("Successfully discovered %d models", len(models))
+			}
+
+			// Run custom validation if provided
+			if tt.validateResult != nil {
+				tt.validateResult(t, models)
+			}
+		})
+	}
+}
+
+func TestDiscoverModelsContextCancellation(t *testing.T) {
+	// Create server with delay, so we can cancel the context
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.WriteHeader(200)
+		w.Write([]byte(`{"models": []}`))
+	}))
+	defer server.Close()
+
+	endpoint := createTestEndpoint(server.URL, domain.ProfileOllama)
+	client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+	// Create context with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	_, err := client.DiscoverModels(ctx, endpoint)
+	if err == nil {
+		t.Errorf("Expected timeout error but got none")
+	}
+
+	// Check that it's a discovery error wrapping a network error
+	var discErr *DiscoveryError
+	if errors.As(err, &discErr) {
+		var networkError *NetworkError
+		if !errors.As(discErr.Err, &networkError) {
+			t.Errorf("Expected NetworkError, got %T", discErr.Err)
+		}
+	}
+}
+
+func TestHealthCheck(t *testing.T) {
+	tests := []struct {
+		name          string
+		serverStatus  int
+		expectedError bool
+	}{
+		{
+			name:          "Health check success",
+			serverStatus:  200,
+			expectedError: false,
+		},
+		{
+			name:          "Health check failure - 404",
+			serverStatus:  404,
+			expectedError: true,
+		},
+		{
+			name:          "Health check failure - 500",
+			serverStatus:  500,
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.serverStatus)
+			}))
+			defer server.Close()
+
+			endpoint := createTestEndpoint(server.URL, domain.ProfileOllama)
+			client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+			err := client.HealthCheck(context.Background(), endpoint)
+
+			if tt.expectedError && err == nil {
+				t.Errorf("Expected error but got none")
+			}
+			if !tt.expectedError && err != nil {
+				t.Errorf("Unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestGetMetrics(t *testing.T) {
+	client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+	// Make sure everything is zero before starting
+	metrics := client.GetMetrics()
+	if metrics.TotalDiscoveries != 0 {
+		t.Errorf("Expected TotalDiscoveries to be 0, got %d", metrics.TotalDiscoveries)
+	}
+	if metrics.SuccessfulRequests != 0 {
+		t.Errorf("Expected SuccessfulRequests to be 0, got %d", metrics.SuccessfulRequests)
+	}
+	if metrics.FailedRequests != 0 {
+		t.Errorf("Expected FailedRequests to be 0, got %d", metrics.FailedRequests)
+	}
+
+	// Test successful discovery updates metrics
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"models": [{"name": "test-model"}]}`))
+	}))
+	defer server.Close()
+
+	endpoint := createTestEndpoint(server.URL, domain.ProfileOllama)
+	_, err := client.DiscoverModels(context.Background(), endpoint)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	metrics = client.GetMetrics()
+	if metrics.TotalDiscoveries != 1 {
+		t.Errorf("Expected TotalDiscoveries to be 1, got %d", metrics.TotalDiscoveries)
+	}
+	if metrics.SuccessfulRequests != 1 {
+		t.Errorf("Expected SuccessfulRequests to be 1, got %d", metrics.SuccessfulRequests)
+	}
+	if metrics.LastDiscoveryTime.IsZero() {
+		t.Errorf("Expected LastDiscoveryTime to be set")
+	}
+}
+
+func TestMaxResponseSizeLimit(t *testing.T) {
+	// Create response larger than MaxResponseSize
+	// Cheapest way to create this payload
+	largeResponse := fmt.Sprintf(`{"models": [{"name": "%s"}]}`, strings.Repeat("x", MaxResponseSize))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte(largeResponse))
+	}))
+	defer server.Close()
+
+	endpoint := createTestEndpoint(server.URL, domain.ProfileOllama)
+	client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+	_, err := client.DiscoverModels(context.Background(), endpoint)
+	if err == nil {
+		t.Errorf("Expected error due to response size limit")
+	}
+}
+
+// TestModelURLOverride verifies that when an endpoint has a custom ModelURLString
+// configured, discovery uses that URL instead of the profile's default path.
+// This is critical for non-standard deployments where model discovery lives
+// at a different path than the profile expects.
+func TestModelURLOverride(t *testing.T) {
+	tests := []struct {
+		name                 string
+		endpointType         string
+		customModelPath      string // Custom path for model discovery
+		profileDefaultPath   string // The profile's default discovery path
+		serverResponse       string
+		expectedModels       int
+		expectCustomPathUsed bool
+	}{
+		{
+			name:                 "Ollama with custom model URL uses override",
+			endpointType:         domain.ProfileOllama,
+			customModelPath:      "/custom/models/endpoint",
+			profileDefaultPath:   "/api/tags",
+			serverResponse:       `{"models": [{"name": "llama3:8b"}]}`,
+			expectedModels:       1,
+			expectCustomPathUsed: true,
+		},
+		{
+			name:                 "vLLM with custom model URL uses override",
+			endpointType:         domain.ProfileVLLM,
+			customModelPath:      "/internal/v2/model-list",
+			profileDefaultPath:   "/v1/models",
+			serverResponse:       `{"object": "list", "data": [{"id": "mistral-7b", "object": "model"}]}`,
+			expectedModels:       1,
+			expectCustomPathUsed: true,
+		},
+		{
+			name:                 "LlamaCpp with custom model URL uses override",
+			endpointType:         domain.ProfileLlamaCpp,
+			customModelPath:      "/api/internal/models",
+			profileDefaultPath:   "/v1/models",
+			serverResponse:       `{"object": "list", "data": [{"id": "phi-3-mini", "object": "model"}]}`,
+			expectedModels:       1,
+			expectCustomPathUsed: true,
+		},
+		{
+			name:                 "LM Studio with custom model URL uses override",
+			endpointType:         domain.ProfileLmStudio,
+			customModelPath:      "/special/discovery",
+			profileDefaultPath:   "/api/v0/models",
+			serverResponse:       `{"object": "list", "data": [{"id": "qwen2-7b", "object": "model"}]}`,
+			expectedModels:       1,
+			expectCustomPathUsed: true,
+		},
+		{
+			name:                 "OpenAI Compatible with custom model URL uses override",
+			endpointType:         domain.ProfileOpenAICompatible,
+			customModelPath:      "/proxy/models",
+			profileDefaultPath:   "/v1/models",
+			serverResponse:       `{"object": "list", "data": [{"id": "gpt-4-turbo", "object": "model"}]}`,
+			expectedModels:       1,
+			expectCustomPathUsed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requestedPath string
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestedPath = r.URL.Path
+				t.Logf("Server received request at path: %s", r.URL.Path)
+
+				// Only respond successfully to the custom path
+				if r.URL.Path == tt.customModelPath {
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(tt.serverResponse))
+					return
+				}
+
+				// Return 404 for any other path (including the profile default)
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"error": "not found"}`))
+			}))
+			defer server.Close()
+
+			// Create endpoint with custom model URL
+			endpoint := createTestEndpointWithModelURL(server.URL, tt.endpointType, server.URL+tt.customModelPath)
+
+			client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+			models, err := client.DiscoverModels(context.Background(), endpoint)
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if tt.expectCustomPathUsed && requestedPath != tt.customModelPath {
+				t.Errorf("Expected custom path %q to be used, but server received request at %q", tt.customModelPath, requestedPath)
+			}
+
+			if len(models) != tt.expectedModels {
+				t.Errorf("Expected %d models, got %d", tt.expectedModels, len(models))
+			}
+		})
+	}
+}
+
+// TestModelURLFallbackToProfileDefault verifies that when ModelURLString is empty,
+// the profile's default discovery path is used. This ensures backwards compatibility.
+func TestModelURLFallbackToProfileDefault(t *testing.T) {
+	tests := []struct {
+		name               string
+		endpointType       string
+		profileDefaultPath string
+		serverResponse     string
+		expectedModels     int
+	}{
+		{
+			name:               "Ollama without custom URL uses profile default /api/tags",
+			endpointType:       domain.ProfileOllama,
+			profileDefaultPath: "/api/tags",
+			serverResponse:     `{"models": [{"name": "codellama:7b"}, {"name": "llama3:70b"}]}`,
+			expectedModels:     2,
+		},
+		{
+			name:               "vLLM without custom URL uses profile default /v1/models",
+			endpointType:       domain.ProfileVLLM,
+			profileDefaultPath: "/v1/models",
+			serverResponse:     `{"object": "list", "data": [{"id": "mixtral-8x7b", "object": "model"}]}`,
+			expectedModels:     1,
+		},
+		{
+			name:               "LM Studio without custom URL uses profile default /api/v0/models",
+			endpointType:       domain.ProfileLmStudio,
+			profileDefaultPath: "/api/v0/models",
+			serverResponse:     `{"object": "list", "data": [{"id": "gemma-2b", "object": "model"}]}`,
+			expectedModels:     1,
+		},
+		{
+			name:               "LlamaCpp without custom URL uses profile default /v1/models",
+			endpointType:       domain.ProfileLlamaCpp,
+			profileDefaultPath: "/v1/models",
+			serverResponse:     `{"object": "list", "data": [{"id": "tinyllama", "object": "model"}]}`,
+			expectedModels:     1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requestedPath string
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestedPath = r.URL.Path
+				t.Logf("Server received request at path: %s", r.URL.Path)
+
+				// Respond successfully only to the expected default path
+				if r.URL.Path == tt.profileDefaultPath {
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(tt.serverResponse))
+					return
+				}
+
+				// Return 404 for any other path
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte(`{"error": "not found"}`))
+			}))
+			defer server.Close()
+
+			// Create endpoint WITHOUT a custom model URL (empty string triggers fallback)
+			endpoint := createTestEndpointWithModelURL(server.URL, tt.endpointType, "")
+
+			client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+			models, err := client.DiscoverModels(context.Background(), endpoint)
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if requestedPath != tt.profileDefaultPath {
+				t.Errorf("Expected profile default path %q to be used, but server received request at %q", tt.profileDefaultPath, requestedPath)
+			}
+
+			if len(models) != tt.expectedModels {
+				t.Errorf("Expected %d models, got %d", tt.expectedModels, len(models))
+			}
+		})
+	}
+}
+
+// TestOpenAICompatibleModelURLBehavior verifies special handling for OpenAI-compatible
+// profiles where /v1/models override is ignored to preserve existing configurations.
+func TestOpenAICompatibleModelURLBehavior(t *testing.T) {
+	tests := []struct {
+		name                 string
+		modelURLConfig       string // What user configures
+		expectProfileDefault bool   // Whether we expect the profile default to be used
+		expectedPath         string // Expected discovery path
+	}{
+		{
+			name:                 "OpenAI-compatible with /v1/models uses profile default",
+			modelURLConfig:       "/v1/models",
+			expectProfileDefault: true,
+			expectedPath:         "/v1/models",
+		},
+		{
+			name:                 "OpenAI-compatible with custom path uses override",
+			modelURLConfig:       "/api/v2/models", // Path, will be combined with server URL
+			expectProfileDefault: false,
+			expectedPath:         "/api/v2/models",
+		},
+		{
+			name:                 "OpenAI-compatible with /models ignored (Docker/OpenWebUI case)",
+			modelURLConfig:       "/models", // Often returns HTML, not JSON
+			expectProfileDefault: true,
+			expectedPath:         "/v1/models",
+		},
+		{
+			name:                 "OpenAI-compatible with empty model_url uses profile default",
+			modelURLConfig:       "",
+			expectProfileDefault: true,
+			expectedPath:         "/v1/models",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requestedPath string
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestedPath = r.URL.Path
+				t.Logf("Server received request at path: %s", r.URL.Path)
+
+				// Only respond to the expected path
+				if r.URL.Path == tt.expectedPath {
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(`{"object": "list", "data": [{"id": "test-model", "object": "model"}]}`))
+					return
+				}
+
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer server.Close()
+
+			// For the override test, we need to build the full URL first
+			modelURLString := tt.modelURLConfig
+			if tt.modelURLConfig == "/api/v2/models" {
+				modelURLString = server.URL + tt.modelURLConfig
+			}
+
+			// Create endpoint with configured model URL
+			endpoint := createTestEndpointWithModelURL(server.URL, domain.ProfileOpenAICompatible, modelURLString)
+
+			client := NewHTTPModelDiscoveryClientWithDefaults(createTestProfileFactory(t), createTestLogger())
+
+			models, err := client.DiscoverModels(context.Background(), endpoint)
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if requestedPath != tt.expectedPath {
+				t.Errorf("Expected path %q to be used, but server received request at %q", tt.expectedPath, requestedPath)
+			}
+
+			if len(models) == 0 {
+				t.Errorf("Expected models to be discovered, got 0")
+			}
+		})
+	}
+}
+
+type serverResponse struct {
+	status int
+	body   string
+}
+
+func createTestEndpoint(baseURL, endpointType string) *domain.Endpoint {
+	parsedURL, _ := url.Parse(baseURL)
+
+	healthCheckURL, _ := url.Parse(baseURL + "/")
+	modelURL, _ := url.Parse(baseURL + "/api/tags")
+
+	// Leave ModelURLString empty by default so the profile's default discovery
+	// path is used. Tests that need to verify the override behaviour should use
+	// createTestEndpointWithModelURL instead.
+	return &domain.Endpoint{
+		Name:                 "test-endpoint",
+		URL:                  parsedURL,
+		Type:                 endpointType,
+		Priority:             100,
+		HealthCheckURL:       healthCheckURL,
+		ModelUrl:             modelURL,
+		URLString:            baseURL,
+		HealthCheckURLString: baseURL + "/",
+		ModelURLString:       "", // Empty to use profile defaults
+		Status:               domain.StatusHealthy,
+		CheckInterval:        5 * time.Second,
+		CheckTimeout:         2 * time.Second,
+	}
+}
+
+// createTestEndpointWithModelURL creates an endpoint with an explicit model URL override.
+// Pass an empty string for modelURLString to test fallback to profile defaults.
+func createTestEndpointWithModelURL(baseURL, endpointType, modelURLString string) *domain.Endpoint {
+	parsedURL, _ := url.Parse(baseURL)
+	healthCheckURL, _ := url.Parse(baseURL + "/")
+
+	var modelURL *url.URL
+	if modelURLString != "" {
+		modelURL, _ = url.Parse(modelURLString)
+	}
+
+	return &domain.Endpoint{
+		Name:                 "test-endpoint",
+		URL:                  parsedURL,
+		Type:                 endpointType,
+		Priority:             100,
+		HealthCheckURL:       healthCheckURL,
+		ModelUrl:             modelURL,
+		URLString:            baseURL,
+		HealthCheckURLString: baseURL + "/",
+		ModelURLString:       modelURLString, // Can be empty to test fallback behaviour
+		Status:               domain.StatusHealthy,
+		CheckInterval:        5 * time.Second,
+		CheckTimeout:         2 * time.Second,
+	}
+}
+
+// TestDiscoverModels_AuthenticatedEndpoint verifies that discovery requests carry
+// the endpoint auth header. Without it, authenticated backends 401 and discovery
+// never populates the model list.
+func TestDiscoverModels_AuthenticatedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	const token = "Bearer test-secret"
+	var receivedAuth string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		if receivedAuth != token {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"models":[{"name":"llama3:8b","size":1234}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	endpointURL, _ := url.Parse(srv.URL)
+	endpoint := &domain.Endpoint{
+		Name:            "auth-backend",
+		Type:            domain.ProfileOllama,
+		URL:             endpointURL,
+		URLString:       srv.URL,
+		AuthHeaderName:  "Authorization",
+		AuthHeaderValue: token,
+	}
+
+	factory, err := profile.NewFactoryWithDefaults()
+	if err != nil {
+		t.Fatalf("profile factory: %v", err)
+	}
+
+	client := NewHTTPModelDiscoveryClientWithDefaults(factory, createTestLogger())
+	models, err := client.DiscoverModels(context.Background(), endpoint)
+	if err != nil {
+		t.Fatalf("DiscoverModels failed: %v", err)
+	}
+	if len(models) == 0 {
+		t.Error("expected models, got none")
+	}
+	if receivedAuth != token {
+		t.Errorf("backend received auth %q, want %q", receivedAuth, token)
+	}
+}
+
+func createTestLogger() logger.StyledLogger {
+	slogLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelError, // Only log errors to reduce test noise
+	}))
+
+	return logger.NewPlainStyledLogger(slogLogger)
+}
+
+// createTestProfileFactory creates a profile factory for testing with proper error handling
+func createTestProfileFactory(t *testing.T) *profile.Factory {
+	t.Helper()
+
+	factory, err := profile.NewFactoryWithDefaults()
+	if err != nil {
+		t.Fatalf("Failed to create profile factory: %v", err)
+	}
+
+	return factory
+}

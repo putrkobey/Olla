@@ -67,3 +67,142 @@ type ProfileConfig struct {
 		MaxConcurrentRequests int           `yaml:"max_concurrent_requests"`
 		DefaultPriority       int           `yaml:"default_priority"`
 		StreamingSupport      bool          `yaml:"streaming_support"`
+	} `yaml:"characteristics"`
+
+	Resources struct {
+		Quantization struct {
+			Multipliers map[string]float64 `yaml:"multipliers"`
+		} `yaml:"quantization"`
+		ModelSizes        []ModelSizePattern        `yaml:"model_sizes"`
+		ConcurrencyLimits []ConcurrencyLimitPattern `yaml:"concurrency_limits"`
+		Defaults          ResourceRequirements      `yaml:"defaults"`
+		TimeoutScaling    TimeoutScaling            `yaml:"timeout_scaling"`
+	} `yaml:"resources"`
+
+	// PathIndices allows configuring which paths serve specific purposes
+	PathIndices struct {
+		Health          int `yaml:"health"`
+		Models          int `yaml:"models"`
+		Completions     int `yaml:"completions"`
+		ChatCompletions int `yaml:"chat_completions"`
+		Embeddings      int `yaml:"embeddings"`
+	} `yaml:"path_indices"`
+}
+
+// AuthHint describes the authentication capabilities of a backend profile.
+// Fields are intentionally optional. Absent means "we don't know" or "not applicable".
+// This is advisory only; the actual auth configuration lives in the endpoint config.
+type AuthHint struct {
+	// DefaultHeader is the expected credential header for api_key auth.
+	// Empty means the backend uses the standard Authorization header.
+	DefaultHeader string `yaml:"default_header,omitempty" json:"default_header,omitempty"`
+
+	// Types lists the authentication schemes this backend supports (e.g. ["bearer"]).
+	// An empty slice means the backend has no documented auth support.
+	Types []string `yaml:"types,omitempty" json:"types,omitempty"`
+
+	// Required indicates whether the backend is known to require authentication.
+	// False (default) means auth is optional or not applicable for most deployments.
+	Required bool `yaml:"required,omitempty" json:"required,omitempty"`
+}
+
+// ModelSizePattern defines resource requirements for models matching specific patterns
+type ModelSizePattern struct {
+	Patterns            []string `yaml:"patterns"`
+	MinMemoryGB         float64  `yaml:"min_memory_gb"`
+	RecommendedMemoryGB float64  `yaml:"recommended_memory_gb"`
+	MinGPUMemoryGB      float64  `yaml:"min_gpu_memory_gb"`
+	EstimatedLoadTimeMS int      `yaml:"estimated_load_time_ms"`
+}
+
+// ConcurrencyLimitPattern defines how many concurrent requests a model can handle based on its memory requirements
+type ConcurrencyLimitPattern struct {
+	MinMemoryGB   float64 `yaml:"min_memory_gb"`
+	MaxConcurrent int     `yaml:"max_concurrent"`
+}
+
+// TimeoutScaling configures dynamic timeout adjustment based on model characteristics
+type TimeoutScaling struct {
+	BaseTimeoutSeconds int  `yaml:"base_timeout_seconds"`
+	LoadTimeBuffer     bool `yaml:"load_time_buffer"` // adds estimated_load_time_ms to timeout
+}
+
+// ContextPattern maps model name patterns to context window sizes
+type ContextPattern struct {
+	Pattern string `yaml:"pattern"`
+	Context int64  `yaml:"context"`
+}
+
+// Limitation name constants for features that may be absent on a given backend.
+// The passthrough endpoint filter uses exact-name matching against these values,
+// so token-counting limitations (which use different names) are never affected.
+const (
+	AnthropicLimitationNoToolUse          = "no_tool_use"
+	AnthropicLimitationNoExtendedThinking = "no_extended_thinking"
+	AnthropicLimitationNoVision           = "no_vision"
+)
+
+// AnthropicSupportConfig declares native Anthropic Messages API support for a
+// backend platform. This enables the passthrough optimisation: when a backend
+// natively understands the Anthropic wire format, requests can be forwarded
+// directly without the costly Anthropic-to-OpenAI-and-back translation.
+//
+// Example YAML (in a profile's api section):
+//
+//	api:
+//	  anthropic_support:
+//	    enabled: true
+//	    messages_path: "/v1/messages"
+//	    token_count: true
+//	    min_version: "b4847"
+//	    limitations:
+//	      - "no_extended_thinking"
+//	      - "max_tokens_4096"
+type AnthropicSupportConfig struct {
+	// MessagesPath is the backend path that accepts Anthropic Messages API
+	// requests (e.g. "/v1/messages"). Required when Enabled is true.
+	MessagesPath string `yaml:"messages_path"`
+
+	// MinVersion is the backend build version that introduced native Anthropic
+	// support (e.g. "b4847", "0.14.0", "0.4.1"). Informational only; not
+	// currently enforced at runtime.
+	MinVersion string `yaml:"min_version,omitempty"`
+
+	// Limitations lists Anthropic features this backend does NOT support.
+	// Enforced by the passthrough endpoint filter for messages-affecting
+	// limitations (no_tool_use, no_extended_thinking, no_vision). Endpoints
+	// that declare a limitation matching an active request feature are excluded
+	// from the passthrough subset and fall back to translation.
+	// Common values: "no_extended_thinking", "no_tool_use", "no_vision",
+	// "max_tokens_4096".
+	Limitations []string `yaml:"limitations,omitempty"`
+
+	// Enabled controls whether passthrough is active for this backend.
+	// Defaults to false so existing profiles remain unaffected.
+	Enabled bool `yaml:"enabled"`
+
+	// TokenCount indicates the backend supports the Anthropic token counting
+	// endpoint. When true, token count requests can also be passed through.
+	TokenCount bool `yaml:"token_count,omitempty"`
+}
+
+// HasLimitation reports whether the backend declares a specific limitation.
+// Callers use this to check whether a request feature (e.g. extended thinking)
+// is unsupported before attempting passthrough.
+func (c *AnthropicSupportConfig) HasLimitation(limitation string) bool {
+	if c == nil {
+		return false
+	}
+	for _, l := range c.Limitations {
+		if l == limitation {
+			return true
+		}
+	}
+	return false
+}
+
+// SupportsPassthrough is a convenience check that the config is non-nil and
+// explicitly enabled. Safe to call on a nil receiver.
+func (c *AnthropicSupportConfig) SupportsPassthrough() bool {
+	return c != nil && c.Enabled
+}
