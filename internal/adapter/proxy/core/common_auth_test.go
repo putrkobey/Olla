@@ -147,3 +147,152 @@ func TestCopyHeaders_NilEndpointStripsAuth(t *testing.T) {
 
 	proxyReq, err := http.NewRequest(http.MethodPost, "http://backend.internal/v1/chat", nil)
 	require.NoError(t, err)
+
+	CopyHeaders(proxyReq, originalReq, nil)
+
+	assert.Empty(t, proxyReq.Header.Get("Authorization"),
+		"client Authorization must be stripped even when no endpoint auth is configured")
+}
+
+// TestCopyHeaders_AuthArrivesAtBackend wires up a real httptest backend and
+// confirms that the injected Authorization header survives the full round-trip,
+// not just that CopyHeaders places it on proxyReq in memory.
+func TestCopyHeaders_AuthArrivesAtBackend(t *testing.T) {
+	t.Parallel()
+
+	srv, captured := newCapturingBackend(t)
+
+	endpoint := &domain.Endpoint{
+		AuthHeaderName:  "Authorization",
+		AuthHeaderValue: "Bearer backend-secret",
+	}
+
+	originalReq := httptest.NewRequest(http.MethodGet, "http://olla.internal/api/tags", nil)
+
+	proxyReq, err := http.NewRequest(http.MethodGet, srv.URL+"/api/tags", nil)
+	require.NoError(t, err)
+
+	CopyHeaders(proxyReq, originalReq, endpoint)
+
+	resp, err := http.DefaultClient.Do(proxyReq)
+	require.NoError(t, err)
+	defer resp.Body.Close() //nolint:errcheck
+
+	require.NotNil(t, captured.headers, "backend must have received a request")
+	assert.Equal(t, "Bearer backend-secret", captured.headers.Get("Authorization"),
+		"Authorization header must arrive at the backend after transport")
+}
+
+// TestCopyHeaders_CustomHeaders covers the endpoint.Headers map injection behaviour.
+func TestCopyHeaders_CustomHeaders(t *testing.T) {
+	t.Parallel()
+
+	t.Run("custom headers set with no auth", func(t *testing.T) {
+		t.Parallel()
+
+		endpoint := &domain.Endpoint{
+			Headers: map[string]string{
+				"X-Tenant-ID": "acme",
+				"X-Env":       "prod",
+			},
+		}
+
+		originalReq := httptest.NewRequest(http.MethodPost, "http://olla.internal/v1/chat", nil)
+		proxyReq, err := http.NewRequest(http.MethodPost, "http://backend.internal/v1/chat", nil)
+		require.NoError(t, err)
+
+		CopyHeaders(proxyReq, originalReq, endpoint)
+
+		assert.Equal(t, "acme", proxyReq.Header.Get("X-Tenant-ID"))
+		assert.Equal(t, "prod", proxyReq.Header.Get("X-Env"))
+		assert.Empty(t, proxyReq.Header.Get("Authorization"), "no auth header when auth is not configured")
+	})
+
+	t.Run("auth wins when headers map also sets Authorization", func(t *testing.T) {
+		t.Parallel()
+
+		// If a user puts Authorization in both headers: and auth:, auth: must win.
+		endpoint := &domain.Endpoint{
+			Headers: map[string]string{
+				"Authorization": "Bearer from-headers-map",
+			},
+			AuthHeaderName:  "Authorization",
+			AuthHeaderValue: "Bearer from-auth-section",
+		}
+
+		originalReq := httptest.NewRequest(http.MethodPost, "http://olla.internal/v1/chat", nil)
+		proxyReq, err := http.NewRequest(http.MethodPost, "http://backend.internal/v1/chat", nil)
+		require.NoError(t, err)
+
+		CopyHeaders(proxyReq, originalReq, endpoint)
+
+		values := proxyReq.Header["Authorization"]
+		require.Len(t, values, 1, "must have exactly one Authorization value")
+		assert.Equal(t, "Bearer from-auth-section", values[0], "auth: section must beat headers: map")
+	})
+
+	t.Run("sensitive header in headers map overrides the strip: operator intent wins", func(t *testing.T) {
+		t.Parallel()
+
+		// The strip removes the client's X-Api-Key, but if the operator explicitly
+		// puts X-Api-Key in headers:, it is their deliberate configuration and should be honoured.
+		endpoint := &domain.Endpoint{
+			Headers: map[string]string{
+				"X-Api-Key": "backend-api-key",
+			},
+		}
+
+		originalReq := httptest.NewRequest(http.MethodPost, "http://olla.internal/v1/chat", nil)
+		originalReq.Header.Set("X-Api-Key", "client-api-key")
+
+		proxyReq, err := http.NewRequest(http.MethodPost, "http://backend.internal/v1/chat", nil)
+		require.NoError(t, err)
+
+		CopyHeaders(proxyReq, originalReq, endpoint)
+
+		// The endpoint's value must appear, not the client's.
+		assert.Equal(t, "backend-api-key", proxyReq.Header.Get("X-Api-Key"),
+			"operator-configured header must reach the backend even if it was in the strip list")
+	})
+
+	t.Run("nil headers map is a no-op", func(t *testing.T) {
+		t.Parallel()
+
+		endpoint := &domain.Endpoint{
+			Headers: nil,
+		}
+
+		originalReq := httptest.NewRequest(http.MethodPost, "http://olla.internal/v1/chat", nil)
+		originalReq.Header.Set("Content-Type", "application/json")
+
+		proxyReq, err := http.NewRequest(http.MethodPost, "http://backend.internal/v1/chat", nil)
+		require.NoError(t, err)
+
+		CopyHeaders(proxyReq, originalReq, endpoint)
+
+		// Content-Type is copied from the client as normal.
+		assert.Equal(t, "application/json", proxyReq.Header.Get("Content-Type"))
+	})
+
+	t.Run("multiple custom headers all set correctly", func(t *testing.T) {
+		t.Parallel()
+
+		endpoint := &domain.Endpoint{
+			Headers: map[string]string{
+				"X-Org":      "my-org",
+				"X-Region":   "ap-southeast-2",
+				"X-Priority": "high",
+			},
+		}
+
+		originalReq := httptest.NewRequest(http.MethodPost, "http://olla.internal/v1/chat", nil)
+		proxyReq, err := http.NewRequest(http.MethodPost, "http://backend.internal/v1/chat", nil)
+		require.NoError(t, err)
+
+		CopyHeaders(proxyReq, originalReq, endpoint)
+
+		assert.Equal(t, "my-org", proxyReq.Header.Get("X-Org"))
+		assert.Equal(t, "ap-southeast-2", proxyReq.Header.Get("X-Region"))
+		assert.Equal(t, "high", proxyReq.Header.Get("X-Priority"))
+	})
+}
