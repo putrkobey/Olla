@@ -189,3 +189,194 @@ func TestModelFilteringIntegration(t *testing.T) {
 			// Check expected models
 			assert.ElementsMatch(t, tt.expectedNames, filteredNames)
 		})
+	}
+}
+
+func TestFilterConfigOperations(t *testing.T) {
+	t.Run("merge filter configs", func(t *testing.T) {
+		base := &domain.FilterConfig{
+			Include: []string{"pattern1"},
+			Exclude: []string{"exclude1"},
+		}
+
+		override := &domain.FilterConfig{
+			Include: []string{"pattern2"},
+			Exclude: []string{"exclude2"},
+		}
+
+		merged := base.Merge(override)
+
+		assert.ElementsMatch(t, []string{"pattern1", "pattern2"}, merged.Include)
+		assert.ElementsMatch(t, []string{"exclude1", "exclude2"}, merged.Exclude)
+	})
+
+	t.Run("clone filter config", func(t *testing.T) {
+		original := &domain.FilterConfig{
+			Include: []string{"pattern1", "pattern2"},
+			Exclude: []string{"exclude1"},
+		}
+
+		cloned := original.Clone()
+
+		// Modify original
+		original.Include[0] = "modified"
+
+		// Verify clone is independent
+		assert.Equal(t, "pattern1", cloned.Include[0])
+		assert.NotEqual(t, original.Include[0], cloned.Include[0])
+	})
+
+	t.Run("validate patterns", func(t *testing.T) {
+		validConfig := &domain.FilterConfig{
+			Include: []string{"valid*", "*pattern", "exact"},
+			Exclude: []string{"exclude*"},
+		}
+
+		err := validConfig.Validate()
+		assert.NoError(t, err)
+
+		invalidConfig := &domain.FilterConfig{
+			Include: []string{"", "  ", "valid"},
+		}
+
+		err = invalidConfig.Validate()
+		assert.Error(t, err)
+	})
+}
+
+func TestEndToEndFiltering(t *testing.T) {
+	ctx := context.Background()
+
+	// Simulate a complete filtering workflow
+	t.Run("complete filtering workflow", func(t *testing.T) {
+		// 1. Load filter configurations (simulating from config file)
+		configs := map[string]*domain.FilterConfig{
+			"production-profiles": {
+				Include: []string{"ollama", "openai*"},
+				Exclude: []string{"*test*", "*debug*"},
+			},
+			"safe-models": {
+				Exclude: []string{"*uncensored*", "*adult*", "*nsfw*"},
+			},
+			"large-models": {
+				Include: []string{"*70b*", "*65b*", "*34b*"},
+			},
+		}
+
+		// 2. Use the filters directly - the real path is GlobFilter, config
+		// storage/retrieval used to be exercised via MemoryFilterRepository but
+		// that had zero production callers and was removed.
+		filterImpl := filter.NewGlobFilter()
+
+		// Test profile filtering
+		profileFilter := configs["production-profiles"]
+
+		profiles := map[string]interface{}{
+			"ollama":       "ollama-profile",
+			"openai":       "openai-profile",
+			"openai-test":  "openai-test-profile",
+			"debug-server": "debug-profile",
+			"lmstudio":     "lmstudio-profile",
+		}
+
+		filteredProfiles, err := filterImpl.ApplyToMap(ctx, profileFilter, profiles)
+		require.NoError(t, err)
+
+		// Should include: ollama, openai
+		// Should exclude: openai-test (contains "test"), debug-server (contains "debug"), lmstudio (not in include)
+		assert.Len(t, filteredProfiles, 2)
+		assert.Contains(t, filteredProfiles, "ollama")
+		assert.Contains(t, filteredProfiles, "openai")
+
+		// Test model filtering
+		modelFilter := configs["safe-models"]
+
+		models := []*domain.ModelInfo{
+			{Name: "llama3-8b"},
+			{Name: "llama3-8b-uncensored"},
+			{Name: "mistral-7b"},
+			{Name: "adult-content-gen"},
+		}
+
+		result, err := filterImpl.Apply(ctx, modelFilter, models, func(item interface{}) string {
+			if model, ok := item.(*domain.ModelInfo); ok {
+				return model.Name
+			}
+			return ""
+		})
+		require.NoError(t, err)
+
+		// Should exclude models with uncensored/adult/nsfw in name
+		assert.Len(t, result.Accepted, 2)
+		assert.Len(t, result.Rejected, 2)
+
+		// Verify accepted models
+		acceptedNames := make([]string, 0)
+		for _, item := range result.Accepted {
+			if model, ok := item.(*domain.ModelInfo); ok {
+				acceptedNames = append(acceptedNames, model.Name)
+			}
+		}
+		assert.ElementsMatch(t, []string{"llama3-8b", "mistral-7b"}, acceptedNames)
+	})
+}
+
+func BenchmarkFilterOperations(b *testing.B) {
+	ctx := context.Background()
+	f := filter.NewGlobFilter()
+
+	config := &domain.FilterConfig{
+		Include: []string{"llama*", "mistral*", "*-7b", "*-8b"},
+		Exclude: []string{"*uncensored*", "*test*", "debug*"},
+	}
+
+	// Create a large set of models
+	models := make([]*domain.ModelInfo, 1000)
+	for i := range 1000 {
+		models[i] = &domain.ModelInfo{
+			Name: generateModelName(i),
+		}
+	}
+
+	b.ResetTimer()
+
+	b.Run("filter_1000_models", func(b *testing.B) {
+		for range b.N {
+			_, _ = f.Apply(ctx, config, models, func(item interface{}) string {
+				if model, ok := item.(*domain.ModelInfo); ok {
+					return model.Name
+				}
+				return ""
+			})
+		}
+	})
+
+	b.Run("pattern_matching_with_cache", func(b *testing.B) {
+		// Prime the cache
+		f.Matches(config, "llama3-8b")
+
+		b.ResetTimer()
+		for range b.N {
+			f.Matches(config, "llama3-8b")
+		}
+	})
+
+	b.Run("pattern_matching_without_cache", func(b *testing.B) {
+		for i := range b.N {
+			// Use different names to avoid cache hits
+			f.Matches(config, generateModelName(i))
+		}
+	})
+}
+
+func generateModelName(i int) string {
+	prefixes := []string{"llama", "mistral", "qwen", "deepseek", "codellama"}
+	sizes := []string{"7b", "8b", "13b", "34b", "70b"}
+	suffixes := []string{"", "-instruct", "-chat", "-uncensored", "-test"}
+
+	prefix := prefixes[i%len(prefixes)]
+	size := sizes[i%len(sizes)]
+	suffix := suffixes[i%len(suffixes)]
+
+	return prefix + "-" + size + suffix
+}
