@@ -126,3 +126,132 @@ func TestPerformTimedRead_NoGoroutineLeak(t *testing.T) {
 			cancel()
 
 			// This should return nil due to context cancellation
+			s.performTimedRead(ctx, reader, localBuffer, 10*time.Millisecond, localState, logger)
+		}()
+	}
+
+	// Wait for all tests to complete
+	wg.Wait()
+
+	// Give goroutines time to exit
+	time.Sleep(50 * time.Millisecond)
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+
+	// Check goroutine count
+	finalGoroutines := runtime.NumGoroutine()
+	leaked := finalGoroutines - initialGoroutines
+
+	if leaked > 5 { // Allow slightly more variance for concurrent execution
+		t.Errorf("Goroutine leak detected: initial=%d, final=%d, leaked=%d",
+			initialGoroutines, finalGoroutines, leaked)
+	}
+}
+
+// TestStreamResponseWithTimeout_ClientDisconnect verifies no goroutine leaks on client disconnect
+func TestStreamResponseWithTimeout_ClientDisconnect(t *testing.T) {
+	// Get initial goroutine count
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	initialGoroutines := runtime.NumGoroutine()
+
+	s := &Service{
+		configuration: func() *Configuration {
+			c := &Configuration{}
+			c.ReadTimeout = 100 * time.Millisecond
+			return c
+		}(),
+	}
+
+	// Create a reader that streams data slowly
+	reader := strings.NewReader(strings.Repeat("test data ", 1000))
+	buffer := make([]byte, 1024)
+	logger := createTestLogger()
+
+	// Simulate multiple client disconnections
+	for range 20 {
+		clientCtx, clientCancel := context.WithCancel(context.Background())
+		upstreamCtx := context.Background()
+		writer := &mockWriter{}
+
+		// Start streaming in goroutine
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+
+			// create a mock response with the reader as body
+			resp := &http.Response{
+				Body: io.NopCloser(reader),
+				Header: http.Header{
+					"Content-Type": []string{"text/plain"},
+				},
+			}
+			_, _, _ = s.streamResponseWithTimeout(clientCtx, upstreamCtx, writer, resp, buffer, logger)
+		}()
+
+		// Simulate client disconnect after short time
+		time.Sleep(10 * time.Millisecond)
+		clientCancel()
+
+		// Wait for streaming to complete
+		select {
+		case <-done:
+			// Good
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("streamResponseWithTimeout did not complete after client disconnect")
+		}
+
+		// Reset reader for next iteration
+		reader.Seek(0, io.SeekStart)
+	}
+
+	// Wait for goroutines to exit
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine()-initialGoroutines <= 2 // allow small variance
+	}, pollCeiling, pollInterval, "goroutine leak detected")
+}
+
+// Helper types for testing
+
+type delayedReader struct {
+	delay time.Duration
+	read  bool
+}
+
+func (d *delayedReader) Read(p []byte) (n int, err error) {
+	if !d.read {
+		time.Sleep(d.delay)
+		d.read = true
+		copy(p, []byte("delayed data"))
+		return 12, nil
+	}
+	return 0, io.EOF
+}
+
+type mockWriter struct {
+	data   []byte
+	header http.Header
+}
+
+func (m *mockWriter) Write(p []byte) (n int, err error) {
+	m.data = append(m.data, p...)
+	return len(p), nil
+}
+
+func (m *mockWriter) Header() http.Header {
+	if m.header == nil {
+		m.header = make(http.Header)
+	}
+	return m.header
+}
+
+func (m *mockWriter) WriteHeader(statusCode int) {
+	// Mock implementation
+}
+
+func createTestLogger() logger.StyledLogger {
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	return logger.NewPlainStyledLogger(log)
+}
