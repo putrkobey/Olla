@@ -274,3 +274,279 @@ func (h *RetryHandler) ExecuteWithRetry(
 
 		// Once the response has started we cannot safely retry, whatever the
 		// method. The client would receive a partial response from this
+		// endpoint followed by a fresh one from the next, causing corruption or
+		// double-billing. Return the error and let the caller decide.
+		if tracker.started {
+			h.logger.Debug("skipping retry: response already started",
+				"method", r.Method,
+				"endpoint", endpoint.Name)
+			return lastErr
+		}
+
+		// The connection genuinely failed, so the endpoint is still demoted, but
+		// the request may already have been read and acted on by that backend.
+		// With non_idempotent off, a POST/PATCH/DELETE is not replayed elsewhere.
+		if h.policy.NoNonIdempotent && !isIdempotent(r.Method) {
+			h.logger.Warn("Connection failed to endpoint, marking as unhealthy",
+				"endpoint", endpoint.Name,
+				"error", lastErr,
+				"attempt", attemptCount,
+				"retry", "skipped: non-idempotent method and proxy.retry.non_idempotent is off",
+				"method", r.Method)
+			h.markEndpointUnhealthy(ctx, endpoint)
+			return lastErr
+		}
+
+		// Handle connection error and retry logic
+		availableEndpoints = h.handleConnectionFailure(ctx, endpoint, lastErr, attemptCount, availableEndpoints, maxRetries)
+	}
+
+	return h.buildFinalError(availableEndpoints, maxRetries, lastErr, cbOpenCount, connErrCount)
+}
+
+// preserveRequestBody reads and preserves request body for potential retries
+func (h *RetryHandler) preserveRequestBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, nil
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		// An oversized chunked body is a client rejection the handler answers with 413 and
+		// samples; an ERROR here would write one line per request.
+		var maxBytesErr *http.MaxBytesError
+		if !errors.As(err, &maxBytesErr) {
+			h.logger.Error("Failed to read request body for retry preservation", "error", err)
+		}
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	if err := r.Body.Close(); err != nil {
+		h.logger.Warn("Failed to close original request body", "error", err)
+	}
+
+	// Recreate the body for the first attempt
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	return bodyBytes, nil
+}
+
+// checkContextCancellation verifies if the context has been cancelled
+func (h *RetryHandler) checkContextCancellation(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("request cancelled: %w", ctx.Err())
+	default:
+		return nil
+	}
+}
+
+// resetRequestBodyForRetry recreates request body for retry attempts
+func (h *RetryHandler) resetRequestBodyForRetry(r *http.Request, bodyBytes []byte, attemptCount int) {
+	if bodyBytes != nil && attemptCount > 0 {
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+}
+
+// executeProxyAttempt executes a single proxy attempt with connection counting
+func (h *RetryHandler) executeProxyAttempt(ctx context.Context, w http.ResponseWriter, r *http.Request,
+	endpoint *domain.Endpoint, selector domain.EndpointSelector, stats *ports.RequestStats, proxyFunc ProxyFunc) error {
+
+	selector.IncrementConnections(endpoint)
+	defer selector.DecrementConnections(endpoint)
+
+	return proxyFunc(ctx, w, r, endpoint, stats)
+}
+
+// handleConnectionFailure processes connection failures and manages endpoint removal.
+//
+// This is one of two layers of failure protection, and it fires first: a
+// single connection-refused error demotes the endpoint to offline right here
+// (see markEndpointUnhealthy), on the very first attempt, well before the
+// proxy engine's own per-endpoint circuit breaker (olla/service.go's
+// circuitBreaker, threshold 5) could accumulate enough failures to open.
+// That's intentional layering, not redundancy: connection-refused means the
+// backend process is down/unreachable, which request-path health demotion
+// (backed by the health checker's periodic re-probing) is the right tool
+// for - retrying it further or waiting for a 5-failure threshold would just
+// burn latency on a backend that health checks will keep confirming is
+// down. In practice this means the circuit breaker rarely gets to open on
+// connection-refused; it mostly governs the failure classes that don't
+// trip this 1-strike path - hangs and response-header timeouts, where the
+// backend is reachable but not answering. See olla/service.go's
+// circuitBreaker.IsOpen for the other side of this split.
+func (h *RetryHandler) handleConnectionFailure(ctx context.Context, endpoint *domain.Endpoint,
+	err error, attemptCount int, availableEndpoints []*domain.Endpoint, maxRetries int) []*domain.Endpoint {
+
+	h.logger.Warn("Connection failed to endpoint, marking as unhealthy",
+		"endpoint", endpoint.Name,
+		"error", err,
+		"attempt", attemptCount,
+		"remaining_endpoints", len(availableEndpoints)-1)
+
+	h.markEndpointUnhealthy(ctx, endpoint)
+
+	// Remove failed endpoint from available list
+	updatedEndpoints := h.removeFailedEndpoint(availableEndpoints, endpoint)
+
+	if len(updatedEndpoints) > 0 && attemptCount < maxRetries {
+		h.logger.Info("Retrying request with different endpoint",
+			"available_endpoints", len(updatedEndpoints),
+			"attempts_remaining", maxRetries-attemptCount)
+	}
+
+	return updatedEndpoints
+}
+
+// removeFailedEndpoint removes the failed endpoint from the available list
+func (h *RetryHandler) removeFailedEndpoint(endpoints []*domain.Endpoint, failedEndpoint *domain.Endpoint) []*domain.Endpoint {
+	for i := range endpoints {
+		if endpoints[i].Name == failedEndpoint.Name {
+			// Remove element at index i by copying subsequent elements
+			copy(endpoints[i:], endpoints[i+1:])
+			return endpoints[:len(endpoints)-1]
+		}
+	}
+	return endpoints
+}
+
+// buildFinalError constructs the appropriate error message for retry failure.
+// cbOpenCount and connErrCount are tallied across every attempt, not just the
+// last one - lastErr alone can't distinguish "every endpoint was CB-open"
+// from "some failed on the network and the last one happened to be CB-open",
+// and conflating the two hides genuine connectivity failures from operators.
+func (h *RetryHandler) buildFinalError(availableEndpoints []*domain.Endpoint, maxRetries int, lastErr error, cbOpenCount, connErrCount int) error {
+	if len(availableEndpoints) == 0 {
+		switch {
+		case cbOpenCount > 0 && connErrCount > 0:
+			return fmt.Errorf("all endpoints unavailable (%d connection failure(s), %d circuit breaker open): %w",
+				connErrCount, cbOpenCount, lastErr)
+		case cbOpenCount > 0:
+			// CB-open exhaustion is reachable here now (FR-2 removes endpoints
+			// without demoting them); don't mislabel it a connection failure, which
+			// would imply a network outage that never happened.
+			return fmt.Errorf("all endpoints unavailable (circuit breaker open): %w", lastErr)
+		default:
+			return fmt.Errorf("all endpoints failed with connection errors: %w", lastErr)
+		}
+	}
+	return fmt.Errorf("max attempts (%d) reached: %w", maxRetries, lastErr)
+}
+
+// IsConnectionError identifies transient network errors suitable for retry.
+// Client-side context cancellations and deadline exceeded errors are NOT
+// connection errors — the backend is not at fault and must not be penalised
+// or failed-over with an already-expired context.
+func IsConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Short-circuit before the net.Error check: context.DeadlineExceeded's
+	// concrete type (*url.Error wrapping it) satisfies net.Error (Timeout()==true),
+	// which would falsely mark the endpoint unhealthy for a client timeout.
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	var syscallErr syscall.Errno
+	if errors.As(err, &syscallErr) {
+		switch syscallErr {
+		case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.ECONNABORTED:
+			return true
+		default:
+			// Non-connection syscall errors
+		}
+	}
+
+	return hasConnectionError(err)
+}
+
+// connectionErrors is a last-resort string fallback for errors that have lost
+// their type information (e.g. plain errors.New from middleware or test stubs).
+// Well-wrapped OS errors are already caught by the net.Error / syscall.Errno
+// branches above, so this list covers only cases those branches cannot reach.
+var connectionErrors = []string{
+	"connection refused",     // syscall.ECONNREFUSED on non-unwrappable paths
+	"connection reset",       // syscall.ECONNRESET on non-unwrappable paths
+	"no such host",           // *net.DNSError without type chain
+	"network is unreachable", // syscall.ENETUNREACH without type chain
+	"no route to host",       // syscall.EHOSTUNREACH without type chain
+	"i/o timeout",            // plain-string timeout errors; net.Error.Timeout() covers wrapped ones
+	"connectex:",             // Windows dial error prefix; appears without net.Error wrapping on some paths
+}
+
+func hasConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+	for _, pattern := range connectionErrors {
+		if strings.Contains(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// markEndpointUnhealthy transitions endpoint to offline state with backoff calculation
+func (h *RetryHandler) markEndpointUnhealthy(ctx context.Context, endpoint *domain.Endpoint) {
+	if endpoint == nil {
+		return
+	}
+
+	now := time.Now()
+
+	// Work with copy to preserve original state
+	endpointCopy := *endpoint
+	endpointCopy.Status = domain.StatusOffline
+	endpointCopy.ConsecutiveFailures++
+	endpointCopy.LastChecked = now
+
+	// Calculate proper exponential backoff multiplier
+	// First failure: keep default interval from the endpoint but set multiplier to 2
+	// Subsequent failures: apply exponential backoff
+	var backoffInterval time.Duration
+
+	if endpointCopy.BackoffMultiplier <= 1 {
+		// First failure - use normal interval
+		endpointCopy.BackoffMultiplier = 2
+		backoffInterval = endpointCopy.CheckInterval
+	} else {
+		// Subsequent failures - apply current multiplier and calculate next
+		backoffInterval = endpointCopy.CheckInterval * time.Duration(endpointCopy.BackoffMultiplier)
+
+		// Calculate next multiplier for future failures
+		endpointCopy.BackoffMultiplier *= 2
+		if endpointCopy.BackoffMultiplier > constants.DefaultMaxBackoffMultiplier {
+			endpointCopy.BackoffMultiplier = constants.DefaultMaxBackoffMultiplier
+		}
+	}
+
+	if backoffInterval > constants.DefaultMaxBackoffSeconds {
+		backoffInterval = constants.DefaultMaxBackoffSeconds
+	}
+	endpointCopy.NextCheckTime = now.Add(backoffInterval)
+
+	h.logger.Warn("Marking endpoint as unhealthy due to connection failure",
+		"endpoint", endpoint.Name,
+		"consecutive_failures", endpointCopy.ConsecutiveFailures,
+		"backoff_multiplier", endpointCopy.BackoffMultiplier,
+		"next_check", endpointCopy.NextCheckTime.Format(time.RFC3339))
+
+	// Persist status change via discovery service
+	h.updateEndpointStatus(ctx, &endpointCopy)
+}
+
+// updateEndpointStatus persists endpoint state changes
+func (h *RetryHandler) updateEndpointStatus(ctx context.Context, endpoint *domain.Endpoint) {
+	if err := h.discoveryService.UpdateEndpointStatus(ctx, endpoint); err != nil {
+		h.logger.Debug("Failed to update endpoint status in repository", "error", err)
+	}
+}
