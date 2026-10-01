@@ -170,3 +170,349 @@ func TestResolveAliasEndpoints_ShortCircuitsOnStatusCodeNotActionString(t *testi
 
 	// Alias resolves to nothing, so resolveAliasEndpoints falls through to the
 	// standard-routing fallback lookup, which is where the short-circuit lives.
+	aliases := map[string][]string{
+		"nonexistent-alias": {"model-not-in-registry"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: &mockBasicActionModelRegistry{},
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "nonexistent-alias"
+	profile.SupportedBy = []string{domain.ProfileOllama}
+
+	result := app.resolveAliasEndpoints(t.Context(), profile, candidates, styledLog)
+
+	assert.Empty(t, result, "a 404/503 decision must fail fast regardless of its action string")
+	require.NotNil(t, profile.RoutingDecision)
+	assert.Equal(t, "no_model", profile.RoutingDecision.Action, "sanity check: this registry deliberately does not use the \"rejected\" action string")
+	assert.Equal(t, http.StatusNotFound, profile.RoutingDecision.StatusCode)
+}
+
+// TestResolveAliasEndpoints_NoIntersectionWithCandidates_StrictRejects covers fix 4 from
+// the #191 follow-up review, CodeRabbit round 2: the alias resolves to real target models,
+// but none of the endpoints serving those models are in the healthy/compatible candidate
+// list. Rather than the handler synthesising its own rejection, this must fall through to
+// the configured routing strategy for the alias name itself - exactly like the "resolved to
+// no endpoints at all" branch - so the strategy's decision (not a hardcoded one) governs the
+// outcome. Under a strict/rejecting registry that decision is still a fail-fast rejection,
+// just reported as model_not_found/404 (an unknown model name) rather than the
+// alias-specific model_unavailable/503 the handler used to synthesise.
+func TestResolveAliasEndpoints_NoIntersectionWithCandidates_StrictRejects(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	endpoint1URL, _ := url.Parse("http://ollama:11434")
+	// Only ollama is a candidate; lmstudio (which actually serves the aliased model) is not.
+	candidates := []*domain.Endpoint{
+		{
+			Name:      "ollama",
+			URL:       endpoint1URL,
+			URLString: "http://ollama:11434",
+			Type:      domain.ProfileOllama,
+		},
+	}
+
+	// The alias resolves to a model that only exists on lmstudio, which isn't a candidate.
+	// strict:true means the fallback lookup on the alias name itself also rejects, since
+	// "gpt-oss-120b" isn't a model the registry knows about either.
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"gpt-oss-120b-MLX": {"http://lmstudio:1234"},
+		},
+		strict: true,
+	}
+
+	aliases := map[string][]string{
+		"gpt-oss-120b": {"gpt-oss-120b-MLX"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "gpt-oss-120b"
+	profile.SupportedBy = []string{domain.ProfileOllama, domain.ProfileLmStudio}
+
+	result := app.resolveAliasEndpoints(t.Context(), profile, candidates, styledLog)
+
+	assert.Empty(t, result, "strict routing on the alias name also rejects, so nothing is routable")
+
+	require.NotNil(t, profile.RoutingDecision, "a decision must be recorded so headers/status are decision-aware, not generic")
+	assert.Equal(t, "strict", profile.RoutingDecision.Strategy)
+	assert.Equal(t, "rejected", profile.RoutingDecision.Action)
+	assert.Equal(t, http.StatusNotFound, profile.RoutingDecision.StatusCode)
+
+	aliasMapRaw, ok := profile.InspectionMeta.Load(constants.ContextModelAliasMapKey)
+	assert.False(t, ok, "rejected fallback must not carry an alias rewrite map")
+	assert.Nil(t, aliasMapRaw)
+}
+
+// TestResolveAliasEndpoints_NoIntersectionWithCandidates_OptimisticFallsBack covers the
+// other side of the same fix: under a registry that returns a fallback decision with
+// endpoints (optimistic routing, fallback_behavior: all) instead of a rejection, the
+// no-intersection branch must let that fallback through rather than unconditionally
+// returning empty. This is the behaviour CodeRabbit flagged as missing - previously this
+// branch always rejected, so optimistic/all could never recover here. The returned
+// endpoints don't serve the alias's actual target models (they're the routing strategy's
+// substitute, not an alias match), so the alias rewrite map must NOT be set - the proxy
+// has to forward the original request body unchanged.
+func TestResolveAliasEndpoints_NoIntersectionWithCandidates_OptimisticFallsBack(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	endpoint1URL, _ := url.Parse("http://ollama:11434")
+	candidates := []*domain.Endpoint{
+		{
+			Name:      "ollama",
+			URL:       endpoint1URL,
+			URLString: "http://ollama:11434",
+			Type:      domain.ProfileOllama,
+		},
+	}
+
+	// The alias resolves to a model that only exists on lmstudio, which isn't a candidate.
+	// strict is left false, so mockSimpleModelRegistry's fallback lookup on the alias name
+	// mirrors an optimistic/all decision: it hands back the candidates rather than rejecting.
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"gpt-oss-120b-MLX": {"http://lmstudio:1234"},
+		},
+	}
+
+	aliases := map[string][]string{
+		"gpt-oss-120b": {"gpt-oss-120b-MLX"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "gpt-oss-120b"
+	profile.SupportedBy = []string{domain.ProfileOllama, domain.ProfileLmStudio}
+
+	result := app.resolveAliasEndpoints(t.Context(), profile, candidates, styledLog)
+
+	require.Len(t, result, 1, "the fallback decision hands back the candidate set, so the request still proxies")
+	assert.Equal(t, "http://ollama:11434", result[0].URLString)
+
+	require.NotNil(t, profile.RoutingDecision)
+	assert.NotEqual(t, "rejected", profile.RoutingDecision.Action)
+
+	aliasMapRaw, ok := profile.InspectionMeta.Load(constants.ContextModelAliasMapKey)
+	assert.False(t, ok, "fallback endpoints weren't confirmed to serve the aliased model, so no rewrite map must be set")
+	assert.Nil(t, aliasMapRaw)
+}
+
+func TestResolveAliasEndpoints_SelfReferencingAlias(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	endpoint1URL, _ := url.Parse("http://ollama:11434")
+	endpoint2URL, _ := url.Parse("http://lmstudio:1234")
+
+	candidates := []*domain.Endpoint{
+		{
+			Name:      "ollama",
+			URL:       endpoint1URL,
+			URLString: "http://ollama:11434",
+			Type:      domain.ProfileOllama,
+		},
+		{
+			Name:      "lmstudio",
+			URL:       endpoint2URL,
+			URLString: "http://lmstudio:1234",
+			Type:      domain.ProfileLmStudio,
+		},
+	}
+
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"gpt-oss:120b": {"http://ollama:11434"},
+			"gpt-oss-120b": {"http://lmstudio:1234"}, // same name as alias
+		},
+	}
+
+	// Alias name is also a real model on one backend
+	aliases := map[string][]string{
+		"gpt-oss-120b": {"gpt-oss:120b", "gpt-oss-120b"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "gpt-oss-120b"
+	profile.SupportedBy = []string{domain.ProfileOllama, domain.ProfileLmStudio}
+
+	result := app.resolveAliasEndpoints(t.Context(), profile, candidates, styledLog)
+
+	// Both endpoints should be included
+	assert.Len(t, result, 2)
+
+	// Verify rewrite map: ollama gets gpt-oss:120b, lmstudio gets gpt-oss-120b (its native name)
+	aliasMapRaw, ok := profile.InspectionMeta.Load(constants.ContextModelAliasMapKey)
+	require.True(t, ok)
+
+	aliasMap := aliasMapRaw.(map[string]string)
+	assert.Equal(t, "gpt-oss:120b", aliasMap["http://ollama:11434"])
+	assert.Equal(t, "gpt-oss-120b", aliasMap["http://lmstudio:1234"])
+}
+
+func TestResolveAliasEndpoints_OnlyHealthyCandidatesReturned(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	endpoint1URL, _ := url.Parse("http://ollama:11434")
+	endpoint2URL, _ := url.Parse("http://lmstudio:1234")
+
+	// Only ollama is in the candidate list (healthy)
+	candidates := []*domain.Endpoint{
+		{
+			Name:      "ollama",
+			URL:       endpoint1URL,
+			URLString: "http://ollama:11434",
+			Type:      domain.ProfileOllama,
+		},
+	}
+
+	// Both endpoints have the model, but lmstudio is not in candidates (unhealthy)
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"gpt-oss:120b":     {"http://ollama:11434"},
+			"gpt-oss-120b-MLX": {"http://lmstudio:1234"},
+		},
+	}
+
+	aliases := map[string][]string{
+		"gpt-oss-120b": {"gpt-oss:120b", "gpt-oss-120b-MLX"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "gpt-oss-120b"
+	profile.SupportedBy = []string{domain.ProfileOllama, domain.ProfileLmStudio}
+
+	result := app.resolveAliasEndpoints(t.Context(), profile, candidates, styledLog)
+
+	// Only the healthy candidate (ollama) should be returned
+	assert.Len(t, result, 1)
+	assert.Equal(t, "http://ollama:11434", result[0].URLString)
+
+	// lmstudio should NOT be in result despite having a matching model
+	_ = endpoint2URL // was used for setup clarity
+}
+
+func TestResolveAliasEndpoints_SetsRoutingDecision(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	endpoint1URL, _ := url.Parse("http://ollama:11434")
+	candidates := []*domain.Endpoint{
+		{
+			Name:      "ollama",
+			URL:       endpoint1URL,
+			URLString: "http://ollama:11434",
+			Type:      domain.ProfileOllama,
+		},
+	}
+
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"gpt-oss:120b": {"http://ollama:11434"},
+		},
+	}
+
+	aliases := map[string][]string{
+		"gpt-oss-120b": {"gpt-oss:120b"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "gpt-oss-120b"
+	profile.SupportedBy = []string{domain.ProfileOllama}
+
+	_ = app.resolveAliasEndpoints(t.Context(), profile, candidates, styledLog)
+
+	// Should set routing decision
+	require.NotNil(t, profile.RoutingDecision, "routing decision should be set")
+	assert.Equal(t, "alias", profile.RoutingDecision.Strategy)
+	assert.Equal(t, "routed", profile.RoutingDecision.Action)
+}
+
+func TestResolveAliasEndpoints_IntegrationWithFilterEndpointsByProfile(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	endpoint1URL, _ := url.Parse("http://ollama:11434")
+	endpoint2URL, _ := url.Parse("http://lmstudio:1234")
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "ollama",
+			URL:       endpoint1URL,
+			URLString: "http://ollama:11434",
+			Type:      domain.ProfileOllama,
+		},
+		{
+			Name:      "lmstudio",
+			URL:       endpoint2URL,
+			URLString: "http://lmstudio:1234",
+			Type:      domain.ProfileLmStudio,
+		},
+	}
+
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"gpt-oss:120b":     {"http://ollama:11434"},
+			"gpt-oss-120b-MLX": {"http://lmstudio:1234"},
+		},
+	}
+
+	aliases := map[string][]string{
+		"gpt-oss-120b": {"gpt-oss:120b", "gpt-oss-120b-MLX"},
+	}
+	aliasResolver := registry.NewAliasResolver(aliases, styledLog)
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		aliasResolver: aliasResolver,
+		logger:        styledLog,
+	}
+
+	// Test through filterEndpointsByProfile, which is the real entry point
+	profile := domain.NewRequestProfile("/v1/chat/completions")
+	profile.ModelName = "gpt-oss-120b"
+	profile.SupportedBy = []string{domain.ProfileOllama, domain.ProfileLmStudio}
+
+	result := app.filterEndpointsByProfile(endpoints, profile, styledLog)
+
+	// Both endpoints should be returned via alias resolution
+	assert.Len(t, result, 2)
+
+	// Verify the routing went through alias path
+	require.NotNil(t, profile.RoutingDecision)
+	assert.Equal(t, "alias", profile.RoutingDecision.Strategy)
+}
