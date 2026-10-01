@@ -112,3 +112,118 @@ func TestCORSNoOriginPassthrough(t *testing.T) {
 	if v := rr.Header().Get("Access-Control-Expose-Headers"); v != "" {
 		t.Errorf("expected no Access-Control-Expose-Headers for non-CORS request, got %q", v)
 	}
+}
+
+// TestCORSExplicitExposedHeadersOverride confirms that setting ExposedHeaders in
+// the config replaces the default X-Olla-* set entirely — no merging happens.
+func TestCORSExplicitExposedHeadersOverride(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseCORSConfig()
+	cfg.ExposedHeaders = []string{"X-Custom-Header"}
+
+	var called bool
+	c := NewCORS(cfg)
+	handler := c.Handler(nextCalledHandler(&called))
+
+	req := httptest.NewRequest(http.MethodGet, "/olla/proxy/v1/models", nil)
+	req.Header.Set("Origin", "https://example.com")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	exposed := rr.Header().Get("Access-Control-Expose-Headers")
+	if !strings.Contains(exposed, "X-Custom-Header") {
+		t.Errorf("expected custom header in Expose-Headers, got %q", exposed)
+	}
+	if strings.Contains(exposed, constants.HeaderXOllaModel) {
+		t.Errorf("default %q must not appear when ExposedHeaders is explicitly set, got %q",
+			constants.HeaderXOllaModel, exposed)
+	}
+}
+
+// TestCORSAllowCredentials verifies that AllowCredentials=true propagates correctly
+// and that the reflected origin is returned (not a wildcard, which the CORS spec forbids).
+func TestCORSAllowCredentials(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseCORSConfig()
+	cfg.AllowCredentials = true
+
+	var called bool
+	c := NewCORS(cfg)
+	handler := c.Handler(nextCalledHandler(&called))
+
+	req := httptest.NewRequest(http.MethodGet, "/olla/proxy/v1/models", nil)
+	req.Header.Set("Origin", "https://example.com")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if v := rr.Header().Get("Access-Control-Allow-Credentials"); v != "true" {
+		t.Errorf("expected Access-Control-Allow-Credentials: true, got %q", v)
+	}
+	// When credentials are in play the CORS spec forbids wildcard; the origin must be echoed.
+	if v := rr.Header().Get("Access-Control-Allow-Origin"); v != "https://example.com" {
+		t.Errorf("expected Allow-Origin to reflect request origin with credentials, got %q", v)
+	}
+}
+
+// TestCORSDisallowedOrigin verifies that a request from an unlisted origin does
+// not receive an Access-Control-Allow-Origin header.
+func TestCORSDisallowedOrigin(t *testing.T) {
+	t.Parallel()
+
+	var called bool
+	c := NewCORS(baseCORSConfig())
+	handler := c.Handler(nextCalledHandler(&called))
+
+	req := httptest.NewRequest(http.MethodGet, "/olla/proxy/v1/models", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if v := rr.Header().Get("Access-Control-Allow-Origin"); v == "https://evil.example.com" {
+		t.Errorf("disallowed origin must not appear in Access-Control-Allow-Origin, got %q", v)
+	}
+}
+
+// TestDefaultCORSExposedHeaders is a regression guard that asserts every expected
+// X-Olla-* header constant is present in DefaultCORSExposedHeaders. Without this,
+// a new header added to content.go would silently go unexposed to browser clients.
+func TestDefaultCORSExposedHeaders(t *testing.T) {
+	t.Parallel()
+
+	expected := []string{
+		constants.HeaderXOllaRequestID,
+		constants.HeaderXOllaEndpoint,
+		constants.HeaderXOllaBackendType,
+		constants.HeaderXOllaModel,
+		constants.HeaderXOllaResponseTime,
+		constants.HeaderXOllaRoutingStrategy,
+		constants.HeaderXOllaRoutingDecision,
+		constants.HeaderXOllaRoutingReason,
+		constants.HeaderXOllaMode,
+		constants.HeaderXOllaPartial,
+		constants.HeaderXOllaStickySession,
+		constants.HeaderXOllaStickyKeySource,
+		constants.HeaderXOllaSessionID,
+	}
+
+	defaultSet := make(map[string]struct{}, len(DefaultCORSExposedHeaders))
+	for _, h := range DefaultCORSExposedHeaders {
+		defaultSet[h] = struct{}{}
+	}
+
+	for _, h := range expected {
+		if _, ok := defaultSet[h]; !ok {
+			t.Errorf("DefaultCORSExposedHeaders is missing %q", h)
+		}
+	}
+
+	if len(DefaultCORSExposedHeaders) != len(expected) {
+		t.Errorf("DefaultCORSExposedHeaders has %d entries, expected %d — update this test when adding new X-Olla-* headers",
+			len(DefaultCORSExposedHeaders), len(expected))
+	}
+}
