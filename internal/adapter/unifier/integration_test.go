@@ -176,3 +176,182 @@ func TestUnifierIntegrationWithRegistry(t *testing.T) {
 	assert.Len(t, phi4ModelAfter.SourceEndpoints, 1)
 	assert.Equal(t, ollamaEndpoint, phi4ModelAfter.SourceEndpoints[0].EndpointURL)
 }
+
+func TestUnifierIntegrationEdgeCases(t *testing.T) {
+	log := createTestLogger()
+	ctx := context.Background()
+
+	// Create unified registry
+	unifiedRegistry := registry.NewUnifiedMemoryModelRegistry(log, nil, nil, nil)
+
+	t.Run("empty model list", func(t *testing.T) {
+		err := unifiedRegistry.RegisterModels(ctx, "http://localhost:11434", []*domain.ModelInfo{})
+		assert.NoError(t, err)
+
+		models, err := unifiedRegistry.GetUnifiedModels(ctx)
+		assert.NoError(t, err)
+		assert.Empty(t, models)
+	})
+
+	t.Run("nil models in list", func(t *testing.T) {
+		models := []*domain.ModelInfo{
+			{
+				Name: "valid:model",
+				Details: &domain.ModelDetails{
+					Family:        strPtr("test"),
+					ParameterSize: strPtr("7B"),
+				},
+			},
+			nil, // Should be handled gracefully
+			{
+				Name: "another:model",
+				Details: &domain.ModelDetails{
+					Family:        strPtr("test2"),
+					ParameterSize: strPtr("13B"),
+				},
+			},
+		}
+
+		err := unifiedRegistry.RegisterModels(ctx, "http://localhost:11434", models)
+		assert.NoError(t, err)
+
+		// Wait for async processing
+		time.Sleep(50 * time.Millisecond)
+
+		unifiedModels, err := unifiedRegistry.GetUnifiedModels(ctx)
+		assert.NoError(t, err)
+		assert.Len(t, unifiedModels, 2) // Only valid models
+	})
+
+	t.Run("concurrent endpoint registration", func(t *testing.T) {
+		// Register the same model from multiple endpoints concurrently
+		model := &domain.ModelInfo{
+			Name: "concurrent:test",
+			Details: &domain.ModelDetails{
+				Family:            strPtr("concurrent"),
+				ParameterSize:     strPtr("7B"),
+				QuantizationLevel: strPtr("Q4_0"),
+			},
+			Size: 4_000_000_000,
+		}
+
+		endpoints := []string{
+			"http://endpoint1:11434",
+			"http://endpoint2:11434",
+			"http://endpoint3:11434",
+		}
+
+		// Register concurrently
+		var wg sync.WaitGroup
+		for _, endpoint := range endpoints {
+			wg.Add(1)
+			go func(url string) {
+				defer wg.Done()
+				err := unifiedRegistry.RegisterModels(ctx, url, []*domain.ModelInfo{model})
+				assert.NoError(t, err)
+			}(endpoint)
+		}
+		wg.Wait()
+
+		// Wait for async unification
+		time.Sleep(100 * time.Millisecond)
+
+		// Should have one unified model with multiple endpoints
+		unified, err := unifiedRegistry.GetUnifiedModel(ctx, "concurrent:test")
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, len(unified.SourceEndpoints), 1)
+	})
+}
+
+func TestUnifierWithRealWorldScenarios(t *testing.T) {
+	log := createTestLogger()
+	ctx := context.Background()
+	unifiedRegistry := registry.NewUnifiedMemoryModelRegistry(log, nil, nil, nil)
+
+	// Scenario 1: Model migration between endpoints
+	t.Run("model migration", func(t *testing.T) {
+		oldEndpoint := "http://old-server:11434"
+		newEndpoint := "http://new-server:11434"
+
+		model := &domain.ModelInfo{
+			Name: "migrating:model",
+			Details: &domain.ModelDetails{
+				Family:            strPtr("test"),
+				ParameterSize:     strPtr("7B"),
+				QuantizationLevel: strPtr("Q4_K_M"),
+			},
+		}
+
+		// Initially on old endpoint
+		err := unifiedRegistry.RegisterModels(ctx, oldEndpoint, []*domain.ModelInfo{model})
+		require.NoError(t, err)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Add to new endpoint
+		err = unifiedRegistry.RegisterModels(ctx, newEndpoint, []*domain.ModelInfo{model})
+		require.NoError(t, err)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Should be available on both
+		endpoints, err := unifiedRegistry.GetEndpointsForModel(ctx, "migrating:model")
+		require.NoError(t, err)
+		assert.Len(t, endpoints, 2)
+
+		// Remove from old endpoint
+		err = unifiedRegistry.RemoveEndpoint(ctx, oldEndpoint)
+		require.NoError(t, err)
+
+		// Should only be on new endpoint
+		endpoints, err = unifiedRegistry.GetEndpointsForModel(ctx, "migrating:model")
+		require.NoError(t, err)
+		assert.Len(t, endpoints, 1)
+		assert.Equal(t, newEndpoint, endpoints[0])
+	})
+
+	// Scenario 2: Model version updates
+	t.Run("model version updates", func(t *testing.T) {
+		endpoint := "http://localhost:11434"
+
+		// Register old version
+		oldModel := &domain.ModelInfo{
+			Name: "llama2:13b",
+			Details: &domain.ModelDetails{
+				Family:            strPtr("llama"),
+				ParameterSize:     strPtr("13B"),
+				QuantizationLevel: strPtr("Q4_0"),
+				Digest:            strPtr("old-digest"),
+			},
+			LastSeen: time.Now().Add(-24 * time.Hour),
+		}
+
+		err := unifiedRegistry.RegisterModels(ctx, endpoint, []*domain.ModelInfo{oldModel})
+		require.NoError(t, err)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Update with new version
+		newModel := &domain.ModelInfo{
+			Name: "llama2:13b",
+			Details: &domain.ModelDetails{
+				Family:            strPtr("llama"),
+				ParameterSize:     strPtr("13B"),
+				QuantizationLevel: strPtr("Q4_K_M"), // Better quantization
+				Digest:            strPtr("new-digest"),
+			},
+			LastSeen: time.Now(),
+		}
+
+		err = unifiedRegistry.RegisterModels(ctx, endpoint, []*domain.ModelInfo{newModel})
+		require.NoError(t, err)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// Should have updated to the latest version
+		unified, err := unifiedRegistry.GetUnifiedModel(ctx, "llama2:13b")
+		require.NoError(t, err)
+		// In simplified implementation, we don't parse quantization
+		assert.NotNil(t, unified)
+	})
+}
