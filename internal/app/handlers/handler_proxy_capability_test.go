@@ -109,3 +109,449 @@ func TestFilterEndpointsByCapabilities(t *testing.T) {
 				{
 					ID:           "text-embedding-ada-002",
 					Capabilities: []string{"embeddings"},
+					SourceEndpoints: []domain.SourceEndpoint{
+						{EndpointURL: "http://localhost:11437", LastSeen: time.Now()},
+					},
+				},
+			},
+			"code": {
+				{
+					ID:           "codellama:34b",
+					Capabilities: []string{"code", "chat", "streaming"},
+					SourceEndpoints: []domain.SourceEndpoint{
+						{EndpointURL: "http://localhost:11434", LastSeen: time.Now()},
+					},
+				},
+			},
+		},
+	}
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		logger:        styledLog,
+	}
+
+	tests := []struct {
+		name              string
+		capabilities      *domain.ModelCapabilities
+		expectedEndpoints []*domain.Endpoint
+		expectedCount     int
+		description       string
+	}{
+		{
+			name: "vision request filters to vision-capable endpoints",
+			capabilities: &domain.ModelCapabilities{
+				VisionUnderstanding: true,
+				ChatCompletion:      true,
+				TextGeneration:      true,
+				StreamingSupport:    true,
+			},
+			expectedCount: 3, // endpoints 1, 2, 3 have vision models
+			description:   "Should filter to endpoints with vision-capable models",
+		},
+		{
+			name: "function calling request",
+			capabilities: &domain.ModelCapabilities{
+				FunctionCalling:  true,
+				ChatCompletion:   true,
+				TextGeneration:   true,
+				StreamingSupport: true,
+			},
+			expectedCount: 2, // endpoints 3, 4 have function calling models
+			description:   "Should filter to endpoints with function calling models",
+		},
+		{
+			name: "embeddings request",
+			capabilities: &domain.ModelCapabilities{
+				Embeddings:       true,
+				ChatCompletion:   false,
+				TextGeneration:   false,
+				StreamingSupport: true,
+			},
+			expectedCount: 1, // only endpoint 4 has embeddings
+			description:   "Should filter to endpoints with embedding models",
+		},
+		{
+			name: "code generation request",
+			capabilities: &domain.ModelCapabilities{
+				CodeGeneration:   true,
+				ChatCompletion:   true,
+				TextGeneration:   true,
+				StreamingSupport: true,
+			},
+			expectedCount: 1, // only endpoint 1 has code models
+			description:   "Should filter to endpoints with code generation models",
+		},
+		{
+			name: "combined vision and function calling",
+			capabilities: &domain.ModelCapabilities{
+				VisionUnderstanding: true,
+				FunctionCalling:     true,
+				ChatCompletion:      true,
+				TextGeneration:      true,
+				StreamingSupport:    true,
+			},
+			expectedCount: 1, // only endpoint 3 has both capabilities (gpt-4-vision)
+			description:   "Should filter to endpoints with both vision and function calling",
+		},
+		{
+			name: "no special capabilities",
+			capabilities: &domain.ModelCapabilities{
+				ChatCompletion:   true,
+				TextGeneration:   true,
+				StreamingSupport: true,
+			},
+			expectedCount: 4, // all endpoints returned when no special capabilities
+			description:   "Should return all endpoints when no special capabilities required",
+		},
+		{
+			name:          "nil capabilities",
+			capabilities:  nil,
+			expectedCount: 4, // all endpoints returned
+			description:   "Should return all endpoints when capabilities is nil",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			profile := &domain.RequestProfile{
+				Path:              "/v1/chat/completions",
+				ModelCapabilities: tt.capabilities,
+				SupportedBy:       []string{domain.ProfileOllama, domain.ProfileOpenAICompatible},
+			}
+
+			filtered, _ := app.filterEndpointsByCapabilities(endpoints, profile, styledLog)
+
+			assert.Len(t, filtered, tt.expectedCount, tt.description)
+		})
+	}
+}
+
+// An endpoint hosting a vision model and, separately, a tools model must not
+// satisfy a vision+tools request: only a single model with both qualifies.
+func TestFilterEndpointsByCapabilities_IntersectsPerModel(t *testing.T) {
+	styledLog := &mockStyledLogger{}
+
+	mk := func(name, rawURL string) *domain.Endpoint {
+		u, _ := url.Parse(rawURL)
+		return &domain.Endpoint{Name: name, URL: u, URLString: rawURL, Type: domain.ProfileOpenAICompatible}
+	}
+	split := mk("split", "http://localhost:11434")
+	single := mk("single", "http://localhost:11435")
+	endpoints := []*domain.Endpoint{split, single}
+
+	src := func(rawURLs ...string) []domain.SourceEndpoint {
+		out := make([]domain.SourceEndpoint, 0, len(rawURLs))
+		for _, u := range rawURLs {
+			out = append(out, domain.SourceEndpoint{EndpointURL: u, LastSeen: time.Now()})
+		}
+		return out
+	}
+	visionA := &domain.UnifiedModel{ID: "vision-a", SourceEndpoints: src("http://localhost:11434")}
+	toolsB := &domain.UnifiedModel{ID: "tools-b", SourceEndpoints: src("http://localhost:11434")}
+	both := &domain.UnifiedModel{ID: "vision-tools-c", SourceEndpoints: src("http://localhost:11435")}
+
+	app := &Application{
+		logger: styledLog,
+		modelRegistry: &mockCapabilityModelRegistry{
+			modelsByCapability: map[string][]*domain.UnifiedModel{
+				"vision": {visionA, both},
+				// the real registry answers function_calling for models tagged
+				// either function_calling or tools, so one key covers both
+				"function_calling": {toolsB, both},
+			},
+		},
+	}
+
+	profile := &domain.RequestProfile{
+		Path:              "/v1/chat/completions",
+		ModelCapabilities: &domain.ModelCapabilities{VisionUnderstanding: true, FunctionCalling: true},
+	}
+
+	filtered, _ := app.filterEndpointsByCapabilities(endpoints, profile, styledLog)
+
+	assert.Len(t, filtered, 1)
+	assert.Equal(t, "single", filtered[0].Name)
+}
+
+func TestFilterEndpointsByProfile_WithCapabilities(t *testing.T) {
+	// Create mock logger
+	styledLog := &mockStyledLogger{}
+
+	// Create test endpoints
+	endpoint1, _ := url.Parse("http://localhost:11434")
+	endpoint2, _ := url.Parse("http://localhost:11435")
+	endpoint3, _ := url.Parse("http://localhost:11436")
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "ollama-vision",
+			URL:       endpoint1,
+			URLString: "http://localhost:11434",
+			Type:      domain.ProfileOllama,
+		},
+		{
+			Name:      "ollama-basic",
+			URL:       endpoint2,
+			URLString: "http://localhost:11435",
+			Type:      domain.ProfileOllama,
+		},
+		{
+			Name:      "openai",
+			URL:       endpoint3,
+			URLString: "http://localhost:11436",
+			Type:      domain.ProfileOpenAICompatible,
+		},
+	}
+
+	// Mock model registry with both model and capability support
+	modelRegistry := &mockFullModelRegistry{
+		endpointsForModel: map[string][]string{
+			"llava:13b":    {"http://localhost:11434"},
+			"llama3.1:8b":  {"http://localhost:11435"},
+			"gpt-4-vision": {"http://localhost:11436"},
+		},
+		modelsByCapability: map[string][]*domain.UnifiedModel{
+			"vision": {
+				{
+					ID:           "llava:13b",
+					Capabilities: []string{"vision", "chat"},
+					SourceEndpoints: []domain.SourceEndpoint{
+						{EndpointURL: "http://localhost:11434", LastSeen: time.Now()},
+					},
+				},
+				{
+					ID:           "gpt-4-vision",
+					Capabilities: []string{"vision", "chat", "function_calling"},
+					SourceEndpoints: []domain.SourceEndpoint{
+						{EndpointURL: "http://localhost:11436", LastSeen: time.Now()},
+					},
+				},
+			},
+		},
+	}
+
+	app := &Application{
+		modelRegistry: modelRegistry,
+		logger:        styledLog,
+	}
+
+	t.Run("named model is never narrowed by capability tags", func(t *testing.T) {
+		profile := &domain.RequestProfile{
+			Path:      "/v1/chat/completions",
+			ModelName: "llama3.1:8b",
+			ModelCapabilities: &domain.ModelCapabilities{
+				VisionUnderstanding: true,
+				ChatCompletion:      true,
+			},
+			SupportedBy: []string{domain.ProfileOllama, domain.ProfileOpenAICompatible},
+		}
+
+		filtered := app.filterEndpointsByProfile(endpoints, profile, styledLog)
+
+		// llama3.1:8b carries no vision tag and lives on the non-vision endpoint;
+		// the request names it, so the vision tag on other models must not evict it
+		assert.Len(t, filtered, 1)
+		assert.Equal(t, "ollama-basic", filtered[0].Name)
+	})
+
+	t.Run("falls back to profile filtering when no capability match", func(t *testing.T) {
+		profile := &domain.RequestProfile{
+			Path: "/v1/chat/completions",
+			ModelCapabilities: &domain.ModelCapabilities{
+				Embeddings: true, // No endpoints have embedding models
+			},
+			SupportedBy: []string{domain.ProfileOllama, domain.ProfileOpenAICompatible},
+		}
+
+		filtered := app.filterEndpointsByProfile(endpoints, profile, styledLog)
+
+		// Should return all compatible endpoints since no capability match
+		assert.Len(t, filtered, 3)
+	})
+}
+
+// Mock implementations for capability testing
+type mockCapabilityModelRegistry struct {
+	mockSimpleModelRegistry
+	modelsByCapability map[string][]*domain.UnifiedModel
+}
+
+func (m *mockCapabilityModelRegistry) GetModelsByCapability(ctx context.Context, capability string) ([]*domain.UnifiedModel, error) {
+	if models, ok := m.modelsByCapability[capability]; ok {
+		return models, nil
+	}
+	return []*domain.UnifiedModel{}, nil
+}
+
+// Full mock with both model and capability support
+type mockFullModelRegistry struct {
+	baseMockRegistry
+	endpointsForModel  map[string][]string
+	modelsByCapability map[string][]*domain.UnifiedModel
+}
+
+func (m *mockFullModelRegistry) GetEndpointsForModel(ctx context.Context, modelName string) ([]string, error) {
+	if endpoints, ok := m.endpointsForModel[modelName]; ok {
+		return endpoints, nil
+	}
+	return []string{}, nil
+}
+
+func (m *mockFullModelRegistry) IsModelAvailable(ctx context.Context, modelName string) bool {
+	_, ok := m.endpointsForModel[modelName]
+	return ok
+}
+
+func (m *mockFullModelRegistry) GetModelsByCapability(ctx context.Context, capability string) ([]*domain.UnifiedModel, error) {
+	if models, ok := m.modelsByCapability[capability]; ok {
+		return models, nil
+	}
+	return []*domain.UnifiedModel{}, nil
+}
+
+func (m *mockFullModelRegistry) GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
+	// implement strict routing for tests
+	modelEndpoints, _ := m.GetEndpointsForModel(ctx, modelName)
+
+	if len(modelEndpoints) == 0 {
+		// model not found - return all healthy as fallback
+		return healthyEndpoints, &domain.ModelRoutingDecision{
+			Strategy: "test",
+			Action:   "fallback",
+			Reason:   "model not found",
+		}, nil
+	}
+
+	// filter to only endpoints with the model
+	modelEndpointMap := make(map[string]bool)
+	for _, url := range modelEndpoints {
+		modelEndpointMap[url] = true
+	}
+
+	var routable []*domain.Endpoint
+	for _, endpoint := range healthyEndpoints {
+		if modelEndpointMap[endpoint.URLString] {
+			routable = append(routable, endpoint)
+		}
+	}
+
+	if len(routable) == 0 {
+		// model only on unhealthy endpoints
+		return healthyEndpoints, &domain.ModelRoutingDecision{
+			Strategy: "test",
+			Action:   "fallback",
+			Reason:   "model unavailable",
+		}, nil
+	}
+
+	return routable, &domain.ModelRoutingDecision{
+		Strategy: "test",
+		Action:   "routed",
+		Reason:   "model found",
+	}, nil
+}
+
+// Ensure our mocks implement the interface
+var _ domain.ModelRegistry = (*mockCapabilityModelRegistry)(nil)
+var _ domain.ModelRegistry = (*mockFullModelRegistry)(nil)
+
+func TestExtractRequiredCapabilities(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	tests := []struct {
+		name string
+		caps *domain.ModelCapabilities
+		want []string
+	}{
+		{"function calling needs one tag, not two", &domain.ModelCapabilities{FunctionCalling: true}, []string{"function_calling"}},
+		{"embeddings", &domain.ModelCapabilities{Embeddings: true}, []string{"embeddings"}},
+		{"rerank", &domain.ModelCapabilities{Rerank: true}, []string{"rerank"}},
+		{"classification", &domain.ModelCapabilities{Classification: true}, []string{"classification"}},
+		{"chat only needs nothing", &domain.ModelCapabilities{ChatCompletion: true, TextGeneration: true}, []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, app.extractRequiredCapabilities(tt.caps))
+		})
+	}
+}
+
+// warnRecorder counts Warn calls by message; every other level is a no-op. It returns itself
+// from WithRequestID so request-scoped loggers record into the same counts.
+type warnRecorder struct {
+	mockStyledLogger
+	mu    sync.Mutex
+	warns map[string]int
+}
+
+func newWarnRecorder() *warnRecorder { return &warnRecorder{warns: map[string]int{}} }
+
+func (w *warnRecorder) Warn(msg string, _ ...any) {
+	w.mu.Lock()
+	w.warns[msg]++
+	w.mu.Unlock()
+}
+
+func (w *warnRecorder) WithRequestID(string) logger.StyledLogger { return w }
+
+func (w *warnRecorder) snapshot() map[string]int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make(map[string]int, len(w.warns))
+	for k, v := range w.warns {
+		out[k] = v
+	}
+	return out
+}
+
+func (w *warnRecorder) reset() {
+	w.mu.Lock()
+	w.warns = map[string]int{}
+	w.mu.Unlock()
+}
+
+// A refusal is logged once by the "Request rejected" line, so the filter itself must not
+// write a Warn per request while a client keeps retrying against a downed backend.
+func TestFilterEndpointsByCapabilities_RefusalWritesNoWarn(t *testing.T) {
+	t.Parallel()
+
+	rec := newWarnRecorder()
+	capableURL := "http://embedder:8080"
+	otherURL := "http://reranker:8080"
+	mk := func(name, rawURL string) *domain.Endpoint {
+		u, _ := url.Parse(rawURL)
+		return &domain.Endpoint{Name: name, URL: u, URLString: rawURL, Type: domain.ProfileOpenAICompatible, Status: domain.StatusHealthy}
+	}
+	embedder := &domain.UnifiedModel{ID: "embedder", SourceEndpoints: []domain.SourceEndpoint{{EndpointURL: capableURL, LastSeen: time.Now()}}}
+
+	app := &Application{
+		logger: rec,
+		// the embedder host is known but absent from the healthy list, as when it is down
+		discoveryService: &mockDiscoveryServiceWithFunc{
+			getHealthyEndpointsFunc: func(context.Context) ([]*domain.Endpoint, error) {
+				return []*domain.Endpoint{mk("reranker", otherURL)}, nil
+			},
+			getEndpointsFunc: func(context.Context) ([]*domain.Endpoint, error) {
+				down := mk("embedder", capableURL)
+				down.Status = domain.StatusOffline
+				return []*domain.Endpoint{down, mk("reranker", otherURL)}, nil
+			},
+		},
+		modelRegistry: &mockCapabilityModelRegistry{
+			modelsByCapability: map[string][]*domain.UnifiedModel{"embeddings": {embedder}},
+		},
+	}
+	profile := &domain.RequestProfile{Path: "/embed", ModelCapabilities: &domain.ModelCapabilities{Embeddings: true}}
+
+	for range 100 {
+		filtered, refusal := app.filterEndpointsByCapabilities([]*domain.Endpoint{mk("reranker", otherURL)}, profile, rec)
+		require.Empty(t, filtered)
+		require.NotNil(t, refusal)
+		require.Equal(t, constants.RoutingReasonCapabilityUnavailable, refusal.Reason)
+	}
+
+	assert.Zero(t, rec.warns["Models with the required capabilities exist but none are on a healthy endpoint"])
+}

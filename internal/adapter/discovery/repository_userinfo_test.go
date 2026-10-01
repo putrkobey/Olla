@@ -53,3 +53,59 @@ func TestEndpointConfigValidation_RejectsUserinfo(t *testing.T) {
 	}
 
 	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := NewStaticEndpointRepository()
+			cfg := config.EndpointConfig{
+				Name:           "credentialed",
+				URL:            tc.url,
+				Type:           "ollama",
+				HealthCheckURL: "/health",
+				ModelURL:       "/api/tags",
+				CheckInterval:  5 * time.Second,
+				CheckTimeout:   2 * time.Second,
+			}
+			err := repo.LoadFromConfig(context.Background(), []config.EndpointConfig{cfg})
+			if err == nil {
+				t.Fatalf("expected error for userinfo URL %q, got nil", tc.url)
+			}
+			if !strings.Contains(err.Error(), "auth config block") {
+				t.Errorf("error should direct operator to the auth config block, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "credentials") {
+				t.Errorf("error should mention credentials, got: %v", err)
+			}
+			// The fix should be spelled out: the username/password_file
+			// variants so secrets can be kept out of config too.
+			if !strings.Contains(err.Error(), "username_file") {
+				t.Errorf("error should mention username_file for secret-file resolution, got: %v", err)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error should contain %q, got: %v", want, err)
+				}
+			}
+			for _, secret := range tc.wantAbsent {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error must not echo the real credential %q, got: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+// A plain URL without userinfo must continue to load cleanly (regression guard).
+func TestEndpointConfigValidation_AcceptsPlainURL(t *testing.T) {
+	repo := NewStaticEndpointRepository()
+	cfg := config.EndpointConfig{
+		Name:           "plain",
+		URL:            "http://localhost:11434",
+		Type:           "ollama",
+		HealthCheckURL: "/health",
+		ModelURL:       "/api/tags",
+		CheckInterval:  5 * time.Second,
+		CheckTimeout:   2 * time.Second,
+	}
+	if err := repo.LoadFromConfig(context.Background(), []config.EndpointConfig{cfg}); err != nil {
+		t.Fatalf("plain URL should load, got: %v", err)
+	}
+}
