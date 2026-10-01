@@ -66,3 +66,72 @@ wait_for_url() {
 # the auth-enforced /v1/models path returns 401 which curl -sf treats as failure.
 wait_for_mockbackend() {
     local base_url="$1"
+    local timeout="${2:-15}"
+    wait_for_url "${base_url}/health" "$timeout"
+}
+
+# http_status_for issues a POST with optional bearer token and returns the
+# HTTP status code.
+http_status_for() {
+    local url="$1"
+    local token="${2:-}"
+    local extra_header="${3:-}"
+    local extra_value="${4:-}"
+
+    local args=(-s -o /dev/null -w "%{http_code}" --max-time 10
+        -X POST
+        -H "Content-Type: application/json"
+        -d '{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"max_tokens":5}')
+
+    if [[ -n "$token" ]]; then
+        args+=(-H "Authorization: Bearer $token")
+    fi
+    if [[ -n "$extra_header" && -n "$extra_value" ]]; then
+        args+=(-H "${extra_header}: ${extra_value}")
+    fi
+
+    curl "${args[@]}" "$url"
+}
+
+# kill_proc sends SIGTERM to a PID and waits for it to exit.
+kill_proc() {
+    local pid="$1"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+# free_port kills any process already listening on the given port so repeated
+# test runs don't collide with stale backends from previous runs.
+# Works on Linux, macOS, and Windows (Git Bash / MSYS2).
+free_port() {
+    local port="$1"
+    local pids=""
+
+    # Linux: ss is preferred; fall back to netstat -tlnp
+    if command -v ss >/dev/null 2>&1; then
+        pids=$(ss -tlnp "sport = :${port}" 2>/dev/null | grep -oP '(?<=pid=)\d+' || true)
+    fi
+
+    # macOS: lsof
+    if [[ -z "$pids" ]] && command -v lsof >/dev/null 2>&1; then
+        pids=$(lsof -ti "tcp:${port}" 2>/dev/null || true)
+    fi
+
+    # Windows (Git Bash): netstat -ano gives PID in last column
+    if [[ -z "$pids" ]] && command -v netstat >/dev/null 2>&1; then
+        pids=$(netstat -ano 2>/dev/null \
+            | grep -E "[:.]${port}\s+.+LISTENING" \
+            | awk '{print $NF}' || true)
+    fi
+
+    if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+            # On Windows, bash kill may fail; fall through to taskkill
+            kill "$pid" 2>/dev/null || \
+                { command -v taskkill >/dev/null 2>&1 && taskkill /F /PID "$pid" >/dev/null 2>&1; } || true
+        done
+        sleep 0.8
+    fi
+}
