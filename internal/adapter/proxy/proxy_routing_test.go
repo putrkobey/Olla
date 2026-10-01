@@ -110,3 +110,116 @@ func TestProxyRoutingRegression(t *testing.T) {
 			config := &Configuration{
 				ProxyPrefix:         "/olla",
 				ConnectionTimeout:   10 * time.Second,
+				ConnectionKeepAlive: 30 * time.Second,
+				ResponseTimeout:     30 * time.Second,
+				StreamBufferSize:    8192,
+			}
+
+			// Create proxy factory and service
+			factory := NewFactory(mockStats, nil, testLogger)
+			proxyService, err := factory.Create(tt.proxyType, mockDiscovery, mockSelector, config)
+			require.NoError(t, err)
+
+			// Create test request with context prefix set (simulating what the handler does)
+			req := httptest.NewRequest(http.MethodPost, tt.requestPath, nil)
+			if tt.contextPrefix != "" {
+				ctx := context.WithValue(req.Context(), constants.ContextRoutePrefixKey, tt.contextPrefix)
+				req = req.WithContext(ctx)
+			}
+
+			// Create response recorder
+			recorder := httptest.NewRecorder()
+
+			// Create request stats
+			stats := &ports.RequestStats{
+				RequestID: "test-request",
+				StartTime: time.Now(),
+			}
+
+			// Execute proxy request
+			err = proxyService.ProxyRequest(req.Context(), recorder, req, stats, testLogger)
+			assert.NoError(t, err, tt.description)
+
+			// Verify the backend received the correct path
+			assert.Equal(t, tt.expectedBackendPath, capturedPath,
+				"Backend should receive the correct path for %s", tt.description)
+
+			// Verify response was successful
+			assert.Equal(t, http.StatusOK, recorder.Code)
+		})
+	}
+}
+
+// TestProxyPathHandling verifies that both Sherpa and Olla handle paths correctly
+func TestProxyPathHandling(t *testing.T) {
+	proxyTypes := []string{DefaultProxySherpa, DefaultProxyOlla}
+
+	for _, proxyType := range proxyTypes {
+		t.Run(proxyType, func(t *testing.T) {
+			// Create a test backend
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Echo back the path received
+				w.Header().Set("X-Backend-Path", r.URL.Path)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer backend.Close()
+
+			testURL, _ := url.Parse(backend.URL)
+			endpoint := &domain.Endpoint{
+				Name:      "test-endpoint",
+				URLString: backend.URL,
+				URL:       testURL,
+				Type:      "test",
+				Status:    domain.StatusHealthy,
+			}
+
+			// Setup test components
+			testLogger := createTestLogger()
+			mockStats := createTestStatsCollector()
+			mockSelector := newMockEndpointSelector(mockStats)
+			mockDiscovery := &mockDiscoveryService{
+				endpoints: []*domain.Endpoint{endpoint},
+			}
+
+			// Create proxy
+			config := &Configuration{
+				ProxyPrefix:         "/olla",
+				ConnectionTimeout:   10 * time.Second,
+				ConnectionKeepAlive: 30 * time.Second,
+				StreamBufferSize:    8192,
+			}
+
+			factory := NewFactory(mockStats, nil, testLogger)
+			proxyService, err := factory.Create(proxyType, mockDiscovery, mockSelector, config)
+			require.NoError(t, err)
+
+			// Test various path scenarios
+			testCases := []struct {
+				path         string
+				expectedPath string
+			}{
+				{"/api/chat", "/api/chat"},
+				{"/v1/models", "/v1/models"},
+				{"/", "/"},
+				{"/path/with/multiple/segments", "/path/with/multiple/segments"},
+			}
+
+			for _, tc := range testCases {
+				req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+				recorder := httptest.NewRecorder()
+				stats := &ports.RequestStats{
+					RequestID: "test",
+					StartTime: time.Now(),
+				}
+
+				err := proxyService.ProxyRequest(req.Context(), recorder, req, stats, testLogger)
+				assert.NoError(t, err)
+
+				// Check that backend received the correct path
+				backendPath := recorder.Header().Get("X-Backend-Path")
+				assert.Equal(t, tc.expectedPath, backendPath,
+					"Proxy %s should preserve path %s", proxyType, tc.path)
+			}
+		})
+	}
+}
