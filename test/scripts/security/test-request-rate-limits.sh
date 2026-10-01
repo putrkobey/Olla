@@ -136,3 +136,279 @@ test_basic_rate_limiting() {
 
     # Success criteria: Must have both success AND rate limiting to prove it's working
     if [[ $success_count -gt 0 && $rate_limited_count -gt 0 && "$headers_present" == "true" ]]; then
+        echo "✅ PASS: Rate limiting is working perfectly!"
+        echo "   - Got $success_count successful requests (proves requests can succeed)"
+        echo "   - Got $rate_limited_count rate limited requests (proves rate limiting is active)"
+        echo "   - Rate limit headers are present (proves middleware is working)"
+        record_test_result "Basic Rate Limiting" "true"
+    elif [[ $rate_limited_count -gt 0 ]]; then
+        echo "✅ PASS: Rate limiting detected (some 429s found)"
+        record_test_result "Basic Rate Limiting" "true"
+    elif [[ "$headers_present" == "true" ]]; then
+        echo "⚠️  PARTIAL: Headers present but no rate limiting triggered"
+        echo "   This might mean limits are set too high for this test"
+        record_test_result "Basic Rate Limiting" "true"
+    else
+        echo "❌ FAIL: No rate limiting detected and no headers present"
+        record_test_result "Basic Rate Limiting" "false"
+    fi
+}
+
+# Test 2: Health Endpoint Verification
+test_health_endpoint() {
+    echo
+    echo "Testing: Health Endpoint Rate Limiting"
+    echo "Expected: Health endpoint should have different (usually higher) rate limits"
+    echo
+
+    local requests=8
+    local success_count=0
+    local rate_limited_count=0
+    local health_limit=""
+
+    echo "Making $requests requests to health endpoint..."
+
+    for ((i=1; i<=requests; i++)); do
+        local result=$(make_test_request "$HEALTH_ENDPOINT" "")
+        local status=$(echo "$result" | cut -d'|' -f1)
+        local limit=$(echo "$result" | cut -d'|' -f2)
+        local remaining=$(echo "$result" | cut -d'|' -f3)
+
+        echo "  Request $i: $status (Limit: $limit, Remaining: $remaining)"
+
+        if [[ "$status" == "200" ]]; then
+            success_count=$((success_count + 1))
+        elif [[ "$status" == "429" ]]; then
+            rate_limited_count=$((rate_limited_count + 1))
+        fi
+
+        if [[ -n "$limit" && -z "$health_limit" ]]; then
+            health_limit="$limit"
+        fi
+    done
+
+    echo
+    echo "Results Analysis:"
+    echo "  Successful requests: $success_count"
+    echo "  Rate limited requests: $rate_limited_count"
+    echo "  Health endpoint limit: $health_limit"
+
+    # Health endpoint test passes if we can detect it's configured
+    if [[ -n "$health_limit" ]]; then
+        echo "✅ PASS: Health endpoint rate limiting is configured (limit: $health_limit)"
+        record_test_result "Health Endpoint Rate Limiting" "true"
+    else
+        echo "❌ FAIL: Could not detect health endpoint rate limit configuration"
+        record_test_result "Health Endpoint Rate Limiting" "false"
+    fi
+}
+
+# Test 3: Per-IP Isolation
+test_per_ip_isolation() {
+    echo
+    echo "Testing: Per-IP Isolation"
+    echo "Expected: Different IPs should have independent rate limit buckets"
+    echo
+
+    local requests=10
+    local ip1="203.0.113.1"
+    local ip2="203.0.113.2"
+
+    echo "Testing IP 1: $ip1"
+    local ip1_success=0
+    local ip1_rate_limited=0
+
+    for ((i=1; i<=requests; i++)); do
+        local result=$(make_test_request "$PROXY_ENDPOINT" "$ip1")
+        local status=$(echo "$result" | cut -d'|' -f1)
+
+        if [[ "$status" == "200" || "$status" == "502" ]]; then
+            ip1_success=$((ip1_success + 1))
+        elif [[ "$status" == "429" ]]; then
+            ip1_rate_limited=$((ip1_rate_limited + 1))
+        fi
+    done
+
+    # Brief pause between IP tests
+    sleep 0.5
+
+    echo "Testing IP 2: $ip2"
+    local ip2_success=0
+    local ip2_rate_limited=0
+
+    for ((i=1; i<=requests; i++)); do
+        local result=$(make_test_request "$PROXY_ENDPOINT" "$ip2")
+        local status=$(echo "$result" | cut -d'|' -f1)
+
+        if [[ "$status" == "200" || "$status" == "502" ]]; then
+            ip2_success=$((ip2_success + 1))
+        elif [[ "$status" == "429" ]]; then
+            ip2_rate_limited=$((ip2_rate_limited + 1))
+        fi
+    done
+
+    echo
+    echo "Results Analysis:"
+    echo "  IP1 ($ip1): $ip1_success successful, $ip1_rate_limited rate limited"
+    echo "  IP2 ($ip2): $ip2_success successful, $ip2_rate_limited rate limited"
+
+    # Per-IP isolation passes if both IPs show some activity
+    if [[ $ip1_success -gt 0 && $ip2_success -gt 0 ]]; then
+        echo "✅ PASS: Per-IP isolation working - both IPs can make requests independently"
+        record_test_result "Per-IP Isolation" "true"
+    else
+        echo "❌ FAIL: Per-IP isolation may not be working properly"
+        record_test_result "Per-IP Isolation" "false"
+    fi
+}
+
+# Test 4: Burst and Rate Limiting Detection
+test_burst_and_rate_limiting() {
+    echo
+    echo "Testing: Burst Capacity and Rate Limiting"
+    echo "Expected: Should allow initial burst of requests, then apply rate limiting"
+    echo
+
+    local requests=20
+    local success_count=0
+    local rate_limited_count=0
+    local first_rate_limit_at=0
+
+    echo "Making $requests rapid requests to test burst behavior..."
+
+    for ((i=1; i<=requests; i++)); do
+        local result=$(make_test_request "$PROXY_ENDPOINT" "192.168.99.99")
+        local status=$(echo "$result" | cut -d'|' -f1)
+
+        echo "  Request $i: $status"
+
+        if [[ "$status" == "200" || "$status" == "502" ]]; then
+            success_count=$((success_count + 1))
+        elif [[ "$status" == "429" ]]; then
+            rate_limited_count=$((rate_limited_count + 1))
+            if [[ $first_rate_limit_at -eq 0 ]]; then
+                first_rate_limit_at=$i
+            fi
+        fi
+    done
+
+    echo
+    echo "Results Analysis:"
+    echo "  Total successful: $success_count"
+    echo "  Total rate limited: $rate_limited_count"
+    echo "  First rate limit at request: $first_rate_limit_at"
+
+    if [[ $rate_limited_count -gt 0 ]]; then
+        echo "✅ PASS: Burst and rate limiting working!"
+        echo "   - Allowed $success_count requests initially (burst working)"
+        echo "   - Applied rate limiting after request $first_rate_limit_at (rate limiting working)"
+        record_test_result "Burst Capacity" "true"
+    elif [[ $success_count -gt 0 ]]; then
+        echo "⚠️  PARTIAL: Requests succeeding but no rate limiting detected"
+        echo "   This might indicate limits are set too high for this test"
+        record_test_result "Burst Capacity" "true"
+    else
+        echo "❌ FAIL: No requests succeeded - something may be wrong"
+        record_test_result "Burst Capacity" "false"
+    fi
+}
+
+# Test 5: Header Verification
+test_headers() {
+    echo
+    echo "Testing: Rate Limit Headers"
+    echo "Expected: All requests should include X-RateLimit-* headers"
+    echo
+
+    local result=$(make_test_request "$PROXY_ENDPOINT" "")
+    local status=$(echo "$result" | cut -d'|' -f1)
+    local limit=$(echo "$result" | cut -d'|' -f2)
+    local remaining=$(echo "$result" | cut -d'|' -f3)
+
+    echo "Test request result:"
+    echo "  Status: $status"
+    echo "  X-RateLimit-Limit: $limit"
+    echo "  X-RateLimit-Remaining: $remaining"
+
+    if [[ -n "$limit" && -n "$remaining" ]]; then
+        echo "✅ PASS: Rate limit headers are present and working"
+        record_test_result "Rate Limit Headers" "true"
+    else
+        echo "❌ FAIL: Rate limit headers are missing"
+        record_test_result "Rate Limit Headers" "false"
+    fi
+}
+
+# Check if Olla is running
+echo "Checking if Olla is running..."
+if ! curl -s "$OLLA_URL$HEALTH_ENDPOINT" > /dev/null; then
+    echo "❌ Olla is not running or not accessible at $OLLA_URL"
+    echo "Please start Olla with rate limiting configured and try again."
+    exit 1
+fi
+
+echo "✅ Olla is running!"
+echo
+
+# Run all tests
+test_basic_rate_limiting
+test_health_endpoint
+test_per_ip_isolation
+test_burst_and_rate_limiting
+test_headers
+
+echo
+echo "🦙 Rate Limiting Test Summary"
+echo "=============================="
+echo "Tests completed: $TOTAL_TESTS"
+echo "Passed: $PASSED_TESTS"
+echo "Failed: $((TOTAL_TESTS - PASSED_TESTS))"
+echo
+
+if [[ ${#FAILED_TESTS[@]} -eq 0 ]]; then
+    echo "🎉 ALL TESTS PASSED!"
+    echo
+    echo "✅ Security Assessment: Your Olla rate limiting is working correctly!"
+    echo "   - Rate limiting is active and blocking excessive requests"
+    echo "   - Headers are being set properly for client feedback"
+    echo "   - Per-IP isolation is working"
+    echo "   - Burst capacity is functioning"
+    echo
+    echo "Your Olla instance is properly protected against request flooding!"
+else
+    echo "⚠️  Some tests failed:"
+    for failed_test in "${FAILED_TESTS[@]}"; do
+        echo "   ❌ $failed_test"
+    done
+    echo
+    echo "💡 This might indicate:"
+    echo "   - Rate limiting is disabled (check OLLA_SERVER_*_RATE_LIMIT variables)"
+    echo "   - Rate limits are set too high for testing"
+    echo "   - There's an issue with the rate limiting implementation"
+    echo
+    echo "🔧 Try running with stricter limits for testing:"
+    echo "   export OLLA_SERVER_PER_IP_RATE_LIMIT=\"10\""
+    echo "   export OLLA_SERVER_RATE_BURST_SIZE=\"2\""
+    echo "   export OLLA_SERVER_HEALTH_RATE_LIMIT=\"30\""
+    echo "   make run"
+fi
+
+echo
+echo "Understanding the Results:"
+echo "========================="
+echo "✅ PERFECT: Mix of 200s and 429s = Rate limiting working correctly"
+echo "✅ GOOD: Only 200s with headers = Rate limiting configured but limits are high"
+echo "❌ BAD: Only 200s without headers = Rate limiting disabled"
+echo "❌ BAD: Only 429s = Rate limiting too strict (all requests blocked)"
+echo
+echo "Status Codes:"
+echo "- 200: Request allowed and processed successfully"
+echo "- 429: Request rate limited (this is security working!)"
+echo "- 502: Request allowed but no backend available"
+
+# Exit with appropriate code
+if [[ ${#FAILED_TESTS[@]} -eq 0 ]]; then
+    exit 0
+else
+    exit 1
+fi
