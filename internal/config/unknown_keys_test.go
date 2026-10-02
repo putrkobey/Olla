@@ -131,3 +131,136 @@ func TestFindUnknownKeys(t *testing.T) {
 	}
 }
 
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := map[string]int{}
+	for _, s := range a {
+		m[s]++
+	}
+	for _, s := range b {
+		m[s]--
+	}
+	for _, n := range m {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestFindUnknownKeys_OrderIsDocumentOrder(t *testing.T) {
+	t.Parallel()
+	got := keyStrings(FindUnknownKeys([]byte("b_key: 1\nserver:\n  z: 1\n  a: 2\n")))
+	want := []string{"b_key (line 1)", "server.z (line 3)", "server.a (line 4)"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestLoad_RecordsUnknownKeysAndStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  port: 41999\nproxy:\n  bogus_key: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unknown keys must not fail Load: %v", err)
+	}
+	if cfg.Server.Port != 41999 {
+		t.Errorf("known keys must still apply, got port %d", cfg.Server.Port)
+	}
+	if got := keyStrings(cfg.UnknownKeys); len(got) != 1 || got[0] != "proxy.bogus_key (line 4)" {
+		t.Errorf("unexpected unknown keys: %v", got)
+	}
+}
+
+func TestLoad_NoUnknownKeysWhenClean(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(path, []byte("server:\n  port: 41999\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.UnknownKeys) != 0 {
+		t.Errorf("expected none, got %v", cfg.UnknownKeys)
+	}
+}
+
+// Guards the shipped defaults against dead keys creeping back in; the startup
+// WARN would otherwise fire on every default install.
+func TestShippedConfigsHaveNoUnknownKeys(t *testing.T) {
+	t.Parallel()
+	for _, path := range []string{"../../config.yaml", "../../config/config.yaml"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			if got := keyStrings(FindUnknownKeys(data)); len(got) != 0 {
+				t.Errorf("%s has keys Olla ignores: %v", path, got)
+			}
+		})
+	}
+}
+
+func TestFindUnknownKeys_MergeBombTerminates(t *testing.T) {
+	t.Parallel()
+	doc := "x-bomb: &bomb\n  <<: [*bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb]\n  bogus: 1\nx-root: &root {proxy: *bomb}\n<<: *root\nproxy: {}\n"
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = FindUnknownKeys([]byte(doc))
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("walker did not terminate on a self-referencing merge")
+	}
+}
+
+func TestFindUnknownKeys_ReportsAreBounded(t *testing.T) {
+	t.Parallel()
+	var b strings.Builder
+	b.WriteString("x-bomb: &bomb\n  <<: [*bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb]\n")
+	for i := range 1000 {
+		fmt.Fprintf(&b, "  f%d: 1\n", i)
+	}
+	b.WriteString("x-root: &root {proxy: *bomb}\n<<: *root\nproxy: {}\n")
+	if got := len(FindUnknownKeys([]byte(b.String()))); got > maxKeyWalkVisits {
+		t.Errorf("reports exceeded the visit budget: %d", got)
+	}
+}
+
+func TestFindUnknownKeys_MergeBombReportsEachKeyOnce(t *testing.T) {
+	t.Parallel()
+	doc := "x-bomb: &bomb\n  <<: [*bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb, *bomb]\n  bogus: 1\nx-root: &root {proxy: *bomb}\n<<: *root\nproxy: {}\n"
+	got := FindUnknownKeys([]byte(doc))
+	if len(got) != 1 {
+		t.Fatalf("got %d entries, want 1: %v", len(got), got)
+	}
+	if got[0].Path != "proxy.bogus" {
+		t.Errorf("Path = %q, want proxy.bogus", got[0].Path)
+	}
+}
+
+func TestFindUnknownKeys_DistinctKeysAreKeptInOrder(t *testing.T) {
+	t.Parallel()
+	// The same typo on two lines is two reports; an anchor merged into two
+	// sections reports once per section because the path differs.
+	doc := "x-shared: &shared\n  oops: 1\nproxy:\n  <<: *shared\n  engnie: a\nserver:\n  <<: *shared\n"
+	got := FindUnknownKeys([]byte(doc))
+	want := []string{"proxy.oops (line 2)", "proxy.engnie (line 5)", "server.oops (line 2)"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i].String() != want[i] {
+			t.Errorf("entry %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
