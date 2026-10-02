@@ -45,3 +45,144 @@ func (f *GlobFilter) Apply(ctx context.Context, config *domain.FilterConfig, ite
 
 	accepted := make([]interface{}, 0)
 	rejected := make([]interface{}, 0)
+
+	for i := range itemsValue.Len() {
+		item := itemsValue.Index(i).Interface()
+		itemName := nameExtractor(item)
+
+		if f.Matches(config, itemName) {
+			accepted = append(accepted, item)
+		} else {
+			rejected = append(rejected, item)
+		}
+	}
+
+	return &domain.FilterResult{
+		Accepted: accepted,
+		Rejected: rejected,
+		Stats: domain.FilterStats{
+			TotalItems:    itemsValue.Len(),
+			AcceptedCount: len(accepted),
+			RejectedCount: len(rejected),
+		},
+	}, nil
+}
+
+// ApplyToMap filters a map of items based on the filter configuration
+func (f *GlobFilter) ApplyToMap(ctx context.Context, config *domain.FilterConfig, items map[string]interface{}) (map[string]interface{}, error) {
+	if config == nil || config.IsEmpty() {
+		// not filtering needed, return a copy of the original map
+		result := make(map[string]interface{}, len(items))
+		for k, v := range items {
+			result[k] = v
+		}
+		return result, nil
+	}
+
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid filter configuration: %w", err)
+	}
+
+	result := make(map[string]interface{})
+
+	for key, value := range items {
+		if f.Matches(config, key) {
+			result[key] = value
+		}
+	}
+
+	return result, nil
+}
+
+// Matches checks if a single item matches the filter configuration
+func (f *GlobFilter) Matches(config *domain.FilterConfig, itemName string) bool {
+	if config == nil || config.IsEmpty() {
+		// No filter means everything matches
+		return true
+	}
+
+	// lets check if item should be included
+	included := false
+
+	// if there's no include patterns or include has "*", include everything initially
+	if config.HasIncludeAll() {
+		included = true
+	} else {
+		// Check if item matches any include pattern
+		for _, pattern := range config.Include {
+			if f.matchesPattern(itemName, pattern) {
+				included = true
+				break
+			}
+		}
+	}
+
+	// if not included, no need to check exclude patterns
+	if !included {
+		return false
+	}
+
+	// check if item matches any exclude pattern
+	// exclude takes precedence over include
+	for _, pattern := range config.Exclude {
+		if f.matchesPattern(itemName, pattern) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// matchesPattern checks if a string matches a glob pattern with caching
+func (f *GlobFilter) matchesPattern(s, patternStr string) bool {
+	// caching for perf
+	cacheKey := fmt.Sprintf("%s::%s", s, patternStr)
+
+	f.cacheMu.RLock()
+	if result, exists := f.patternCache[cacheKey]; exists {
+		f.cacheMu.RUnlock()
+		return result
+	}
+	f.cacheMu.RUnlock()
+
+	// Use the centralized pattern matching logic
+	matches := pattern.MatchesGlob(s, patternStr)
+
+	// cache this pup
+	f.cacheMu.Lock()
+	f.patternCache[cacheKey] = matches
+	f.cacheMu.Unlock()
+
+	return matches
+}
+
+// createResultFromItems creates a FilterResult with all items as accepted
+func (f *GlobFilter) createResultFromItems(items interface{}, rejected []interface{}) *domain.FilterResult {
+	itemsValue := reflect.ValueOf(items)
+	accepted := make([]interface{}, 0, itemsValue.Len())
+
+	for i := range itemsValue.Len() {
+		accepted = append(accepted, itemsValue.Index(i).Interface())
+	}
+
+	if rejected == nil {
+		rejected = make([]interface{}, 0)
+	}
+
+	return &domain.FilterResult{
+		Accepted: accepted,
+		Rejected: rejected,
+		Stats: domain.FilterStats{
+			TotalItems:    itemsValue.Len(),
+			AcceptedCount: len(accepted),
+			RejectedCount: len(rejected),
+		},
+	}
+}
+
+// ClearCache clears the pattern matching cache
+func (f *GlobFilter) ClearCache() {
+	f.cacheMu.Lock()
+	defer f.cacheMu.Unlock()
+	f.patternCache = make(map[string]bool)
+}
