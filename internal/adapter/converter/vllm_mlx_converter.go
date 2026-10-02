@@ -36,3 +36,41 @@ func (c *VLLMMLXConverter) ConvertToFormat(models []*domain.UnifiedModel, filter
 	data := make([]profile.VLLMMLXModel, 0, len(filtered))
 	for _, model := range filtered {
 		mlxModel := c.convertModel(model)
+		if mlxModel != nil {
+			data = append(data, *mlxModel)
+		}
+	}
+
+	return profile.VLLMMLXResponse{
+		Object: "list",
+		Data:   data,
+	}, nil
+}
+
+func (c *VLLMMLXConverter) convertModel(model *domain.UnifiedModel) *profile.VLLMMLXModel {
+	modelID := c.FindNativeName(model)
+	if modelID == "" {
+		// Fall back to first alias, then unified ID
+		if len(model.Aliases) > 0 {
+			modelID = model.Aliases[0].Name
+		} else {
+			modelID = model.ID
+		}
+	}
+
+	return &profile.VLLMMLXModel{
+		ID:      modelID,
+		Object:  "model",
+		Created: time.Now().Unix(),
+		OwnedBy: c.determineOwner(modelID),
+	}
+}
+
+// determineOwner extracts the namespace from a HuggingFace-style model ID
+// (e.g. "mlx-community/Model-Name" -> "mlx-community"), defaulting to "vllm-mlx"
+// when the ID has no "/" separator.
+func (c *VLLMMLXConverter) determineOwner(modelID string) string {
+	// Use shared owner extraction logic from BaseConverter
+	// Handles slash-separated (org/model) and hyphenated (org-model) formats
+	return ExtractOwnerFromModelID(modelID, constants.ProviderTypeVLLMMLX)
+}
