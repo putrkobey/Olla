@@ -42,3 +42,48 @@ func TestRegisterProviderRoutes_AllShippedProfiles(t *testing.T) {
 	mux := http.NewServeMux()
 	reg.WireUp(mux)
 	routes := reg.GetRoutes()
+
+	// Profiles whose discovery path returns model metadata rather than a model
+	// listing. The listing route must not shadow it: it is forwarded verbatim.
+	metadataDiscovery := map[string]bool{constants.ProviderTypeTextEmbeddingsInference: true}
+
+	names := append(factory.GetAvailableProfiles(), constants.ProviderTypeOpenAICompat)
+	checked := 0
+	for _, name := range names {
+		p, perr := factory.GetProfile(name)
+		if perr != nil {
+			continue
+		}
+		cfg := p.GetConfig()
+		for _, prefix := range cfg.Routing.Prefixes {
+			t.Run(name+"/"+prefix, func(t *testing.T) {
+				base := constants.DefaultOllaProxyPathPrefix + prefix + constants.DefaultPathPrefix
+				assert.Contains(t, routes, base, "catch-all proxy route")
+
+				listings := []string{}
+				if cfg.API.OpenAICompatible {
+					listings = append(listings, base+"v1/models")
+				}
+				if cfg.API.ModelDiscoveryPath != "" {
+					discovery := base + strings.TrimPrefix(cfg.API.ModelDiscoveryPath, constants.DefaultPathPrefix)
+					if metadataDiscovery[name] {
+						assert.NotContains(t, routes, discovery, "discovery path carries metadata and must reach the backend")
+					} else {
+						listings = append(listings, discovery)
+					}
+				}
+				require.NotEmpty(t, listings, "every profile serves at least one listing")
+
+				for _, path := range listings {
+					assert.Contains(t, routes, path)
+					rec := httptest.NewRecorder()
+					mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+					assert.Equal(t, http.StatusOK, rec.Code, "GET %s: %s", path, rec.Body.String())
+					assert.Contains(t, rec.Header().Get(constants.HeaderContentType), "json", "GET %s", path)
+				}
+			})
+			checked++
+		}
+	}
+	assert.Greater(t, checked, 10, "walked the shipped profiles")
+}
