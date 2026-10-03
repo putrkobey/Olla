@@ -37,3 +37,83 @@ type RequestProfile struct {
 
 	RequiresFunctionCall bool
 	RequiresVision       bool
+
+	// FailClosedOnNoMatch marks a profile whose SupportedBy represents a hard
+	// provider-type boundary rather than a soft compatibility hint. Set only by
+	// createProviderProfile for a non-OpenAI provider-scoped route (e.g.
+	// /olla/vllm/), never for the OpenAI-inclusive profile or the unscoped
+	// /olla/proxy/ route's inspector-derived profile. When true,
+	// filterEndpointsByProfile must return the empty set rather than widen to
+	// all endpoints if nothing matches - crossing provider types during a
+	// same-type outage (e.g. a vllm request silently served by an
+	// openai-compatible backend) is a correctness bug, not graceful
+	// degradation, and must produce the normal no-routable-endpoints 404/503.
+	FailClosedOnNoMatch bool
+
+	// QuietNoMatchFallback logs the widen-to-all fallback at Debug rather than Warn. Set for
+	// translator routes, where a fleet with no chat-capable backend widens and is then refused
+	// with a sampled 404: a Warn per request would flood the log ahead of it.
+	QuietNoMatchFallback bool
+}
+
+func NewRequestProfile(path string) *RequestProfile {
+	return &RequestProfile{
+		Path:           path,
+		SupportedBy:    make([]string, 0, 4),
+		InspectionMeta: xsync.NewMap[string, interface{}](),
+	}
+}
+
+func (rp *RequestProfile) IsCompatibleWith(endpointType string) bool {
+	if endpointType == ProfileAuto {
+		return true
+	}
+
+	if len(rp.SupportedBy) == 0 {
+		return true
+	}
+
+	for _, supported := range rp.SupportedBy {
+		if supported == endpointType {
+			return true
+		}
+		// "openai" is a user-facing alias for openai-compatible — endpoints configured
+		// with type "openai" speak the same protocol and must be accepted here.
+		// Ollama and LM Studio also expose the OpenAI-compatible API surface.
+		if supported == ProfileOpenAICompatible && (endpointType == ProfileOllama || endpointType == ProfileLmStudio || endpointType == ProfileOpenAI) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rp *RequestProfile) AddSupportedProfile(profileType string) {
+	if profileType == "" {
+		return
+	}
+
+	for _, existing := range rp.SupportedBy {
+		if existing == profileType {
+			return
+		}
+	}
+
+	rp.SupportedBy = append(rp.SupportedBy, profileType)
+}
+
+func (rp *RequestProfile) SetInspectionMeta(key string, value interface{}) {
+	rp.InspectionMeta.Store(key, value)
+}
+
+// StickyOutcome carries the result of a sticky session selection back to the
+// handler layer via context. The handler allocates it, passes it in context,
+// and the proxy engine reads it to write response headers before WriteHeader.
+// Defined here (not in adapter/balancer) so that adapter/proxy/core can read it
+// without creating an import cycle.
+type StickyOutcome struct {
+	// Result is "hit", "miss", "repin", or "disabled".
+	Result string
+	// Source is which key source produced the affinity key.
+	Source string
+}
