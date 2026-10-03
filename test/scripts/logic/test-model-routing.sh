@@ -245,3 +245,251 @@ test_model_routing() {
         fi
         
         # Fallback to response body if headers not present
+        if [ -z "$olla_endpoint" ] && echo "$response" | grep -q '"endpoint"'; then
+            endpoint_info=$(echo "$response" | grep -o '"endpoint":"[^"]*"' | cut -d'"' -f4 || true)
+            if [ -n "$endpoint_info" ]; then
+                echo -e "  ${GREY}Routed to (from body): $endpoint_info${RESET}"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗ Failed${RESET} (HTTP $http_code) - ${GREY}${response_time}s${RESET}"
+        FAILED_ROUTES=$((FAILED_ROUTES + 1))
+        
+        # Track failure by endpoint if we got one
+        if [ -n "$olla_endpoint" ]; then
+            ENDPOINT_USAGE["$olla_endpoint"]=$((${ENDPOINT_USAGE["$olla_endpoint"]:-0} + 1))
+            ENDPOINT_FAILURE["$olla_endpoint"]=$((${ENDPOINT_FAILURE["$olla_endpoint"]:-0} + 1))
+        fi
+        
+        # Show detailed error information
+        if [ -n "$response" ]; then
+            # Try to parse JSON error
+            if echo "$response" | grep -q '"error"'; then
+                error_msg=$(echo "$response" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"\([^"]*\)".*/\1/' || true)
+                if [ -n "$error_msg" ]; then
+                    echo -e "  ${YELLOW}Error:${RESET} ${error_msg}"
+                fi
+            fi
+            
+            # Try to parse message field
+            if echo "$response" | grep -q '"message"'; then
+                message=$(echo "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*: *"\([^"]*\)".*/\1/' || true)
+                if [ -n "$message" ] && [ "$message" != "$error_msg" ]; then
+                    echo -e "  ${YELLOW}Message:${RESET} ${message}"
+                fi
+            fi
+            
+            # If response is not JSON or we couldn't parse it, show raw response (truncated)
+            if ! echo "$response" | grep -q '"error"\|"message"' && [ ${#response} -gt 0 ]; then
+                if [ ${#response} -gt 200 ]; then
+                    echo -e "  ${YELLOW}Response:${RESET} ${response:0:200}..."
+                else
+                    echo -e "  ${YELLOW}Response:${RESET} ${response}"
+                fi
+            fi
+        elif [ "$http_code" = "000" ]; then
+            echo -e "  ${YELLOW}Error:${RESET} Connection timeout or DNS resolution failed"
+        elif [ "$http_code" = "404" ]; then
+            # Check if it's a stale model version
+            if [[ "$model" =~ -[0-9a-f]{8}$ ]]; then
+                echo -e "  ${YELLOW}Info:${RESET} Model version may no longer exist (likely updated/removed)"
+            else
+                echo -e "  ${YELLOW}Error:${RESET} Model not found or no compatible endpoint available"
+            fi
+        elif [ "$http_code" = "502" ]; then
+            echo -e "  ${YELLOW}Error:${RESET} Bad gateway - backend endpoint may be down"
+        elif [ "$http_code" = "503" ]; then
+            echo -e "  ${YELLOW}Error:${RESET} Service unavailable - all endpoints may be unhealthy"
+        fi
+        
+        # Show request details for debugging
+        if [ "$VERBOSE" = "true" ]; then
+            echo -e "  ${GREY}Request body: ${request_body:0:100}...${RESET}"
+        fi
+    fi
+}
+
+run_all_tests() {
+    ALL_MODELS=("${AVAILABLE_MODELS[@]}" "${ADDITIONAL_MODELS[@]}")
+    
+    # Remove duplicates
+    declare -A seen
+    declare -a UNIQUE_MODELS=()
+    for model in "${ALL_MODELS[@]}"; do
+        if [[ -z "${seen[$model]:-}" ]]; then
+            seen[$model]=1
+            UNIQUE_MODELS+=("$model")
+        fi
+    done
+    
+    if [ ${#UNIQUE_MODELS[@]} -eq 0 ]; then
+        echo -e "${RED}No models to test!${RESET}"
+        echo -e "Either Olla has no models or you need to specify models as arguments."
+        return
+    fi
+    
+    echo -e "${WHITE}Running routing tests for ${#UNIQUE_MODELS[@]} models...${RESET}"
+    echo -e "${GREY}Target: ${TARGET_URL}${PROXY_ENDPOINT}${RESET}"
+    echo
+    
+    # Note: This script tests model routing and capability detection.
+    # The proxy also implements:
+    # - Dynamic concurrency limits based on model size (70B=1, 30B=2, 13B=4, 7B=8)
+    # - Request timeouts with load time buffers for large models
+    # - Context window detection (models with :32k, -16k, etc. in names)
+    # These features are transparent to clients but improve reliability.
+    
+    local model_count=1
+    for model in "${UNIQUE_MODELS[@]}"; do
+        echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        echo -e "${WHITE}Model: ${CYAN}$model${RESET} ${GREY}($model_count of ${#UNIQUE_MODELS[@]})${RESET}"
+        model_count=$((model_count + 1))
+        
+        # Show detected characteristics
+        local characteristics=""
+        if [[ "$model" =~ (32k|16k|8k) ]]; then
+            characteristics="${characteristics} [Extended Context]"
+        fi
+        if [[ "$model" =~ (70b|65b|34b|33b|30b) ]]; then
+            characteristics="${characteristics} [Large Model]"
+        fi
+        if [ -n "$characteristics" ]; then
+            echo -e "${GREY}Characteristics:${YELLOW}$characteristics${RESET}"
+        fi
+        
+        # Test simple chat (skip for embedding-only models)
+        if [[ ! "$model" =~ (embed|embedding|nomic-embed-text|mxbai-embed-large) ]]; then
+            test_model_routing "$model" "Simple Chat" "${TEST_CASES[simple_chat]}" "v1/chat/completions"
+        else
+            echo -e "${GREY}  Skipping chat test for embedding-only model${RESET}"
+        fi
+        
+        # Test vision capability (only vision models)
+        if [[ "$model" =~ (llava|vision|gpt-4-vision|bakllava) ]]; then
+            test_model_routing "$model" "Vision Request" "${TEST_CASES[vision_request]}" "v1/chat/completions"
+        fi
+        
+        # Test function calling (selected models, but not base llama3)
+        if [[ "$model" =~ (gpt-4|claude|mistral|llama3\.|llama3\.2|llama3\.3|magistral) ]] && [[ ! "$model" =~ ^llama3:latest$ ]]; then
+            test_model_routing "$model" "Function Calling" "${TEST_CASES[function_call]}" "v1/chat/completions"
+        fi
+        
+        # Test code generation (code-specific models)
+        if [[ "$model" =~ (code|deepseek-coder|codellama|coder) ]]; then
+            test_model_routing "$model" "Code Generation" "${TEST_CASES[code_request]}" "v1/chat/completions"
+        fi
+        
+        # Test embeddings (embedding models only)
+        if [[ "$model" =~ (embed|embedding|nomic-embed-text|mxbai-embed-large) ]]; then
+            test_model_routing "$model" "Embeddings" "${TEST_CASES[embedding_request]}" "v1/embeddings"
+        fi
+    done
+}
+
+show_summary() {
+    # Calculate script runtime
+    local SCRIPT_END_TIME=$(date +%s)
+    local RUNTIME=$((SCRIPT_END_TIME - SCRIPT_START_TIME))
+    local RUNTIME_MINUTES=$((RUNTIME / 60))
+    local RUNTIME_SECONDS=$((RUNTIME % 60))
+    
+    echo -e "\n${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${WHITE}Test Summary:${RESET}"
+    echo -e "  Total Tests:        ${CYAN}$TOTAL_TESTS${RESET}"
+    echo -e "  Successful Routes:  ${GREEN}$SUCCESSFUL_ROUTES${RESET}"
+    echo -e "  Failed Routes:      ${RED}$FAILED_ROUTES${RESET}"
+    
+    if [ $TOTAL_TESTS -gt 0 ]; then
+        local success_rate=$((SUCCESSFUL_ROUTES * 100 / TOTAL_TESTS))
+        echo -e "  Success Rate:       ${YELLOW}${success_rate}%${RESET}"
+        echo -e "  Total Runtime:      ${CYAN}${RUNTIME_MINUTES}m ${RUNTIME_SECONDS}s${RESET}"
+        
+        # Show endpoint usage summary with success/failure breakdown
+        if [ ${#ENDPOINT_USAGE[@]} -gt 0 ]; then
+            echo
+            echo -e "${WHITE}Endpoint Statistics:${RESET}"
+            echo -e "${GREY}  Endpoint                     Total    Success    Failed${RESET}"
+            echo -e "${GREY}  ────────────────────────────────────────────────────────${RESET}"
+            
+            # Sort endpoints by total usage
+            for endpoint in $(printf '%s\n' "${!ENDPOINT_USAGE[@]}" | sort); do
+                local total=${ENDPOINT_USAGE[$endpoint]}
+                local success=${ENDPOINT_SUCCESS[$endpoint]:-0}
+                local failed=${ENDPOINT_FAILURE[$endpoint]:-0}
+                
+                # Color code based on failure rate
+                local endpoint_color=$GREEN
+                if [ $failed -gt 0 ]; then
+                    local failure_rate=$((failed * 100 / total))
+                    if [ $failure_rate -gt 50 ]; then
+                        endpoint_color=$RED
+                    elif [ $failure_rate -gt 20 ]; then
+                        endpoint_color=$YELLOW
+                    fi
+                fi
+                
+                printf "  ${endpoint_color}%-25s${RESET}  %5d    ${GREEN}%5d${RESET}    ${RED}%5d${RESET}\n" \
+                    "$endpoint" "$total" "$success" "$failed"
+            done
+        fi
+        
+        echo
+        if [ $success_rate -eq 100 ]; then
+            echo -e "${GREEN}✓ All routing tests passed!${RESET}"
+        elif [ $success_rate -ge 80 ]; then
+            echo -e "${YELLOW}⚠ Most routing tests passed, but some failures detected${RESET}"
+        else
+            echo -e "${RED}✗ Significant routing issues detected${RESET}"
+            echo
+            echo -e "${YELLOW}Common issues to check:${RESET}"
+            echo -e "  • Ensure models are available on configured endpoints"
+            echo -e "  • Check that endpoints are healthy and reachable"
+            echo -e "  • Verify model capabilities are properly detected"
+            echo -e "  • Confirm routing configuration in Olla"
+        fi
+    fi
+    echo
+}
+
+
+# Main execution
+main() {
+    if [[ "${1:-}" =~ ^(-h|--help|help)$ ]]; then
+        banner
+        usage
+        exit 0
+    fi
+    
+    banner
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}ERROR:${RESET} curl is required"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Checking Olla availability...${RESET}"
+    if ! curl -s -f -o /dev/null --max-time 5 "${TARGET_URL}/internal/health" 2>/dev/null; then
+        echo -e "${RED}ERROR:${RESET} Cannot reach Olla at ${TARGET_URL}"
+        echo -e "Make sure Olla is running and accessible"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Olla is reachable${RESET}"
+    echo
+
+    fetch_available_models
+    
+    # Process command-line arguments as additional models
+    if [ $# -gt 0 ]; then
+        echo -e "${YELLOW}Additional models specified:${RESET}"
+        for model in "$@"; do
+            ADDITIONAL_MODELS+=("$model")
+            echo -e "  • ${CYAN}$model${RESET}"
+        done
+        echo
+    fi
+
+    run_all_tests
+    show_summary
+}
+
+main "$@"
