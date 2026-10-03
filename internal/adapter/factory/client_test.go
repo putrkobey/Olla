@@ -59,3 +59,65 @@ func TestRefuseCrossOriginRedirect(t *testing.T) {
 		{"other scheme", "http://backend/x", "ftp://backend/x", false},
 	}
 	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			orig, err := http.NewRequest(http.MethodGet, tt.from, http.NoBody)
+			require.NoError(t, err)
+			next, err := http.NewRequest(http.MethodGet, tt.to, http.NoBody)
+			require.NoError(t, err)
+
+			err = RefuseCrossOriginRedirect(next, []*http.Request{orig})
+			if tt.follow {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorIs(t, err, http.ErrUseLastResponse)
+			}
+		})
+	}
+
+	t.Run("downgrade after an upgrade stays refused", func(t *testing.T) {
+		t.Parallel()
+		first, _ := http.NewRequest(http.MethodGet, "http://b/x", http.NoBody)
+		upgraded, _ := http.NewRequest(http.MethodGet, "https://b/x", http.NoBody)
+		back, _ := http.NewRequest(http.MethodGet, "http://b/x", http.NoBody)
+		assert.ErrorIs(t, RefuseCrossOriginRedirect(back, []*http.Request{first, upgraded}), http.ErrUseLastResponse)
+	})
+
+	t.Run("hop limit", func(t *testing.T) {
+		t.Parallel()
+		orig, _ := http.NewRequest(http.MethodGet, "http://b/x", http.NoBody)
+		via := make([]*http.Request, maxBackendRedirects)
+		for i := range via {
+			via[i] = orig
+		}
+		assert.ErrorIs(t, RefuseCrossOriginRedirect(orig, via), http.ErrUseLastResponse)
+	})
+}
+
+// A real cross-host redirect must not replay API-key or custom headers.
+func TestNewBackendHTTPClient_DoesNotReplayHeadersAcrossHosts(t *testing.T) {
+	t.Parallel()
+
+	leaked := make(chan http.Header, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked <- r.Header.Clone()
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.RedirectHandler(target.URL+"/api/tags", http.StatusFound))
+	t.Cleanup(origin.Close)
+
+	req, err := http.NewRequest(http.MethodGet, origin.URL, http.NoBody)
+	require.NoError(t, err)
+	req.Header.Set("X-Api-Key", "sk-SECRET-123")
+
+	resp, err := NewBackendHTTPClient(BackendClientOptions{Timeout: 5 * time.Second}).Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode, "the 3xx is returned, not followed")
+	select {
+	case h := <-leaked:
+		t.Fatalf("redirect target received a request carrying %q", h.Get("X-Api-Key"))
+	default:
+	}
+}
