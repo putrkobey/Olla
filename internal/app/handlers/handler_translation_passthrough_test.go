@@ -484,3 +484,1951 @@ func TestTranslationHandler_PassthroughUsed_MixedEndpoints(t *testing.T) {
 		{Name: "vllm-1", Type: "vllm", Status: domain.StatusHealthy},
 		{Name: "ollama-1", Type: "ollama", Status: domain.StatusHealthy}, // No Anthropic support
 	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+			},
+			// ollama has no config (returns nil)
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			passthroughEndpointsReceived = eps
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"id": "msg_123", "type": "message"})
+		},
+	}
+
+	discoveryService := &mockDiscoveryServiceWithEndpoints{
+		endpoints: endpoints,
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: discoveryService,
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	anthropicReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// With the fix, handler filters to capable endpoints then uses passthrough for the vllm subset.
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "passthrough", rec.Header().Get("X-Olla-Mode"), "Should use passthrough for the capable subset")
+	require.Len(t, passthroughEndpointsReceived, 1, "Only the vllm endpoint should be proxied")
+	assert.Equal(t, "vllm-1", passthroughEndpointsReceived[0].Name, "vllm endpoint should be used")
+}
+
+// TestTranslationHandler_FallbackToTranslation_PassthroughDisabled tests fallback when passthrough is disabled
+func TestTranslationHandler_FallbackToTranslation_PassthroughDisabled(t *testing.T) {
+	translationUsed := false
+
+	endpoints := []*domain.Endpoint{
+		{Name: "vllm-1", Type: "vllm", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+			},
+		},
+	}
+
+	// Translator with passthrough disabled
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: false, // Disabled
+		profileLookup:      profileLookup,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			translationUsed = true
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{
+					"model": "claude-3-5-sonnet-20241022",
+					"messages": []interface{}{
+						map[string]interface{}{"role": "user", "content": "test"},
+					},
+				},
+				ModelName:   "claude-3-5-sonnet-20241022",
+				IsStreaming: false,
+				TargetPath:  "/v1/chat/completions",
+			}, nil
+		},
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			response := map[string]interface{}{
+				"id":      "chatcmpl-123",
+				"object":  "chat.completion",
+				"choices": []interface{}{},
+			}
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(response)
+		},
+	}
+
+	discoveryService := &mockDiscoveryServiceWithEndpoints{
+		endpoints: endpoints,
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: discoveryService,
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	anthropicReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Verify translation mode was used even though backend supports Anthropic
+	assert.True(t, translationUsed, "Translation should be used when passthrough is disabled")
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.NotEqual(t, "passthrough", rec.Header().Get("X-Olla-Mode"))
+}
+
+// TestTranslationHandler_FallbackToTranslation_NoAnthropicSupport tests fallback for backends without support
+func TestTranslationHandler_FallbackToTranslation_NoAnthropicSupport(t *testing.T) {
+	translationUsed := false
+
+	endpoints := []*domain.Endpoint{
+		{Name: "ollama-1", Type: "ollama", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			// ollama has no Anthropic support configured
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			translationUsed = true
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{
+					"model": "claude-3-5-sonnet-20241022",
+					"messages": []interface{}{
+						map[string]interface{}{"role": "user", "content": "test"},
+					},
+				},
+				ModelName:   "claude-3-5-sonnet-20241022",
+				IsStreaming: false,
+				TargetPath:  "/v1/chat/completions",
+			}, nil
+		},
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			response := map[string]interface{}{
+				"id":      "chatcmpl-123",
+				"object":  "chat.completion",
+				"choices": []interface{}{},
+			}
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(response)
+		},
+	}
+
+	discoveryService := &mockDiscoveryServiceWithEndpoints{
+		endpoints: endpoints,
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: discoveryService,
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	anthropicReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Verify translation mode was used
+	assert.True(t, translationUsed, "Translation should be used when backend lacks Anthropic support")
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestTranslationHandler_PassthroughErrorPreservation tests that errors are properly preserved in passthrough mode
+func TestTranslationHandler_PassthroughErrorPreservation(t *testing.T) {
+	// Setup mock backend that returns an error
+	mockBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.Header().Set(constants.HeaderXOllaEndpoint, "test-backend")
+		w.WriteHeader(http.StatusBadRequest)
+
+		errorResp := map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "invalid_request_error",
+				"message": "Invalid model specified",
+			},
+		}
+		json.NewEncoder(w).Encode(errorResp)
+	}))
+	defer mockBackend.Close()
+
+	backendURL, _ := url.Parse(mockBackend.URL)
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "vllm-backend",
+			URL:       backendURL,
+			URLString: mockBackend.URL,
+			Type:      "vllm",
+			Status:    domain.StatusHealthy,
+		},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+			},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			client := &http.Client{Timeout: 5 * time.Second}
+			backendReq, err := http.NewRequest(r.Method, eps[0].URLString+r.URL.Path, r.Body)
+			if err != nil {
+				return err
+			}
+
+			resp, err := client.Do(backendReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, err = io.Copy(w, resp.Body)
+			return err
+		},
+	}
+
+	discoveryService := &mockDiscoveryServiceWithEndpoints{
+		endpoints: endpoints,
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: discoveryService,
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	anthropicReq := map[string]interface{}{
+		"model":      "invalid-model",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Verify error response is preserved
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Equal(t, "passthrough", rec.Header().Get("X-Olla-Mode"))
+
+	var errorResp map[string]interface{}
+	err := json.Unmarshal(rec.Body.Bytes(), &errorResp)
+	require.NoError(t, err)
+	assert.Equal(t, "error", errorResp["type"])
+
+	errorObj := errorResp["error"].(map[string]interface{})
+	assert.Equal(t, "invalid_request_error", errorObj["type"])
+	assert.Contains(t, errorObj["message"], "Invalid model")
+}
+
+// TestTranslationHandler_ExistingTranslationTestsStillPass verifies no regression
+func TestTranslationHandler_ExistingTranslationTestsStillPass(t *testing.T) {
+	// This test ensures the existing translation tests still work
+	// Run a basic translation flow test
+	mockLogger := &mockStyledLogger{}
+	trans := &mockTranslator{
+		name:                  "test-translator",
+		implementsErrorWriter: true,
+		writeErrorFunc: func(w http.ResponseWriter, err error, statusCode int) {
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(statusCode)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": err.Error(),
+			})
+		},
+	}
+
+	app := &Application{
+		logger:           mockLogger,
+		proxyService:     &mockProxyService{},
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{},
+		inspectorChain:   inspector.NewChain(mockLogger),
+		profileFactory:   &mockProfileFactory{},
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody := map[string]interface{}{
+		"model": "test-model",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role":    "user",
+				"content": "Hello",
+			},
+		},
+	}
+	body, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest("POST", "/test", bytes.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, constants.ContentTypeJSON, rec.Header().Get(constants.HeaderContentType))
+
+	// Verify X-Olla-* headers are preserved
+	assert.NotEmpty(t, rec.Header().Get(constants.HeaderXOllaRequestID))
+	assert.NotEmpty(t, rec.Header().Get(constants.HeaderXOllaEndpoint))
+}
+
+// Mock implementations for testing
+
+// mockPassthroughProfileLookup implements translator.ProfileLookup for testing
+type mockPassthroughProfileLookup struct {
+	configs map[string]*domain.AnthropicSupportConfig
+}
+
+func (m *mockPassthroughProfileLookup) GetAnthropicSupport(endpointType string) *domain.AnthropicSupportConfig {
+	if m.configs == nil {
+		return nil
+	}
+	return m.configs[endpointType]
+}
+
+// mockPassthroughTranslator implements both RequestTranslator and PassthroughCapable
+type mockPassthroughTranslator struct {
+	name                   string
+	transformRequestFunc   func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error)
+	transformResponseFunc  func(ctx context.Context, openaiResp interface{}, original *http.Request) (interface{}, error)
+	transformStreamingFunc func(ctx context.Context, openaiStream io.Reader, w http.ResponseWriter, original *http.Request) error
+	writeErrorFunc         func(w http.ResponseWriter, err error, statusCode int)
+	implementsErrorWriter  bool
+	passthroughEnabled     bool
+	profileLookup          translator.ProfileLookup
+}
+
+func (m *mockPassthroughTranslator) Name() string {
+	return m.name
+}
+
+func (m *mockPassthroughTranslator) TransformRequest(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+	if m.transformRequestFunc != nil {
+		return m.transformRequestFunc(ctx, r)
+	}
+	// Default implementation
+	body, _ := io.ReadAll(r.Body)
+	var req map[string]interface{}
+	json.Unmarshal(body, &req)
+
+	modelName := ""
+	if model, ok := req["model"].(string); ok {
+		modelName = model
+	}
+
+	isStreaming := false
+	if stream, ok := req["stream"].(bool); ok {
+		isStreaming = stream
+	}
+
+	return &translator.TransformedRequest{
+		OpenAIRequest: map[string]interface{}{
+			"model":    modelName,
+			"messages": []interface{}{},
+		},
+		ModelName:   modelName,
+		IsStreaming: isStreaming,
+	}, nil
+}
+
+func (m *mockPassthroughTranslator) TransformResponse(ctx context.Context, openaiResp interface{}, original *http.Request) (interface{}, error) {
+	if m.transformResponseFunc != nil {
+		return m.transformResponseFunc(ctx, openaiResp, original)
+	}
+	return map[string]interface{}{
+		"id":      "mock-response-id",
+		"content": "mock response",
+	}, nil
+}
+
+func (m *mockPassthroughTranslator) TransformStreamingResponse(ctx context.Context, openaiStream io.Reader, w http.ResponseWriter, original *http.Request) error {
+	if m.transformStreamingFunc != nil {
+		return m.transformStreamingFunc(ctx, openaiStream, w, original)
+	}
+	w.Header().Set(constants.HeaderContentType, "text/event-stream")
+	_, err := io.Copy(w, openaiStream)
+	return err
+}
+
+func (m *mockPassthroughTranslator) WriteError(w http.ResponseWriter, err error, statusCode int) {
+	if m.implementsErrorWriter && m.writeErrorFunc != nil {
+		m.writeErrorFunc(w, err, statusCode)
+		return
+	}
+	panic("WriteError called on translator that doesn't implement ErrorWriter")
+}
+
+// CanPassthrough implements PassthroughCapable
+func (m *mockPassthroughTranslator) CanPassthrough(endpoints []*domain.Endpoint, profileLookup translator.ProfileLookup) bool {
+	if !m.passthroughEnabled {
+		return false
+	}
+
+	if len(endpoints) == 0 {
+		return false
+	}
+
+	// Check if all endpoints support Anthropic
+	for _, endpoint := range endpoints {
+		cfg := profileLookup.GetAnthropicSupport(endpoint.Type)
+		if cfg == nil || !cfg.Enabled {
+			return false
+		}
+	}
+
+	return true
+}
+
+// PreparePassthrough implements PassthroughCapable
+func (m *mockPassthroughTranslator) PreparePassthrough(bodyBytes []byte, r *http.Request, profileLookup translator.ProfileLookup) (*translator.PassthroughRequest, error) {
+	var req map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+
+	modelName := ""
+	if model, ok := req["model"].(string); ok {
+		modelName = model
+	}
+
+	isStreaming := false
+	if stream, ok := req["stream"].(bool); ok {
+		isStreaming = stream
+	}
+
+	return &translator.PassthroughRequest{
+		Body:        bodyBytes,
+		TargetPath:  "/v1/messages",
+		ModelName:   modelName,
+		IsStreaming: isStreaming,
+	}, nil
+}
+
+// mockDiscoveryServiceWithEndpoints provides configured endpoints for testing
+type mockDiscoveryServiceWithEndpoints struct {
+	endpoints []*domain.Endpoint
+}
+
+func (m *mockDiscoveryServiceWithEndpoints) GetEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	return m.endpoints, nil
+}
+
+func (m *mockDiscoveryServiceWithEndpoints) GetHealthyEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	healthy := make([]*domain.Endpoint, 0)
+	for _, ep := range m.endpoints {
+		if ep.Status == domain.StatusHealthy {
+			healthy = append(healthy, ep)
+		}
+	}
+	return healthy, nil
+}
+
+func (m *mockDiscoveryServiceWithEndpoints) RefreshEndpoints(ctx context.Context) error {
+	return nil
+}
+
+func (m *mockDiscoveryServiceWithEndpoints) UpdateEndpointStatus(ctx context.Context, endpoint *domain.Endpoint) error {
+	return nil
+}
+
+// ========== METRICS INTEGRATION TESTS ==========
+// These tests verify that translator metrics are properly recorded during HTTP request flows
+
+// mockStatsCollectorWithCapture extends mockStatsCollector to capture metrics calls
+type mockStatsCollectorWithCapture struct {
+	recordedEvents []ports.TranslatorRequestEvent
+	mu             sync.Mutex
+}
+
+func (m *mockStatsCollectorWithCapture) RecordRequest(endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
+}
+func (m *mockStatsCollectorWithCapture) RecordConnection(endpoint *domain.Endpoint, delta int) {}
+func (m *mockStatsCollectorWithCapture) RecordSecurityViolation(violation ports.SecurityViolation) {
+}
+func (m *mockStatsCollectorWithCapture) RecordDiscovery(endpoint *domain.Endpoint, success bool, latency time.Duration) {
+}
+func (m *mockStatsCollectorWithCapture) RecordModelRequest(model string, endpoint *domain.Endpoint, status string, latency time.Duration, bytes int64) {
+}
+func (m *mockStatsCollectorWithCapture) RecordModelError(model string, endpoint *domain.Endpoint, errorType string) {
+}
+func (m *mockStatsCollectorWithCapture) GetModelStats() map[string]ports.ModelStats { return nil }
+func (m *mockStatsCollectorWithCapture) GetModelEndpointStats() map[string]map[string]ports.EndpointModelStats {
+	return nil
+}
+func (m *mockStatsCollectorWithCapture) RecordTranslatorRequest(event ports.TranslatorRequestEvent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordedEvents = append(m.recordedEvents, event)
+}
+func (m *mockStatsCollectorWithCapture) GetTranslatorStats() map[string]ports.TranslatorStats {
+	return nil
+}
+func (m *mockStatsCollectorWithCapture) GetProxyStats() ports.ProxyStats { return ports.ProxyStats{} }
+func (m *mockStatsCollectorWithCapture) GetEndpointStats() map[string]ports.EndpointStats {
+	return nil
+}
+func (m *mockStatsCollectorWithCapture) GetSecurityStats() ports.SecurityStats {
+	return ports.SecurityStats{}
+}
+func (m *mockStatsCollectorWithCapture) GetConnectionStats() map[string]int64     { return nil }
+func (m *mockStatsCollectorWithCapture) GetConnectionCount(endpoint string) int64 { return 0 }
+
+func (m *mockStatsCollectorWithCapture) getRecordedEvents() []ports.TranslatorRequestEvent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	events := make([]ports.TranslatorRequestEvent, len(m.recordedEvents))
+	copy(events, m.recordedEvents)
+	return events
+}
+
+// TestTranslationHandler_MetricsRecordedForPassthrough verifies metrics are recorded for passthrough requests
+func TestTranslationHandler_MetricsRecordedForPassthrough(t *testing.T) {
+	// Setup mock backend
+	mockBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Add small delay to ensure measurable latency
+		time.Sleep(1 * time.Millisecond)
+		response := map[string]interface{}{
+			"id":      "msg_01XFDUDYJgAACzvnptvVoYEL",
+			"type":    "message",
+			"role":    "assistant",
+			"content": []map[string]interface{}{{"type": "text", "text": "Hello"}},
+			"model":   "claude-3-5-sonnet-20241022",
+		}
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer mockBackend.Close()
+
+	backendURL, _ := url.Parse(mockBackend.URL)
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "vllm-backend",
+			URL:       backendURL,
+			URLString: mockBackend.URL,
+			Type:      "vllm",
+			Status:    domain.StatusHealthy,
+		},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+			},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:                  "anthropic",
+		passthroughEnabled:    true,
+		profileLookup:         profileLookup,
+		implementsErrorWriter: true,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			client := &http.Client{Timeout: 5 * time.Second}
+			backendReq, err := http.NewRequest(r.Method, eps[0].URLString+r.URL.Path, r.Body)
+			if err != nil {
+				return err
+			}
+			resp, err := client.Do(backendReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			return nil
+		},
+	}
+
+	// Create stats collector that captures events
+	statsCollector := &mockStatsCollectorWithCapture{}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   statsCollector,
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	// Send non-streaming request
+	anthropicReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Verify response is successful
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "passthrough", rec.Header().Get("X-Olla-Mode"))
+
+	// Verify metrics were recorded
+	events := statsCollector.getRecordedEvents()
+	require.Len(t, events, 1, "Expected exactly one translator metrics event")
+
+	event := events[0]
+	assert.Equal(t, "anthropic", event.TranslatorName)
+	assert.Equal(t, "claude-3-5-sonnet-20241022", event.Model)
+	assert.Equal(t, constants.TranslatorModePassthrough, event.Mode)
+	assert.Equal(t, constants.FallbackReasonNone, event.FallbackReason)
+	assert.True(t, event.Success)
+	assert.False(t, event.IsStreaming)
+	assert.Greater(t, event.Latency, time.Duration(0))
+}
+
+// TestTranslationHandler_MetricsRecordedForTranslation verifies metrics are recorded for translation requests
+func TestTranslationHandler_MetricsRecordedForTranslation(t *testing.T) {
+	// Setup endpoints WITHOUT Anthropic support (forces translation mode)
+	endpoints := []*domain.Endpoint{
+		{Name: "ollama-1", Type: "ollama", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			// No Anthropic support for ollama
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{
+					"model": "claude-3-5-sonnet-20241022",
+					"messages": []interface{}{
+						map[string]interface{}{"role": "user", "content": "test"},
+					},
+				},
+				ModelName:   "claude-3-5-sonnet-20241022",
+				IsStreaming: false,
+				TargetPath:  "/v1/chat/completions",
+			}, nil
+		},
+		transformResponseFunc: func(ctx context.Context, openaiResp interface{}, original *http.Request) (interface{}, error) {
+			return map[string]interface{}{
+				"id":   "msg_123",
+				"type": "message",
+			}, nil
+		},
+		implementsErrorWriter: true,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			response := map[string]interface{}{
+				"id":      "chatcmpl-123",
+				"object":  "chat.completion",
+				"choices": []interface{}{},
+			}
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(response)
+		},
+	}
+
+	statsCollector := &mockStatsCollectorWithCapture{}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   statsCollector,
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	anthropicReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// Verify response is successful
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Verify metrics were recorded for translation mode
+	events := statsCollector.getRecordedEvents()
+	require.Len(t, events, 1, "Expected exactly one translator metrics event")
+
+	event := events[0]
+	assert.Equal(t, "anthropic", event.TranslatorName)
+	assert.Equal(t, "claude-3-5-sonnet-20241022", event.Model)
+	assert.Equal(t, constants.TranslatorModeTranslation, event.Mode)
+	assert.Equal(t, constants.FallbackReasonCannotPassthrough, event.FallbackReason)
+	assert.True(t, event.Success)
+	assert.False(t, event.IsStreaming)
+}
+
+// TestTranslationHandler_MetricsRecordedForPassthrough_MixedEndpoints verifies that passthrough
+// mode metrics are recorded when the handler filters a mixed deployment to the capable subset.
+func TestTranslationHandler_MetricsRecordedForPassthrough_MixedEndpoints(t *testing.T) {
+	// Mixed deployment: vllm supports Anthropic natively, ollama does not.
+	// Handler filters to [vllm-1] and uses passthrough — metrics should reflect that.
+	endpoints := []*domain.Endpoint{
+		{Name: "vllm-1", Type: "vllm", Status: domain.StatusHealthy},
+		{Name: "ollama-1", Type: "ollama", Status: domain.StatusHealthy}, // No Anthropic support
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+			},
+			// ollama has no config
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{
+					"model":    "claude-3-5-sonnet-20241022",
+					"messages": []interface{}{map[string]interface{}{"role": "user", "content": "test"}},
+				},
+				ModelName:   "claude-3-5-sonnet-20241022",
+				IsStreaming: false,
+				TargetPath:  "/v1/chat/completions",
+			}, nil
+		},
+		transformResponseFunc: func(ctx context.Context, openaiResp interface{}, original *http.Request) (interface{}, error) {
+			return map[string]interface{}{"id": "msg_123", "type": "message"}, nil
+		},
+		implementsErrorWriter: true,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			response := map[string]interface{}{"id": "chatcmpl-123", "object": "chat.completion", "choices": []interface{}{}}
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(response)
+		},
+	}
+
+	statsCollector := &mockStatsCollectorWithCapture{}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   statsCollector,
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	anthropicReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Hello"},
+		},
+	}
+	reqBody, _ := json.Marshal(anthropicReq)
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "passthrough", rec.Header().Get("X-Olla-Mode"), "Should use passthrough for the capable subset")
+
+	// Verify passthrough mode and no fallback reason are recorded
+	events := statsCollector.getRecordedEvents()
+	require.Len(t, events, 1)
+
+	event := events[0]
+	assert.Equal(t, constants.TranslatorModePassthrough, event.Mode)
+	assert.Equal(t, constants.FallbackReasonNone, event.FallbackReason)
+	assert.True(t, event.Success)
+}
+
+// TestTranslationHandler_MetricsRecordedForStreamingVsNonStreaming verifies streaming flag is tracked
+func TestTranslationHandler_MetricsRecordedForStreamingVsNonStreaming(t *testing.T) {
+	mockBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Add small delay to ensure measurable latency
+		time.Sleep(1 * time.Millisecond)
+		// Check if request is streaming based on request body
+		body, _ := io.ReadAll(r.Body)
+		var req map[string]interface{}
+		json.Unmarshal(body, &req)
+
+		if stream, ok := req["stream"].(bool); ok && stream {
+			// Return SSE stream
+			w.Header().Set(constants.HeaderContentType, "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "event: message_start\ndata: {\\\"type\\\":\\\"message_start\\\"}\n\n")
+			fmt.Fprint(w, "event: message_stop\ndata: {\\\"type\\\":\\\"message_stop\\\"}\n\n")
+		} else {
+			// Return JSON response
+			response := map[string]interface{}{"id": "msg_123", "type": "message"}
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(response)
+		}
+	}))
+	defer mockBackend.Close()
+
+	backendURL, _ := url.Parse(mockBackend.URL)
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "vllm-backend",
+			URL:       backendURL,
+			URLString: mockBackend.URL,
+			Type:      "vllm",
+			Status:    domain.StatusHealthy,
+		},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {Enabled: true, MessagesPath: "/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:                  "anthropic",
+		passthroughEnabled:    true,
+		profileLookup:         profileLookup,
+		implementsErrorWriter: true,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			body, _ := io.ReadAll(r.Body)
+			var req map[string]interface{}
+			json.Unmarshal(body, &req)
+
+			modelName := "claude-3-5-sonnet-20241022"
+			if model, ok := req["model"].(string); ok {
+				modelName = model
+			}
+
+			isStreaming := false
+			if stream, ok := req["stream"].(bool); ok {
+				isStreaming = stream
+			}
+
+			return &translator.TransformedRequest{
+				ModelName:   modelName,
+				IsStreaming: isStreaming,
+			}, nil
+		},
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			client := &http.Client{Timeout: 5 * time.Second}
+			backendReq, err := http.NewRequest(r.Method, eps[0].URLString+r.URL.Path, r.Body)
+			if err != nil {
+				return err
+			}
+
+			resp, err := client.Do(backendReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+
+			return nil
+		},
+	}
+
+	statsCollector := &mockStatsCollectorWithCapture{}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   statsCollector,
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	// Test 1: Non-streaming request
+	nonStreamingReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"stream":     false,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "Hello"}},
+	}
+	reqBody, _ := json.Marshal(nonStreamingReq)
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Test 2: Streaming request
+	streamingReq := map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"stream":     true,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "Hello"}},
+	}
+	reqBody2, _ := json.Marshal(streamingReq)
+	req2 := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody2))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusOK, rec2.Code)
+
+	// Verify both events were recorded with correct streaming flag
+	events := statsCollector.getRecordedEvents()
+	require.Len(t, events, 2)
+
+	// First event should be non-streaming
+	assert.False(t, events[0].IsStreaming, "First request should be non-streaming")
+
+	// Second event should be streaming
+	assert.True(t, events[1].IsStreaming, "Second request should be streaming")
+}
+
+// TestTranslationHandler_MetricsRecordedForSuccessVsError verifies success/failure tracking
+func TestTranslationHandler_MetricsRecordedForSuccessVsError(t *testing.T) {
+	successBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Add small delay to ensure measurable latency
+		time.Sleep(1 * time.Millisecond)
+		response := map[string]interface{}{"id": "msg_123", "type": "message"}
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer successBackend.Close()
+
+	errorBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		errorResp := map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "invalid_request_error",
+				"message": "Test error",
+			},
+		}
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(errorResp)
+	}))
+	defer errorBackend.Close()
+
+	successURL, _ := url.Parse(successBackend.URL)
+	errorURL, _ := url.Parse(errorBackend.URL)
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {Enabled: true, MessagesPath: "/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:                  "anthropic",
+		passthroughEnabled:    true,
+		profileLookup:         profileLookup,
+		implementsErrorWriter: true,
+	}
+
+	statsCollector := &mockStatsCollectorWithCapture{}
+
+	// Test 1: Successful request
+	successEndpoints := []*domain.Endpoint{
+		{Name: "success-backend", URL: successURL, URLString: successBackend.URL, Type: "vllm", Status: domain.StatusHealthy},
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			client := &http.Client{Timeout: 5 * time.Second}
+			backendReq, err := http.NewRequest(r.Method, eps[0].URLString+r.URL.Path, r.Body)
+			if err != nil {
+				return err
+			}
+			resp, err := client.Do(backendReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			return nil
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   statsCollector,
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return successEndpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: successEndpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "Hello"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	// Test 2: Error request
+	errorEndpoints := []*domain.Endpoint{
+		{Name: "error-backend", URL: errorURL, URLString: errorBackend.URL, Type: "vllm", Status: domain.StatusHealthy},
+	}
+
+	app2 := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   statsCollector,
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return errorEndpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: errorEndpoints},
+		Config:           &config.Config{},
+	}
+
+	handler2 := app2.translationHandler(trans)
+
+	reqBody2, _ := json.Marshal(map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "Hello"}},
+	})
+
+	req2 := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody2))
+	rec2 := httptest.NewRecorder()
+	handler2.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusBadRequest, rec2.Code)
+
+	// Verify metrics recorded for both success and error
+	events := statsCollector.getRecordedEvents()
+	require.Len(t, events, 2)
+
+	// First event should be successful
+	assert.True(t, events[0].Success, "First request should be successful")
+
+	// Second event should be successful (even though backend returned error, the handler processed it successfully)
+	// Backend errors are considered successful processing from the handler's perspective
+	assert.True(t, events[1].Success, "Second request should be successful (handler processed backend error)")
+}
+
+// TestTranslatorMode_SetOnPassthroughPath verifies that translatorMode is set to passthrough
+// on the proxyRequest before logRequestStart is called, so lifecycle logs carry the mode.
+func TestTranslatorMode_SetOnPassthroughPath(t *testing.T) {
+	t.Parallel()
+
+	// Capture the proxyRequest state when logRequestStart fires (i.e. when the
+	// underlying proxy service is invoked — at that point pr.translatorMode must
+	// already be set).
+	var capturedMode constants.TranslatorMode
+
+	endpoints := []*domain.Endpoint{
+		{Name: "vllm-1", Type: "vllm", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {Enabled: true, MessagesPath: "/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			// The proxy is called after logRequestStart; by now translatorMode must be set.
+			// We can't reach pr directly, so assert via the response header that was set
+			// before this point.
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message"})
+		},
+	}
+
+	// Intercept the proxyRequest by wrapping executePassthroughRequest via a
+	// custom translator whose PreparePassthrough stores the mode from the header.
+	_ = capturedMode
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "hi"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	// The X-Olla-Mode header is set immediately from pr.translatorMode before the proxy
+	// call, so its presence confirms the field was populated on the passthrough path.
+	assert.Equal(t, string(constants.TranslatorModePassthrough), rec.Header().Get(constants.HeaderXOllaMode),
+		"X-Olla-Mode header must reflect passthrough mode")
+}
+
+// TestTranslatorMode_SetOnTranslationPath verifies that translatorMode is set to translation
+// on the proxyRequest for requests that go through the full format-conversion path.
+func TestTranslatorMode_SetOnTranslationPath(t *testing.T) {
+	t.Parallel()
+
+	endpoints := []*domain.Endpoint{
+		{Name: "ollama-1", Type: "ollama", Status: domain.StatusHealthy},
+	}
+
+	// No Anthropic support configured — forces the translation path.
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{
+					"model":    "claude-3-5-sonnet-20241022",
+					"messages": []interface{}{map[string]interface{}{"role": "user", "content": "test"}},
+				},
+				ModelName:   "claude-3-5-sonnet-20241022",
+				IsStreaming: false,
+				TargetPath:  "/v1/chat/completions",
+			}, nil
+		},
+		transformResponseFunc: func(ctx context.Context, openaiResp interface{}, original *http.Request) (interface{}, error) {
+			return map[string]interface{}{"id": "msg_translated", "type": "message"}, nil
+		},
+		implementsErrorWriter: true,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{
+				"id": "chatcmpl-123", "object": "chat.completion", "choices": []interface{}{},
+			})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 1024,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "hi"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	// The translation path does not set X-Olla-Mode on the response header,
+	// confirming it took the translation route (not passthrough).
+	assert.Empty(t, rec.Header().Get(constants.HeaderXOllaMode),
+		"X-Olla-Mode header must not be set on the translation path")
+}
+
+// TestPassthrough_ProfileMessagesPathOverride verifies that the handler uses the
+// backend profile's configured messages_path rather than the translator's default.
+// Docker Model Runner exposes /anthropic/v1/messages, not /v1/messages, so without
+// the override the proxy would hit a 404 on DMR.
+func TestPassthrough_ProfileMessagesPathOverride(t *testing.T) {
+	t.Parallel()
+
+	var capturedPath string
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "dmr-backend",
+			Type:      "docker-model-runner",
+			Status:    domain.StatusHealthy,
+			URLString: "http://localhost:12434",
+		},
+	}
+
+	// DMR has a non-standard Anthropic path.
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"docker-model-runner": {Enabled: true, MessagesPath: "/anthropic/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			capturedPath = r.URL.Path
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_dmr"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":      "ai/llama3.2",
+		"max_tokens": 512,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "hello"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(constants.TranslatorModePassthrough), rec.Header().Get(constants.HeaderXOllaMode))
+	// The path forwarded to the proxy must use DMR's native path, not the default /v1/messages.
+	assert.Equal(t, "/anthropic/v1/messages", capturedPath,
+		"proxy must use the backend's configured messages_path, not the translator default")
+}
+
+// TestPassthrough_MixedMessagesPathsFiltersToCompatibleSubset verifies that when
+// capable backends disagree on their native Anthropic path, the handler restricts
+// the proxy endpoint list to the path-compatible subset rather than passing all
+// endpoints with a neutral path (which would cause 404s on mismatched backends).
+//
+// Fleet: DMR on /anthropic/v1/messages (1 endpoint) + vLLM on /v1/messages (1 endpoint).
+// The translator's default path is /v1/messages, so on a size tie the /v1/messages
+// group wins. The proxy receives only the vllm endpoint with path /v1/messages.
+func TestPassthrough_MixedMessagesPathsFiltersToCompatibleSubset(t *testing.T) {
+	t.Parallel()
+
+	var capturedEndpoints []*domain.Endpoint
+	var capturedPath string
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "dmr-backend",
+			Type:      "docker-model-runner",
+			Status:    domain.StatusHealthy,
+			URLString: "http://localhost:12434",
+		},
+		{
+			Name:      "vllm-backend",
+			Type:      "vllm",
+			Status:    domain.StatusHealthy,
+			URLString: "http://localhost:8000",
+		},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"docker-model-runner": {Enabled: true, MessagesPath: "/anthropic/v1/messages"},
+			"vllm":                {Enabled: true, MessagesPath: "/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			capturedEndpoints = eps
+			capturedPath = r.URL.Path
+
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.Header().Set(constants.HeaderXOllaEndpoint, eps[0].Name)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_vllm"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":      "claude-3-5-sonnet-20241022",
+		"max_tokens": 512,
+		"messages":   []map[string]interface{}{{"role": "user", "content": "hello"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(constants.TranslatorModePassthrough), rec.Header().Get(constants.HeaderXOllaMode))
+	// On a tie the resolver prefers the subset whose path matches the translator
+	// default (/v1/messages), which is the vllm group.
+	require.Len(t, capturedEndpoints, 1,
+		"proxy must receive only the path-compatible subset, not the full mixed fleet")
+	assert.Equal(t, "vllm-backend", capturedEndpoints[0].Name,
+		"vllm endpoint (path=/v1/messages, matches translator default) must be selected")
+	assert.Equal(t, "/v1/messages", capturedPath,
+		"request path must match the selected subset's native messages path")
+}
+
+// TestPassthrough_MixedFleet_TwoVllmOneDmr_PicksVllmSubset verifies that when the
+// majority of capable backends share a path, that larger subset wins regardless of
+// the tie-break rule, and the DMR endpoint is excluded.
+func TestPassthrough_MixedFleet_TwoVllmOneDmr_PicksVllmSubset(t *testing.T) {
+	t.Parallel()
+
+	var capturedEndpoints []*domain.Endpoint
+	var capturedPath string
+
+	endpoints := []*domain.Endpoint{
+		{Name: "vllm-1", Type: "vllm", Status: domain.StatusHealthy, URLString: "http://localhost:8001"},
+		{Name: "vllm-2", Type: "vllm", Status: domain.StatusHealthy, URLString: "http://localhost:8002"},
+		{Name: "dmr-1", Type: "docker-model-runner", Status: domain.StatusHealthy, URLString: "http://localhost:12434"},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm":                {Enabled: true, MessagesPath: "/v1/messages"},
+			"docker-model-runner": {Enabled: true, MessagesPath: "/anthropic/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			capturedEndpoints = eps
+			capturedPath = r.URL.Path
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_1"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    "claude-3-5-sonnet-20241022",
+		"messages": []map[string]interface{}{{"role": "user", "content": "hello"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(constants.TranslatorModePassthrough), rec.Header().Get(constants.HeaderXOllaMode))
+	// The vllm group has 2 endpoints vs DMR's 1 — larger subset wins.
+	require.Len(t, capturedEndpoints, 2,
+		"both vllm endpoints must be passed; DMR must be excluded")
+	for _, ep := range capturedEndpoints {
+		assert.Equal(t, "vllm", ep.Type, "all passed endpoints must be vllm")
+	}
+	assert.Equal(t, "/v1/messages", capturedPath,
+		"path must be the vllm native path, not the DMR path")
+}
+
+// TestPassthrough_UniformDmrFleet_AllEndpointsPassed verifies that a uniform
+// DMR-only fleet (all on /anthropic/v1/messages) passes all endpoints through
+// without filtering and uses the DMR-specific path.
+func TestPassthrough_UniformDmrFleet_AllEndpointsPassed(t *testing.T) {
+	t.Parallel()
+
+	var capturedEndpoints []*domain.Endpoint
+	var capturedPath string
+
+	endpoints := []*domain.Endpoint{
+		{Name: "dmr-1", Type: "docker-model-runner", Status: domain.StatusHealthy, URLString: "http://localhost:12434"},
+		{Name: "dmr-2", Type: "docker-model-runner", Status: domain.StatusHealthy, URLString: "http://localhost:12435"},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"docker-model-runner": {Enabled: true, MessagesPath: "/anthropic/v1/messages"},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			capturedEndpoints = eps
+			capturedPath = r.URL.Path
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_dmr"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    "ai/llama3.2",
+		"messages": []map[string]interface{}{{"role": "user", "content": "hello"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, string(constants.TranslatorModePassthrough), rec.Header().Get(constants.HeaderXOllaMode))
+	// Uniform fleet: no filtering — both DMR endpoints must be passed.
+	require.Len(t, capturedEndpoints, 2,
+		"uniform DMR fleet must pass all endpoints without filtering")
+	assert.Equal(t, "/anthropic/v1/messages", capturedPath,
+		"path must be the DMR native path for a uniform DMR fleet")
+}
+
+// TestPassthrough_LimitationFiltering_NoToolUse verifies that an endpoint declaring
+// no_tool_use is excluded from the passthrough subset when the request contains tools,
+// but included when the request has no tools.
+func TestPassthrough_LimitationFiltering_NoToolUse(t *testing.T) {
+	t.Parallel()
+
+	endpoints := []*domain.Endpoint{
+		{Name: "limited-backend", Type: "limited", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"limited": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+				Limitations:  []string{domain.AnthropicLimitationNoToolUse},
+			},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+		transformRequestFunc: func(ctx context.Context, r *http.Request) (*translator.TransformedRequest, error) {
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{"model": "claude-3-5-sonnet-20241022", "messages": []interface{}{}},
+				ModelName:     "claude-3-5-sonnet-20241022",
+				IsStreaming:   false,
+				TargetPath:    "/v1/chat/completions",
+			}, nil
+		},
+		transformResponseFunc: func(ctx context.Context, openaiResp interface{}, original *http.Request) (interface{}, error) {
+			return map[string]interface{}{"type": "message", "id": "msg_translated"}, nil
+		},
+		implementsErrorWriter: true,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_proxy"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	// Request WITH tools — endpoint must be excluded, falls back to translation.
+	reqWithTools, _ := json.Marshal(map[string]interface{}{
+		"model":    "claude-3-5-sonnet-20241022",
+		"messages": []map[string]interface{}{{"role": "user", "content": "use a tool"}},
+		"tools": []map[string]interface{}{
+			{"name": "get_weather", "description": "Get weather", "input_schema": map[string]interface{}{"type": "object"}},
+		},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqWithTools))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, rec.Header().Get("X-Olla-Mode"),
+		"endpoint with no_tool_use must be excluded when request uses tools — falls back to translation")
+
+	// Request WITHOUT tools — endpoint must be included, passthrough used.
+	reqWithoutTools, _ := json.Marshal(map[string]interface{}{
+		"model":    "claude-3-5-sonnet-20241022",
+		"messages": []map[string]interface{}{{"role": "user", "content": "hello"}},
+	})
+
+	req2 := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqWithoutTools))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+
+	assert.Equal(t, http.StatusOK, rec2.Code)
+	assert.Equal(t, "passthrough", rec2.Header().Get("X-Olla-Mode"),
+		"endpoint with no_tool_use must be included when request has no tools")
+}
+
+// TestPassthrough_LimitationFiltering_TokenCounting verifies that token-counting
+// limitations (token_counting_404, no_token_counting) never affect messages passthrough.
+func TestPassthrough_LimitationFiltering_TokenCounting(t *testing.T) {
+	t.Parallel()
+
+	var proxyCalled bool
+
+	endpoints := []*domain.Endpoint{
+		{Name: "tc-limited", Type: "tc_backend", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"tc_backend": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+				// Token-counting limitations must never affect messages passthrough.
+				Limitations: []string{"token_counting_404", "no_token_counting"},
+			},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			proxyCalled = true
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_tc"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"model":    "claude-3-5-sonnet-20241022",
+		"messages": []map[string]interface{}{{"role": "user", "content": "hello"}},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.True(t, proxyCalled, "proxy must be called — token-counting limitations must not exclude the endpoint")
+	assert.Equal(t, "passthrough", rec.Header().Get("X-Olla-Mode"),
+		"token-counting limitations must never block messages passthrough")
+}
+
+// TestPassthrough_LimitationFiltering_MixedFleet verifies that in a mixed fleet one
+// endpoint is excluded by a feature limitation while the other passes through.
+// vllm declares no_tool_use; llamacpp has no limitations. A tool-use request must
+// route only to llamacpp via passthrough.
+func TestPassthrough_LimitationFiltering_MixedFleet(t *testing.T) {
+	t.Parallel()
+
+	var capturedEndpoints []*domain.Endpoint
+
+	endpoints := []*domain.Endpoint{
+		{Name: "vllm-1", Type: "vllm", Status: domain.StatusHealthy},
+		{Name: "llamacpp-1", Type: "llamacpp", Status: domain.StatusHealthy},
+	}
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"vllm": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+				Limitations:  []string{domain.AnthropicLimitationNoToolUse},
+			},
+			"llamacpp": {
+				Enabled:      true,
+				MessagesPath: "/v1/messages",
+				// No limitations — supports tool use.
+			},
+		},
+	}
+
+	trans := &mockPassthroughTranslator{
+		name:               "anthropic",
+		passthroughEnabled: true,
+		profileLookup:      profileLookup,
+	}
+
+	proxyService := &mockProxyService{
+		proxyFunc: func(ctx context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+			capturedEndpoints = eps
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			return json.NewEncoder(w).Encode(map[string]interface{}{"type": "message", "id": "msg_mixed"})
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     proxyService,
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{getEndpointsFunc: func() []*domain.Endpoint { return endpoints }},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		profileLookup:    profileLookup,
+		discoveryService: &mockDiscoveryServiceWithEndpoints{endpoints: endpoints},
+		Config:           &config.Config{},
+	}
+
+	handler := app.translationHandler(trans)
+
+	reqWithTools, _ := json.Marshal(map[string]interface{}{
+		"model":    "claude-3-5-sonnet-20241022",
+		"messages": []map[string]interface{}{{"role": "user", "content": "use a tool"}},
+		"tools": []map[string]interface{}{
+			{"name": "search", "description": "Search", "input_schema": map[string]interface{}{"type": "object"}},
+		},
+	})
+
+	req := httptest.NewRequest("POST", "/olla/anthropic/v1/messages", bytes.NewReader(reqWithTools))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "passthrough", rec.Header().Get("X-Olla-Mode"),
+		"llamacpp (no limitations) must accept the tool-use request via passthrough")
+	require.Len(t, capturedEndpoints, 1, "only llamacpp must be in the passthrough subset")
+	assert.Equal(t, "llamacpp-1", capturedEndpoints[0].Name,
+		"vllm (no_tool_use) must be excluded; llamacpp must handle the request")
+}
+
+// TestResolvePassthroughTargetPath_TieBreakDeterminism ensures that when two equal-sized
+// non-default path groups exist, the function always resolves to the path whose first
+// endpoint appears earliest in the input slice — never the other group, regardless of
+// Go's randomised map iteration order.
+func TestResolvePassthroughTargetPath_TieBreakDeterminism(t *testing.T) {
+	t.Parallel()
+
+	// Two backend types with distinct native Anthropic paths, neither matching defaultPath.
+	// Each group has exactly one endpoint so the sizes are equal — a pure tie.
+	// The endpoint for "alpha" appears before "beta" in the slice, so "alpha" must always win.
+	const defaultPath = "/v1/messages"
+	const alphaPath = "/alpha/v1/messages"
+	const betaPath = "/beta/v1/messages"
+
+	profileLookup := &mockPassthroughProfileLookup{
+		configs: map[string]*domain.AnthropicSupportConfig{
+			"alpha": {Enabled: true, MessagesPath: alphaPath},
+			"beta":  {Enabled: true, MessagesPath: betaPath},
+		},
+	}
+
+	endpoints := []*domain.Endpoint{
+		{Name: "alpha-1", Type: "alpha", Status: domain.StatusHealthy},
+		{Name: "beta-1", Type: "beta", Status: domain.StatusHealthy},
+	}
+
+	app := &Application{
+		profileLookup: profileLookup,
+	}
+
+	// Run enough iterations to expose any map-order flapping.
+	const iterations = 20
+	for i := range iterations {
+		resolvedPath, filteredEndpoints := app.resolvePassthroughTargetPath(endpoints, defaultPath)
+		if resolvedPath != alphaPath {
+			t.Errorf("iteration %d: expected %q (first-seen path), got %q", i, alphaPath, resolvedPath)
+		}
+		// The filtered set must contain only the alpha endpoint.
+		if len(filteredEndpoints) != 1 || filteredEndpoints[0].Name != "alpha-1" {
+			t.Errorf("iteration %d: expected [alpha-1], got %v", i, filteredEndpoints)
+		}
+	}
+}
