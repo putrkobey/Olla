@@ -30,3 +30,99 @@ type ModelDetails struct {
 }
 
 type ModelInfo struct {
+	LastSeen    time.Time     `json:"last_seen"`
+	Details     *ModelDetails `json:"details,omitempty"`
+	Name        string        `json:"name"`
+	Type        string        `json:"type,omitempty"`
+	Description string        `json:"description,omitempty"`
+	Size        int64         `json:"size,omitempty"` // Disk size in bytes
+}
+
+// genericModelTypes are values backends put in a top-level type field to mark
+// "this JSON object is a model" (OpenAI-style "object": "model"), not what kind
+// of model it is.
+var genericModelTypes = map[string]struct{}{"model": {}}
+
+// ModelKindFromMetadata returns the model's kind (llm, vlm, embeddings,
+// reranker, classifier) from unified model metadata. The specific kind lives in
+// "model_type" (ModelDetails.Type); the generic "type" (ModelInfo.Type) is only
+// a fallback, and generic object markers such as "model" never count as a
+// kind, otherwise they mask the real one.
+func ModelKindFromMetadata(metadata map[string]any) string {
+	if kind, _ := metadata["model_type"].(string); kind != "" {
+		return kind
+	}
+	if kind, _ := metadata["type"].(string); kind != "" {
+		if _, generic := genericModelTypes[kind]; !generic {
+			return kind
+		}
+	}
+	return ""
+}
+
+type EndpointModels struct {
+	LastUpdated time.Time `json:"last_updated"`
+	// EndpointURL is used for internal map-keying only; it must not appear in
+	// serialised API responses because it may carry auth credentials or internal
+	// network addresses.
+	EndpointURL string       `json:"-"`
+	Models      []*ModelInfo `json:"models"`
+}
+
+type ModelRegistry interface {
+	RegisterModel(ctx context.Context, endpointURL string, model *ModelInfo) error
+	RegisterModels(ctx context.Context, endpointURL string, models []*ModelInfo) error
+	GetModelsForEndpoint(ctx context.Context, endpointURL string) ([]*ModelInfo, error)
+	GetEndpointsForModel(ctx context.Context, modelName string) ([]string, error)
+	IsModelAvailable(ctx context.Context, modelName string) bool
+	GetAllModels(ctx context.Context) (map[string][]*ModelInfo, error)
+	GetEndpointModelMap(ctx context.Context) (map[string]*EndpointModels, error)
+	RemoveEndpoint(ctx context.Context, endpointURL string) error
+	GetStats(ctx context.Context) (RegistryStats, error)
+	ModelsToString(models []*ModelInfo) string
+	ModelsToStrings(models []*ModelInfo) []string
+	GetModelsByCapability(ctx context.Context, capability string) ([]*UnifiedModel, error)
+
+	// GetRoutableEndpointsForModel returns endpoints that should handle a model request based on routing strategy
+	GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*Endpoint) ([]*Endpoint, *ModelRoutingDecision, error)
+}
+
+// ModelRoutingDecision captures routing decision information
+type ModelRoutingDecision struct {
+	Strategy   string // strategy name
+	Action     string // routed, fallback, rejected
+	Reason     string // human-readable reason
+	StatusCode int    // suggested HTTP status for failures
+}
+
+type RegistryStats struct {
+	LastUpdated       time.Time      `json:"last_updated"`
+	ModelsPerEndpoint map[string]int `json:"models_per_endpoint"`
+	TotalEndpoints    int            `json:"total_endpoints"`
+	TotalModels       int            `json:"total_models"`
+}
+
+type ModelRegistryError struct {
+	Err         error
+	Operation   string
+	EndpointURL string
+	ModelName   string
+}
+
+func (e *ModelRegistryError) Error() string {
+	return fmt.Sprintf("model registry %s failed for endpoint %s, model %s: %v",
+		e.Operation, e.EndpointURL, e.ModelName, e.Err)
+}
+
+func (e *ModelRegistryError) Unwrap() error {
+	return e.Err
+}
+
+func NewModelRegistryError(operation, endpointURL, modelName string, err error) *ModelRegistryError {
+	return &ModelRegistryError{
+		Operation:   operation,
+		EndpointURL: endpointURL,
+		ModelName:   modelName,
+		Err:         err,
+	}
+}
