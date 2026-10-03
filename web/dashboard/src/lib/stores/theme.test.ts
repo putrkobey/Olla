@@ -73,3 +73,79 @@ describe('theme toggle', () => {
     expect(theme.resolved).toBe('light');
     theme.toggle(); // light -> dark
     expect(theme.resolved).toBe('dark');
+  });
+
+  it('an explicit reset returns to auto and follows the system again', async () => {
+    mockMatchMedia(false);
+    const { theme } = await import('./theme.svelte');
+
+    theme.toggle();
+    expect(theme.mode).toBe('dark');
+
+    theme.set('auto');
+
+    expect(theme.mode).toBe('auto');
+    expect(theme.resolved).toBe('light');
+    expect(localStorage.getItem('olla-theme')).toBeNull();
+  });
+
+  it('auto is not persisted, but an explicit override is', async () => {
+    mockMatchMedia(false);
+    const { theme } = await import('./theme.svelte');
+
+    theme.toggle();
+    expect(localStorage.getItem('olla-theme')).toBe('dark');
+
+    theme.set('auto');
+    expect(localStorage.getItem('olla-theme')).toBeNull();
+  });
+
+  // Item 15: aria-label/title derive from `resolved`, which used to call
+  // window.matchMedia() directly from a plain getter. Svelte only reruns
+  // $derived off $state changes, so that read was never reactive and the
+  // label stayed stale after a live OS flip (verified via emulateMedia with
+  // no reload). `resolved` must now track a reactive field the matchMedia
+  // listener updates.
+  it('tracks a live OS preference change while in auto, with no reload', async () => {
+    const mm = mockMatchMedia(false);
+    const { theme } = await import('./theme.svelte');
+    expect(theme.resolved).toBe('light');
+
+    mm.fireChange(true);
+    expect(theme.resolved).toBe('dark');
+
+    mm.fireChange(false);
+    expect(theme.resolved).toBe('light');
+  });
+
+  it('stops tracking OS changes after destroy(), leaving no dangling listener', async () => {
+    const mm = mockMatchMedia(false);
+    const { theme } = await import('./theme.svelte');
+    expect(theme.resolved).toBe('light');
+
+    theme.destroy();
+    mm.fireChange(true);
+
+    expect(theme.resolved).toBe('light');
+  });
+});
+
+// The single header button cycles mode auto -> light -> dark -> auto, so
+// cycle() must always advance exactly one step regardless of the resolved
+// theme (the glyph tracks `mode`, not `resolved`, so every step is visible).
+describe('theme cycle', () => {
+  it('advances auto -> light -> dark -> auto, wrapping on the fourth click', async () => {
+    mockMatchMedia(false); // resolved light, but cycle keys off mode
+    const { theme } = await import('./theme.svelte');
+    expect(theme.mode).toBe('auto');
+
+    theme.cycle();
+    expect(theme.mode).toBe('light');
+    theme.cycle();
+    expect(theme.mode).toBe('dark');
+    theme.cycle();
+    expect(theme.mode).toBe('auto');
+    // Wraps cleanly rather than running off the end of the order array.
+    expect(localStorage.getItem('olla-theme')).toBeNull();
+  });
+});
