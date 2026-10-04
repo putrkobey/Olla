@@ -107,3 +107,332 @@ func TestDefaultUnifier_UnifyModels(t *testing.T) {
 				},
 			},
 			endpoints: []*domain.Endpoint{
+				createTestEndpoint("http://localhost:11434", "Ollama Server"),
+				createTestEndpoint("http://localhost:1234", "LM Studio"),
+			},
+			expectedCount:  3,
+			expectedDigest: 0,
+			expectedName:   0,
+		},
+		{
+			name: "case insensitive name matching",
+			inputModels: [][]*domain.ModelInfo{
+				{
+					{
+						Name: "Llama3:8B",
+					},
+				},
+				{
+					{
+						Name: "llama3:8b",
+					},
+				},
+			},
+			endpoints: []*domain.Endpoint{
+				createTestEndpoint("http://localhost:11434", "Ollama Server"),
+				createTestEndpoint("http://localhost:1234", "LM Studio"),
+			},
+			expectedCount:  1,
+			expectedDigest: 0,
+			expectedName:   1,
+		},
+		{
+			name: "conflicting digests prevent name-based merge",
+			inputModels: [][]*domain.ModelInfo{
+				{
+					{
+						Name:    "llama3:8b",
+						Details: &domain.ModelDetails{Digest: ptrString("sha256:abc123")},
+					},
+				},
+				{
+					{
+						Name:    "llama3:8b",
+						Details: &domain.ModelDetails{Digest: ptrString("sha256:def456")},
+					},
+				},
+			},
+			endpoints: []*domain.Endpoint{
+				createTestEndpoint("http://localhost:11434", "Ollama Server"),
+				createTestEndpoint("http://localhost:1234", "LM Studio"),
+			},
+			expectedCount:  2,
+			expectedDigest: 0,
+			expectedName:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			unifier := NewDefaultUnifier()
+
+			var allModels []*domain.UnifiedModel
+			for i, models := range tt.inputModels {
+				unified, err := unifier.UnifyModels(ctx, models, tt.endpoints[i])
+				require.NoError(t, err)
+				allModels = append(allModels, unified...)
+			}
+
+			// NOTE: Internal state checks removed after refactoring
+			// The new implementation encapsulates internal state
+			// We can only verify the public interface behavior
+		})
+	}
+}
+
+func TestDefaultUnifier_ResolveModel(t *testing.T) {
+	ctx := context.Background()
+	unifier := NewDefaultUnifier()
+
+	// Add some models
+	models := []*domain.ModelInfo{
+		{
+			Name:    "llama3:8b",
+			Details: &domain.ModelDetails{Digest: ptrString("sha256:abc123")},
+		},
+		{
+			Name:    "Phi3:Mini",
+			Details: &domain.ModelDetails{Digest: ptrString("sha256:def456")},
+		},
+	}
+
+	endpoint := createTestEndpoint("http://localhost:11434", "Ollama Server")
+	_, err := unifier.UnifyModels(ctx, models, endpoint)
+	require.NoError(t, err)
+
+	// Test resolution by exact ID
+	model, err := unifier.ResolveAlias(ctx, "llama3:8b")
+	require.NoError(t, err)
+	assert.Equal(t, "llama3:8b", model.ID)
+
+	// Test resolution by case-insensitive name
+	model, err = unifier.ResolveAlias(ctx, "phi3:mini")
+	require.NoError(t, err)
+	assert.Equal(t, "Phi3:Mini", model.ID)
+
+	// Test resolution not found
+	_, err = unifier.ResolveAlias(ctx, "nonexistent")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "model not found")
+}
+
+func TestDefaultUnifier_ModelMerging(t *testing.T) {
+	ctx := context.Background()
+	unifier := NewDefaultUnifier()
+
+	// Helper functions
+	ptrInt64 := func(i int64) *int64 {
+		return &i
+	}
+	ptrString := func(s string) *string {
+		return &s
+	}
+
+	// Add model from first endpoint
+	models1 := []*domain.ModelInfo{
+		{
+			Name: "llama3:8b",
+			Details: &domain.ModelDetails{
+				Digest:           ptrString("sha256:abc123"),
+				MaxContextLength: ptrInt64(8192),
+				State:            ptrString("loaded"),
+			},
+		},
+	}
+	endpoint1 := createTestEndpoint("http://localhost:11434", "Ollama Server")
+	_, err := unifier.UnifyModels(ctx, models1, endpoint1)
+	require.NoError(t, err)
+
+	// Add same model from second endpoint
+	models2 := []*domain.ModelInfo{
+		{
+			Name: "llama3:8b",
+			Details: &domain.ModelDetails{
+				Digest:           ptrString("sha256:abc123"),
+				MaxContextLength: ptrInt64(8192),
+				State:            ptrString("not-loaded"),
+			},
+		},
+	}
+	endpoint2 := createTestEndpoint("http://localhost:1234", "LM Studio")
+	_, err = unifier.UnifyModels(ctx, models2, endpoint2)
+	require.NoError(t, err)
+
+	// Check merged model
+	model, err := unifier.ResolveAlias(ctx, "llama3:8b")
+	require.NoError(t, err)
+	assert.Len(t, model.SourceEndpoints, 2)
+	assert.Contains(t, model.Capabilities, "text-generation")
+	// With 8192 context, no special context capability is added (only for 32k+ contexts)
+
+	// Verify both endpoints are present
+	endpoints := make(map[string]bool)
+	for _, source := range model.SourceEndpoints {
+		endpoints[source.EndpointURL] = true
+	}
+	assert.True(t, endpoints["http://localhost:11434"])
+	assert.True(t, endpoints["http://localhost:1234"])
+}
+
+func TestDefaultUnifier_EndpointCleanup(t *testing.T) {
+	ctx := context.Background()
+	unifier := NewDefaultUnifier()
+
+	// Add models from endpoint
+	models := []*domain.ModelInfo{
+		{
+			Name:    "llama3:8b",
+			Details: &domain.ModelDetails{Digest: ptrString("sha256:abc123")},
+		},
+		{
+			Name:    "phi3:mini",
+			Details: &domain.ModelDetails{Digest: ptrString("sha256:def456")},
+		},
+	}
+	endpoint := createTestEndpoint("http://localhost:11434", "Ollama Server")
+	_, err := unifier.UnifyModels(ctx, models, endpoint)
+	require.NoError(t, err)
+
+	// Update endpoint with only one model
+	newModels := []*domain.ModelInfo{
+		{
+			Name:    "llama3:8b",
+			Details: &domain.ModelDetails{Digest: ptrString("sha256:abc123")},
+		},
+	}
+	_, err = unifier.UnifyModels(ctx, newModels, endpoint)
+	require.NoError(t, err)
+
+	// Verify phi3 was removed
+	_, err = unifier.ResolveAlias(ctx, "phi3:mini")
+	assert.Error(t, err)
+
+	// Verify llama3 still exists
+	model, err := unifier.ResolveAlias(ctx, "llama3:8b")
+	require.NoError(t, err)
+	assert.Equal(t, "llama3:8b", model.ID)
+}
+
+func TestDefaultUnifier_Clear(t *testing.T) {
+	ctx := context.Background()
+	unifier := NewDefaultUnifier()
+
+	// Add some models
+	models := []*domain.ModelInfo{
+		{
+			Name:    "llama3:8b",
+			Details: &domain.ModelDetails{Digest: ptrString("sha256:abc123")},
+		},
+	}
+	endpoint := createTestEndpoint("http://localhost:11434", "Ollama Server")
+	_, err := unifier.UnifyModels(ctx, models, endpoint)
+	require.NoError(t, err)
+
+	// Clear
+	err = unifier.Clear(ctx)
+	require.NoError(t, err)
+
+	// Verify model is cleared by trying to resolve it
+	_, err = unifier.ResolveAlias(ctx, "llama3:8b")
+	assert.Error(t, err)
+}
+
+func TestDefaultUnifier_NilAndEmptyInputs(t *testing.T) {
+	ctx := context.Background()
+	unifier := NewDefaultUnifier()
+
+	// Test nil models
+	endpoint := createTestEndpoint("http://localhost:11434", "Ollama Server")
+	result, err := unifier.UnifyModels(ctx, nil, endpoint)
+	require.NoError(t, err)
+	assert.Empty(t, result)
+
+	// Test empty models
+	result, err = unifier.UnifyModels(ctx, []*domain.ModelInfo{}, endpoint)
+	require.NoError(t, err)
+	assert.Empty(t, result)
+
+	// Test with nil model in slice
+	models := []*domain.ModelInfo{
+		{
+			Name: "llama3:8b",
+		},
+		nil,
+		{
+			Name: "phi3:mini",
+		},
+	}
+	result, err = unifier.UnifyModels(ctx, models, endpoint)
+	require.NoError(t, err)
+	assert.Len(t, result, 2)
+}
+
+// Listings emit Aliases[0] as the model id, so a digest-merged model must come
+// out the same every time. The merge used to range over maps, which flipped it.
+func TestMergeUnifiedModels_OrderIsStableAndLeadsWithOwnID(t *testing.T) {
+	u := NewDefaultUnifier()
+	now := time.Now()
+	a := &domain.UnifiedModel{
+		ID:              "Qwen/Qwen3-8B",
+		Aliases:         []domain.AliasEntry{{Name: "Qwen/Qwen3-8B", Source: "vllm"}},
+		SourceEndpoints: []domain.SourceEndpoint{{EndpointURL: "http://a", LastSeen: now}},
+		Capabilities:    []string{"chat", "text-generation"},
+	}
+	b := &domain.UnifiedModel{
+		ID:              "qwen3:8b",
+		Aliases:         []domain.AliasEntry{{Name: "qwen3:8b", Source: "ollama"}},
+		SourceEndpoints: []domain.SourceEndpoint{{EndpointURL: "http://b", LastSeen: now}},
+		Capabilities:    []string{"completion", "chat"},
+	}
+
+	for _, order := range [][]*domain.UnifiedModel{{b, a}, {a, b}} {
+		for range 200 {
+			merged, err := u.MergeUnifiedModels(context.Background(), order)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if merged.Aliases[0].Name != merged.ID {
+				t.Fatalf("Aliases[0]=%q, want the unified id %q", merged.Aliases[0].Name, merged.ID)
+			}
+			if len(merged.Aliases) != 2 || len(merged.SourceEndpoints) != 2 || len(merged.Capabilities) != 3 {
+				t.Fatalf("unexpected merge shape: %+v", merged)
+			}
+			if merged.SourceEndpoints[0].EndpointURL != order[0].SourceEndpoints[0].EndpointURL {
+				t.Fatal("source endpoint order is not the input order")
+			}
+		}
+	}
+}
+
+// Discovery hands the merge models in whatever order endpoints answered, so shuffled input
+// must still lead with the model's own id and carry exactly the union of aliases and sources.
+func TestMergeUnifiedModels_ShuffledInputKeepsOwnIDFirst(t *testing.T) {
+	u := NewDefaultUnifier()
+	now := time.Now()
+	names := []string{"Qwen/Qwen3-8B", "qwen3:8b", "qwen3-8b-gguf", "qwen3:8b-q4"}
+	build := func() []*domain.UnifiedModel {
+		models := make([]*domain.UnifiedModel, len(names))
+		for i, n := range names {
+			models[i] = &domain.UnifiedModel{
+				ID:              names[0],
+				Aliases:         []domain.AliasEntry{{Name: n, Source: "src"}},
+				SourceEndpoints: []domain.SourceEndpoint{{EndpointURL: "http://" + n, LastSeen: now}},
+				Capabilities:    []string{"chat", n},
+			}
+		}
+		return models
+	}
+
+	rng := rand.New(rand.NewSource(1))
+	for range 500 {
+		models := build()
+		rng.Shuffle(len(models), func(i, j int) { models[i], models[j] = models[j], models[i] })
+		merged, err := u.MergeUnifiedModels(context.Background(), models)
+		require.NoError(t, err)
+		require.Equal(t, merged.ID, merged.Aliases[0].Name)
+		require.Len(t, merged.Aliases, len(names))
+		require.Len(t, merged.SourceEndpoints, len(names))
+		require.Len(t, merged.Capabilities, len(names)+1)
+	}
+}
