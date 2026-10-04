@@ -114,3 +114,120 @@ func BenchmarkGetModelsByCapability(b *testing.B) {
 	// Benchmark different capabilities
 	testCases := []string{"chat", "embeddings", "vision", "code", "streaming", "unknown"}
 
+	for _, capability := range testCases {
+		b.Run(capability, func(b *testing.B) {
+			b.ResetTimer()
+			b.ReportAllocs()
+			for range b.N {
+				models, err := registry.GetModelsByCapability(ctx, capability)
+				if err != nil {
+					b.Fatal(err)
+				}
+				_ = models
+			}
+		})
+	}
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			capIdx := 0
+			for pb.Next() {
+				capability := testCases[capIdx%len(testCases)]
+				models, err := registry.GetModelsByCapability(ctx, capability)
+				if err != nil {
+					b.Fatal(err)
+				}
+				_ = models
+				capIdx++
+			}
+		})
+	})
+}
+
+func BenchmarkRegistryWithXSync(b *testing.B) {
+	ctx := context.Background()
+	registry := createTestUnifiedRegistry()
+
+	// Benchmark concurrent model registration with xsync
+	b.Run("ConcurrentRegistration", func(b *testing.B) {
+		b.ResetTimer()
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				model := &domain.ModelInfo{
+					Name:     fmt.Sprintf("model-%d", i),
+					LastSeen: time.Now(),
+				}
+				endpoint := fmt.Sprintf("http://localhost:%d", 11434+(i%100))
+				err := registry.RegisterModel(ctx, endpoint, model)
+				if err != nil {
+					b.Fatal(err)
+				}
+				i++
+			}
+		})
+	})
+
+	// Benchmark concurrent reads with xsync
+	b.Run("ConcurrentReads", func(b *testing.B) {
+		// Pre-populate with some data
+		for i := range 100 {
+			model := &domain.ModelInfo{
+				Name:     fmt.Sprintf("read-model-%d", i),
+				LastSeen: time.Now(),
+			}
+			endpoint := fmt.Sprintf("http://localhost:%d", 11434+i)
+			registry.RegisterModel(ctx, endpoint, model)
+		}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				modelName := fmt.Sprintf("read-model-%d", i%100)
+				available := registry.IsModelAvailable(ctx, modelName)
+				_ = available
+				i++
+			}
+		})
+	})
+}
+
+func BenchmarkMemoryUsage(b *testing.B) {
+	ctx := context.Background()
+
+	// Test memory usage with different numbers of models
+	testSizes := []int{100, 1000, 10000}
+
+	for _, size := range testSizes {
+		b.Run(fmt.Sprintf("Models_%d", size), func(b *testing.B) {
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for range b.N {
+				b.StopTimer()
+				registry := createTestUnifiedRegistry()
+				b.StartTimer()
+
+				// Register models
+				for j := range size {
+					model := &domain.ModelInfo{
+						Name:        fmt.Sprintf("model-%d", j),
+						LastSeen:    time.Now(),
+						Size:        int64(j * 1024 * 1024), // Simulate different sizes
+						Description: fmt.Sprintf("Test model %d with some description text", j),
+					}
+					endpoint := fmt.Sprintf("http://localhost:%d", 11434+(j%10))
+					registry.RegisterModel(ctx, endpoint, model)
+				}
+
+				// Force a stats update to measure full memory impact
+				_, _ = registry.GetStats(ctx)
+			}
+		})
+	}
+}
