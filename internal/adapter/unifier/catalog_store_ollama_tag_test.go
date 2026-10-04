@@ -36,3 +36,42 @@ func TestCatalogResolveByName_OllamaDefaultTag(t *testing.T) {
 		}},
 		{"upper case resolves", "ALL-MINILM", "all-minilm:latest", func(t *testing.T, u ports.ModelUnifier) {
 			unifyOn(t, u, "ollama", "http://o:11434", "all-minilm:latest")
+		}},
+		{"tagged is unchanged", "all-minilm:latest", "all-minilm:latest", func(t *testing.T, u ports.ModelUnifier) {
+			unifyOn(t, u, "ollama", "http://o:11434", "all-minilm:latest")
+		}},
+		{"other tags are not latest", "qwen2.5", "", func(t *testing.T, u ports.ModelUnifier) {
+			unifyOn(t, u, "ollama", "http://o:11434", "qwen2.5:0.5b")
+		}},
+		{"vllm latest does not answer a bare name", "foo", "", func(t *testing.T, u ports.ModelUnifier) {
+			unifyOn(t, u, "vllm", "http://v:8000", "foo:latest")
+		}},
+		{"vllm bare does not answer latest", "foo:latest", "", func(t *testing.T, u ports.ModelUnifier) {
+			unifyOn(t, u, "vllm", "http://v:8000", "foo")
+		}},
+		{"exact vllm bare wins over ollama latest", "foo", "foo", func(t *testing.T, u ports.ModelUnifier) {
+			unifyOn(t, u, "ollama", "http://o:11434", "foo:latest")
+			unifyOn(t, u, "vllm", "http://v:8000", "foo")
+		}},
+		{"a merged model also served by ollama answers the bare name", "foo", "foo:latest", func(t *testing.T, u ports.ModelUnifier) {
+			unifyOn(t, u, "vllm", "http://v:8000", "foo:latest")
+			unifyOn(t, u, "ollama", "http://o:11434", "foo:latest")
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			u := NewDefaultUnifier()
+			tt.setup(t, u)
+
+			got, err := u.ResolveAlias(context.Background(), tt.query)
+			if tt.wantID == "" {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantID, got.ID)
+		})
+	}
+}
