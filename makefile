@@ -327,3 +327,332 @@ lint-web: install-web
 # Run vitest unit tests on the SPA.
 test-web: install-web
 	@echo "Running frontend tests..."
+	@cd $(WEB_DIR) && bun run test
+
+# Remove Vite's cache and the generated embed source (leaving only the
+# committed .gitkeep sentinel behind). Vite now writes straight into
+# $(EMBED_DIST) (see build-web), so there is no separate $(WEB_DIR)/dist to
+# clean any more.
+clean-web:
+	@echo "Cleaning frontend ephemeral build output..."
+	@rm -rf $(WEB_DIR)/node_modules/.cache $(WEB_DIR)/coverage
+	@rm -rf $(EMBED_DIST)/*
+	@touch $(EMBED_DIST)/.gitkeep
+	@echo "Frontend ephemeral output and embed source cleaned."
+
+# Guard against a repeat of the corrupt-font incident: a saved HTML error
+# page committed in place of a real .woff2 (wrong bytes, but a plausible
+# file size, so it passes casual review). Every .woff2 under the frontend
+# source and the built embed dist must start with the WOFF2 magic
+# (hex 774f4632 / ASCII "wOF2"), or CI fails loudly instead of shipping a
+# font that silently falls back to a system sans in every browser.
+check-fonts-web: build-web
+	@echo "Checking .woff2 files start with the WOFF2 magic bytes..."
+	@fail=0; \
+	for f in $$(find $(WEB_DIR)/src $(EMBED_DIST) -name '*.woff2' 2>/dev/null); do \
+		magic=$$(od -An -tx1 -N4 "$$f" | tr -d ' \n'); \
+		if [ "$$magic" != "774f4632" ]; then \
+			printf "\033[31m%s is not a WOFF2 file (magic: %s)\033[0m\n" "$$f" "$$magic"; \
+			fail=1; \
+		fi; \
+	done; \
+	if [ $$fail -eq 1 ]; then \
+		echo "One or more .woff2 files are corrupt or not actually fonts."; \
+		exit 1; \
+	else \
+		printf "\033[32mAll .woff2 files are genuine WOFF2.\033[0m\n"; \
+	fi
+
+# CI web gate: the SPA builds cleanly, its unit tests and type checks pass,
+# and every shipped font is a genuine WOFF2. The dist is gitignored, so there
+# is no committed-output staleness to check; a successful build-web is the
+# freshness signal. test-web, lint-web and build-web all depend on install-web,
+# so a clean checkout gets node_modules installed once (Make runs a shared
+# prerequisite only once per invocation) before any of the three run, and a
+# broken component still fails fast without waiting on the Vite build.
+# Deliberately NOT a dependency of `ready`: a fresh clone with no Bun
+# toolchain must still pass the Go gate, so these only run from `ci`/`ci-web`
+# and the GitHub Actions workflow.
+ci-web: test-web lint-web build-web check-fonts-web
+	@printf "\033[32mDashboard builds, tests, type-checks and fonts are valid.\033[0m\n"
+
+# Format code
+fmt:
+	@echo "Running go fmt..."
+	@go fmt ./...
+	@echo "Running go fmt...Done!"
+
+# Run go vet
+vet:
+	@echo "Running go vet..."
+	@go vet ./...
+	@echo "Running go vet...Done!"
+
+# Run linter
+lint:
+	@echo "Running golangci-lint..."
+	@if command -v golangci-lint > /dev/null 2>&1; then \
+		INSTALLED=$$(golangci-lint --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1); \
+		if [ "$$INSTALLED" = "$(GOLANGCI_LINT_VERSION)" ]; then \
+			printf "  Version: %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  Version: %s [require: %s \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(GOLANGCI_LINT_VERSION)"; \
+		fi; \
+		golangci-lint run --fix; \
+	else \
+		echo "golangci-lint not installed. Run 'make install-deps' or 'make check-deps' for more info."; \
+	fi
+	@echo "Running golangci-lint...Done!"
+
+# Run betteralign
+align:
+	@echo "Running better-align..."
+	@if command -v betteralign > /dev/null 2>&1; then \
+		INSTALLED=$$(go version -m "$$(go env GOPATH)/bin/betteralign$$(go env GOEXE)" 2>/dev/null | grep -E '^\s+mod' | awk '{print $$3}'); \
+		if [ "$$INSTALLED" = "$(BETTERALIGN_VERSION)" ]; then \
+			printf "  Version: %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  Version: %s [require: %s \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(BETTERALIGN_VERSION)"; \
+		fi; \
+		betteralign -apply ./...; \
+	else \
+		echo "betteralign not installed. Run 'make install-deps' or 'make check-deps' for more info."; \
+	fi
+	@echo "Running better-align...Done!"
+
+# Run betteralign in check-only mode (no -apply). CI uses this instead of
+# align - a passing build must mean the committed code is already aligned,
+# not that this run silently patched it in a workspace nothing commits from.
+align-check:
+	@echo "Running better-align (check only)..."
+	@if command -v betteralign > /dev/null 2>&1; then \
+		INSTALLED=$$(go version -m "$$(go env GOPATH)/bin/betteralign$$(go env GOEXE)" 2>/dev/null | grep -E '^\s+mod' | awk '{print $$3}'); \
+		if [ "$$INSTALLED" = "$(BETTERALIGN_VERSION)" ]; then \
+			printf "  Version: %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  Version: %s [require: %s \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(BETTERALIGN_VERSION)"; \
+		fi; \
+		output=$$(betteralign ./... 2>&1); \
+		if [ -n "$$output" ]; then \
+			echo "Struct alignment issues found:"; \
+			echo "$$output"; \
+			exit 1; \
+		fi; \
+	else \
+		echo "betteralign not installed. Run 'make install-deps' or 'make check-deps' for more info."; \
+		exit 1; \
+	fi
+	@echo "Running better-align (check only)...Done!"
+
+# Install dependencies at pinned versions
+install-deps:
+	@echo "Installing dependencies..."
+	@echo "  Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."
+	@go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	@echo "  Installing betteralign $(BETTERALIGN_VERSION)..."
+	@go install github.com/dkorunic/betteralign/cmd/betteralign@$(BETTERALIGN_VERSION)
+	@echo "Checking Bun toolchain (needed for build-web / install-web)..."
+	@if command -v bun > /dev/null 2>&1; then \
+		INSTALLED=$$(bun --version 2>/dev/null); \
+		MAJOR=$$(echo $$INSTALLED | cut -d. -f1); \
+		MINOR=$$(echo $$INSTALLED | cut -d. -f2); \
+		REQ_MAJOR=$$(echo "$(BUN_VERSION)" | cut -d. -f1); \
+		REQ_MINOR=$$(echo "$(BUN_VERSION)" | cut -d. -f2); \
+		if [ "$$MAJOR" -gt "$$REQ_MAJOR" ] || ([ "$$MAJOR" -eq "$$REQ_MAJOR" ] && [ "$$MINOR" -ge "$$REQ_MINOR" ]); then \
+			printf "  bun: %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  bun: %s [require: %s+ \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(BUN_VERSION)"; \
+			echo "  Install Bun $(BUN_VERSION)+ via https://bun.sh"; \
+		fi; \
+	else \
+		printf "  bun: not installed [require: %s+ \033[31m(pinned)\033[0m]\n" "$(BUN_VERSION)"; \
+		echo "  Install Bun $(BUN_VERSION)+ via https://bun.sh"; \
+	fi
+	@echo "Dependencies installed successfully!"
+
+# Check installed tool versions against requirements
+check-deps:
+	@echo "Checking dependencies..."
+	@if command -v golangci-lint > /dev/null 2>&1; then \
+		INSTALLED=$$(golangci-lint --version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1); \
+		if [ "$$INSTALLED" = "$(GOLANGCI_LINT_VERSION)" ]; then \
+			printf "  golangci-lint: %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  golangci-lint: %s [require: %s \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(GOLANGCI_LINT_VERSION)"; \
+		fi \
+	else \
+		printf "  golangci-lint: not installed [require: %s \033[31m(pinned)\033[0m]\n" "$(GOLANGCI_LINT_VERSION)"; \
+	fi
+	@if command -v betteralign > /dev/null 2>&1; then \
+		INSTALLED=$$(go version -m "$$(go env GOPATH)/bin/betteralign$$(go env GOEXE)" 2>/dev/null | grep -E '^\s+mod' | awk '{print $$3}'); \
+		if [ "$$INSTALLED" = "$(BETTERALIGN_VERSION)" ]; then \
+			printf "  betteralign: %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  betteralign: %s [require: %s \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(BETTERALIGN_VERSION)"; \
+		fi \
+	else \
+		printf "  betteralign: not installed [require: %s \033[31m(pinned)\033[0m]\n" "$(BETTERALIGN_VERSION)"; \
+	fi
+	@if command -v bun > /dev/null 2>&1; then \
+		INSTALLED=$$(bun --version 2>/dev/null); \
+		MAJOR=$$(echo $$INSTALLED | cut -d. -f1); \
+		MINOR=$$(echo $$INSTALLED | cut -d. -f2); \
+		REQ_MAJOR=$$(echo "$(BUN_VERSION)" | cut -d. -f1); \
+		REQ_MINOR=$$(echo "$(BUN_VERSION)" | cut -d. -f2); \
+		if [ "$$MAJOR" -gt "$$REQ_MAJOR" ] || ([ "$$MAJOR" -eq "$$REQ_MAJOR" ] && [ "$$MINOR" -ge "$$REQ_MINOR" ]); then \
+			printf "  bun:          %s \033[32m(verified)\033[0m\n" "$$INSTALLED"; \
+		else \
+			printf "  bun:          %s [require: %s+ \033[31m(pinned)\033[0m]\n" "$$INSTALLED" "$(BUN_VERSION)"; \
+		fi \
+	else \
+		printf "  bun:          not installed [require: %s+ \033[31m(pinned)\033[0m]\n" "$(BUN_VERSION)"; \
+	fi
+
+# Development build (no optimisations). build-web first so the dashboard
+# embed is fresh; see run/run-debug for the same reason.
+dev: build-web
+	@echo "Building development version..."
+	@go build $(LDFLAGS) -gcflags="all=-N -l" -o bin/olla-dev .
+
+# Run full CI pipeline locally. ci-web is included here (not in `ready`) so
+# `make ci` matches what the GitHub Actions workflow gates on; ready stays
+# Bun-free for a fresh clone with no Bun toolchain. test-race-cover replaces
+# the old test-race + test-cover pair (same test-race selection, one run
+# instead of two, and it produces the coverage.out CI uploads to Codecov).
+# `test` runs alongside it (no -short) so testing.Short()-gated tests -
+# stress and slow-shutdown cases skipped under -short - execute in at least
+# one gate; race-detection on the -short-eligible suite still comes from
+# test-race-cover.
+ci: deps fmt vet lint align-check test test-race-cover build ci-web
+	@echo "CI pipeline completed successfully!"
+
+# Docker compose up with local config
+docker-compose:
+	@echo "Starting with docker-compose..."
+	@docker-compose up
+
+# Run integration test scripts (requires running Olla instance)
+test-script-integration:
+	@echo "Running integration test scripts..."
+	@cd test/scripts && python integration/test-integration.py $(ARGS)
+
+## test-script-sticky: Run sticky session test scripts (requires running Olla instance)
+test-script-sticky:
+	@echo "Running sticky session test scripts..."
+	@cd test/scripts && python sticky/test-sticky-sessions.py $(ARGS)
+
+# ── AIMock helpers ────────────────────────────────────────────────────────────
+# These targets manage the three AIMock containers used by the sticky session
+# manual test harness. AIMock (ghcr.io/copilotkit/aimock) serves OpenAI and
+# Anthropic endpoints with embedded BACKEND:<id> markers so affinity tests can
+# confirm which instance handled each response.
+#
+# Ports: mock-instance-a=9300, mock-instance-b=9301, mock-instance-c=9302
+.PHONY: mock-up mock-down mock-status mock-logs
+
+## mock-up: Start AIMock instances and wait until all are healthy
+mock-up:
+	@echo "Starting AIMock instances..."
+	@docker compose -f test/mock/compose.yaml up -d --wait --wait-timeout 40
+	@echo "All 3 AIMock instances are healthy"
+
+## mock-down: Stop and remove AIMock containers and volumes
+mock-down:
+	@echo "Stopping AIMock instances..."
+	@docker compose -f test/mock/compose.yaml down -v
+
+## mock-status: Show running state of AIMock instances
+mock-status:
+	@docker compose -f test/mock/compose.yaml ps
+
+## mock-logs: Tail logs from all three AIMock instances
+mock-logs:
+	@docker compose -f test/mock/compose.yaml logs -f
+
+# ── Auth test helpers ─────────────────────────────────────────────────────────
+# These targets run the auth integration scripts that prove outbound credential
+# injection works end-to-end against the Go mock backend (test/cmd/mockbackend).
+# No Docker or AIMock required; the scripts spin up the mock backend in-process.
+
+## test-auth-bearer: Bearer token injection end-to-end (happy + failure paths)
+test-auth-bearer:
+	@echo "Running bearer auth integration test..."
+	@bash test/scripts/auth/auth-bearer.sh
+
+## test-auth-env-fatal: Missing env var must abort Olla startup with a clear error
+test-auth-env-fatal:
+	@echo "Running env-var-missing fatal startup test..."
+	@bash test/scripts/auth/auth-env-fatal.sh
+
+## test-auth-manual: Run all auth scripts that do not require Docker
+test-auth-manual:
+	@echo "Running all auth integration tests..."
+	@bash test/scripts/auth/auth-bearer.sh
+	@bash test/scripts/auth/auth-api-key.sh
+	@bash test/scripts/auth/auth-basic.sh
+	@bash test/scripts/auth/auth-headers-only.sh
+	@bash test/scripts/auth/auth-env-fatal.sh
+
+# Show help
+help:
+	@echo "Available targets:"
+	@echo "  build           - Build optimised binary with version info"
+	@echo "  build-release   - Build release binary (static, optimised)"
+	@echo "  run             - Run with version info"
+	@echo "  run-debug       - Run with debug logging"
+	@echo "  test            - Run all tests"
+	@echo "  test-verbose    - Run tests with verbose output"
+	@echo "  test-short      - Run short tests only"
+	@echo "  test-race       - Run tests with race detection"
+	@echo "  test-cover      - Run tests with coverage"
+	@echo "  test-stress     - Run comprehensive stress tests (may take 30+ seconds)"
+	@echo "  test-cover-html - Run tests with coverage and generate HTML report"
+	@echo "  bench           - Run all benchmarks"
+	@echo "  bench-repo      - Run repository benchmarks"
+	@echo "  bench-balancer  - Run balancer benchmarks"
+	@echo "  version         - Show version info that will be embedded"
+	@echo "  version-built   - Show version from built binary"
+	@echo "  dev             - Build development binary (with debug symbols)"
+	@echo "  clean           - Clean build artifacts and logs"
+	@echo "  deps            - Download and tidy dependencies"
+	@echo "  ready     		 - Make code ready for commit (test, fmt, vet, lint, align)"
+	@echo "  ready-tools     - Check code is ready with tools (fmt, vet, lint, align)"
+	@echo "  validate-linux  - Build and test Linux binaries (AMD64 + ARM64)"
+	@echo "  validate-darwin - Build and test macOS binaries (Intel + Apple Silicon)"
+	@echo "  validate-windows- Build and test Windows binaries (AMD64 + ARM64)"
+	@echo "  validate-all-platforms - Build all 6 platform combinations (local testing)"
+	@echo "  build-local     - Build binary only to ./build/olla (fast, for testing)"
+	@echo "  smoke-build-local - Check build-local from clean and dirty build/ (OLLA_SMOKE_OK=1)"
+	@echo "  build-snapshot  - Build full release to ./dist/ (archives, checksums, etc)"
+	@echo "  docker-build    - Build Docker images locally"
+	@echo "  docker-run      - Run Docker image with local config"
+	@echo "  docker-compose  - Run with docker-compose"
+	@echo "  release-test    - Test full release (binaries + docker + archives)"
+	@echo "  goreleaser-check- Check goreleaser configuration"
+	@echo "  fmt             - Format code"
+	@echo "  vet             - Run go vet static analysis"
+	@echo "  lint            - Run linter (requires golangci-lint)"
+	@echo "  align           - Run alignment checker (requires betteralign)"
+	@echo "  install-deps    - Install dependencies at pinned versions"
+	@echo "  check-deps      - Check installed tool versions against requirements"
+	@echo "  ci              - Run full CI pipeline locally"
+	@echo "  test-script-integration - Run integration test scripts (requires running Olla)"
+	@echo "  test-script-sticky      - Run sticky session test scripts (requires running Olla)"
+	@echo "  mock-up                 - Start AIMock instances and wait for health"
+	@echo "  mock-down               - Stop AIMock instances and remove volumes"
+	@echo "  mock-status             - Show AIMock container state"
+	@echo "  mock-logs               - Tail logs from all AIMock instances"
+	@echo "  test-auth-bearer        - Bearer token injection end-to-end (no Docker needed)"
+	@echo "  test-auth-env-fatal     - Missing env var aborts startup with a clear error"
+	@echo "  test-auth-manual        - All auth integration scripts (no Docker needed)"
+	@echo ""
+	@echo "Frontend:"
+	@echo "  build-web       - Build SPA into the gitignored embed source (run by build/release)"
+	@echo "  install-web     - Install frontend deps (bun install)"
+	@echo "  clean-web       - Remove Vite output, cache, and generated embed source"
+	@echo "  lint-web        - Run svelte-check on the SPA"
+	@echo "  test-web        - Run vitest unit tests on the SPA"
+	@echo "  check-fonts-web - Fail if any .woff2 is missing the WOFF2 magic bytes"
+	@echo "  ci-web          - CI gate: vitest + svelte-check + build + font-integrity (requires Bun; run by 'make ci', not 'make ready')"
+	@echo ""
+	@echo "  help            - Show this help"
