@@ -79,3 +79,85 @@ discovery:
         check_interval: 2s
         check_timeout: 1s
 
+      # ── two Ollamas: one reports capabilities in /api/tags, one is pre-0.30 ─
+      - url: "http://127.0.0.1:19441"
+        name: "mock-ollama-h"
+        type: "ollama"
+        priority: 100
+        model_url: "/api/tags"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+      - url: "http://127.0.0.1:19442"
+        name: "mock-ollama-i"
+        type: "ollama"
+        priority: 100
+        model_url: "/api/tags"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+
+      # ── non-Ollama hosts that speak Anthropic natively ──────────────────
+      - url: "http://127.0.0.1:19443"
+        name: "mock-vllm-j"
+        type: "vllm"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+      - url: "http://127.0.0.1:19444"
+        name: "mock-sglang-k"
+        type: "sglang"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+      - url: "http://127.0.0.1:19445"
+        name: "mock-lmdeploy-l"
+        type: "lmdeploy"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/health"
+        check_interval: 2s
+        check_timeout: 1s
+
+  model_discovery:
+    enabled: true
+    interval: 30s
+    timeout: 5s
+    concurrent_workers: 4
+    retry_attempts: 2
+    retry_backoff: 1s
+
+model_registry:
+  type: "memory"
+  enable_unifier: true
+  unification:
+    stale_threshold: 24h
+    cleanup_interval: 10m
+  routing_strategy:
+    # optimistic + all matches the main fleet; the capability stage narrows
+    # model-less requests before this strategy is consulted.
+    type: "optimistic"
+    options:
+      fallback_behavior: "all"
+      discovery_timeout: 2s
+      discovery_refresh_on_miss: false
+
+translators:
+  anthropic:
+    enabled: true
+    passthrough_enabled: true
+    max_message_size: 10485760
+    inspector:
+      enabled: false
+
+logging:
+  level: "info"
+  format: "text"
+  output: "stdout"
+
+engineering:
+  show_nerdstats: false
