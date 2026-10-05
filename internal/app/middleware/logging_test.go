@@ -275,3 +275,280 @@ func TestRedactQuery(t *testing.T) {
 			for _, hide := range tt.wantHide {
 				if strings.Contains(result, hide) {
 					t.Errorf("redactQuery(%q) = %q; should not contain %q", tt.input, result, hide)
+				}
+			}
+			for _, keep := range tt.wantKeep {
+				if keep != "" && !strings.Contains(result, keep) {
+					t.Errorf("redactQuery(%q) = %q; should contain %q", tt.input, result, keep)
+				}
+			}
+		})
+	}
+}
+
+// TestSanitiseRequestID verifies that inbound X-Request-ID values containing
+// log-injection characters or exceeding the length cap are rejected, while
+// well-formed IDs pass through unchanged.
+func TestSanitiseRequestID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		wantOut string // empty means a fresh ID should be generated (input rejected)
+	}{
+		{
+			name:    "valid alphanumeric ID passes through",
+			input:   "abc-def-1234",
+			wantOut: "abc-def-1234",
+		},
+		{
+			name:    "valid ID with printable ASCII passes through",
+			input:   "req_!@#$%^&*()_+[]{}|;:,.<>?",
+			wantOut: "req_!@#$%^&*()_+[]{}|;:,.<>?",
+		},
+		{
+			name:    "CR injection rejected",
+			input:   "valid\rmalicious",
+			wantOut: "",
+		},
+		{
+			name:    "LF injection rejected",
+			input:   "valid\nmalicious",
+			wantOut: "",
+		},
+		{
+			name:    "CRLF injection rejected",
+			input:   "valid\r\nX-Injected-Header: evil",
+			wantOut: "",
+		},
+		{
+			name:    "NUL byte rejected",
+			input:   "valid\x00nul",
+			wantOut: "",
+		},
+		{
+			name:    "tab rejected",
+			input:   "valid\tvalue",
+			wantOut: "",
+		},
+		{
+			name:    "space rejected",
+			input:   "valid value",
+			wantOut: "",
+		},
+		{
+			name:    "DEL (0x7F) rejected",
+			input:   "valid\x7Fvalue",
+			wantOut: "",
+		},
+		{
+			name:    "exactly maxRequestIDLength accepted",
+			input:   strings.Repeat("a", maxRequestIDLength),
+			wantOut: strings.Repeat("a", maxRequestIDLength),
+		},
+		{
+			name:    "maxRequestIDLength+1 rejected",
+			input:   strings.Repeat("a", maxRequestIDLength+1),
+			wantOut: "",
+		},
+		{
+			name:    "empty string returned as-is (caller generates fresh ID)",
+			input:   "",
+			wantOut: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := sanitiseRequestID(tt.input)
+			if got != tt.wantOut {
+				t.Errorf("sanitiseRequestID(%q) = %q, want %q", tt.input, got, tt.wantOut)
+			}
+		})
+	}
+}
+
+// TestCombinedLoggingMiddleware_InvalidRequestIDReplacedWithGenerated verifies
+// that a request carrying an X-Request-ID containing CRLF does not propagate the
+// injected value into the response or context; instead a fresh ID is generated.
+func TestCombinedLoggingMiddleware_InvalidRequestIDReplacedWithGenerated(t *testing.T) {
+	t.Parallel()
+
+	mockLogger := &mockStyledLogger{}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The context request ID must not contain the injected header value.
+		ctxID := GetRequestID(r.Context())
+		if strings.Contains(ctxID, "injected") {
+			t.Errorf("log-injection payload leaked into context request ID: %q", ctxID)
+		}
+		if strings.ContainsAny(ctxID, "\r\n") {
+			t.Errorf("context request ID contains CRLF: %q", ctxID)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mw := CombinedLoggingMiddleware(mockLogger)(handler)
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/health", nil)
+	req.Header.Set("X-Request-ID", "ok\r\nX-Injected: evil")
+
+	rr := httptest.NewRecorder()
+	mw.ServeHTTP(rr, req)
+
+	responseID := rr.Header().Get("X-Olla-Request-ID")
+	if strings.ContainsAny(responseID, "\r\n") {
+		t.Errorf("response X-Olla-Request-ID contains CRLF: %q", responseID)
+	}
+	if responseID == "" {
+		t.Error("response X-Olla-Request-ID must be non-empty even when the inbound ID is rejected")
+	}
+}
+
+// TestCombinedLoggingMiddleware_ValidRequestIDPreserved verifies that a clean
+// inbound X-Request-ID is echoed in the response header unchanged.
+func TestCombinedLoggingMiddleware_ValidRequestIDPreserved(t *testing.T) {
+	t.Parallel()
+
+	mockLogger := &mockStyledLogger{}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mw := CombinedLoggingMiddleware(mockLogger)(handler)
+
+	const cleanID = "my-clean-request-id-abc123"
+	req := httptest.NewRequest(http.MethodGet, "/internal/health", nil)
+	req.Header.Set("X-Request-ID", cleanID)
+
+	rr := httptest.NewRecorder()
+	mw.ServeHTTP(rr, req)
+
+	if got := rr.Header().Get("X-Olla-Request-ID"); got != cleanID {
+		t.Errorf("X-Olla-Request-ID = %q, want %q", got, cleanID)
+	}
+}
+
+// Mock styled logger for testing
+type mockStyledLogger struct {
+	underlying *slog.Logger
+}
+
+func (m *mockStyledLogger) Debug(msg string, args ...any)                                {}
+func (m *mockStyledLogger) Info(msg string, args ...any)                                 {}
+func (m *mockStyledLogger) Warn(msg string, args ...any)                                 {}
+func (m *mockStyledLogger) Error(msg string, args ...any)                                {}
+func (m *mockStyledLogger) ResetLine()                                                   {}
+func (m *mockStyledLogger) InfoWithStatus(msg string, status string, args ...any)        {}
+func (m *mockStyledLogger) InfoWithCount(msg string, count int, args ...any)             {}
+func (m *mockStyledLogger) InfoWithEndpoint(msg string, endpoint string, args ...any)    {}
+func (m *mockStyledLogger) InfoWithHealthCheck(msg string, endpoint string, args ...any) {}
+func (m *mockStyledLogger) InfoWithNumbers(msg string, numbers ...int64)                 {}
+func (m *mockStyledLogger) WarnWithEndpoint(msg string, endpoint string, args ...any)    {}
+func (m *mockStyledLogger) ErrorWithEndpoint(msg string, endpoint string, args ...any)   {}
+func (m *mockStyledLogger) InfoHealthy(msg string, endpoint string, args ...any)         {}
+func (m *mockStyledLogger) InfoHealthStatus(msg string, name string, status domain.EndpointStatus, args ...any) {
+}
+func (m *mockStyledLogger) GetUnderlying() *slog.Logger {
+	if m.underlying != nil {
+		return m.underlying
+	}
+	return slog.Default()
+}
+func (m *mockStyledLogger) WithRequestID(requestID string) logger.StyledLogger                  { return m }
+func (m *mockStyledLogger) InfoConfigChange(oldName, newName string)                            {}
+func (m *mockStyledLogger) WithAttrs(attrs ...slog.Attr) logger.StyledLogger                    { return m }
+func (m *mockStyledLogger) With(args ...any) logger.StyledLogger                                { return m }
+func (m *mockStyledLogger) InfoWithContext(msg string, endpoint string, ctx logger.LogContext)  {}
+func (m *mockStyledLogger) WarnWithContext(msg string, endpoint string, ctx logger.LogContext)  {}
+func (m *mockStyledLogger) ErrorWithContext(msg string, endpoint string, ctx logger.LogContext) {}
+
+// TestAccessLogLevel pins the level the access log resolves to per outcome.
+// The access log is the operator's audit record, so it must NOT quiet proxy
+// traffic: a proxy success now logs at Info (the regression this test guards
+// against is the proxy-success-quieting that previously demoted it to Debug),
+// and a proxy 4xx/5xx stays at Info. Only successful /internal/ polling is
+// demoted to Debug. See accessLogLevel / isQuietAccessOutcome in logging.go.
+//
+// Note on 5xx mapping: accessLogLevel is intentionally binary (Debug for
+// routine traffic, Info otherwise). Promoting 5xx to Warn/Error is a
+// behaviour change beyond this fix's scope; the operator-visible requirement
+// is "loud at default verbosity", which Info already satisfies.
+func TestAccessLogLevel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		status int
+		want   slog.Level
+	}{
+		// Proxy traffic: never quietened in the access log. Success is the
+		// audit-worthy outcome the security-practices doc relies on.
+		{"proxy success", http.MethodPost, "/olla/proxy/v1/chat/completions", http.StatusOK, slog.LevelInfo},
+		{"proxy not modified", http.MethodGet, "/olla/proxy/v1/models", http.StatusNotModified, slog.LevelInfo},
+		{"proxy server error", http.MethodPost, "/olla/proxy/v1/chat/completions", http.StatusInternalServerError, slog.LevelInfo},
+		{"proxy client error", http.MethodPost, "/olla/proxy/v1/chat/completions", http.StatusBadRequest, slog.LevelInfo},
+		{"/api/ proxy success", http.MethodPost, "/api/chat", http.StatusOK, slog.LevelInfo},
+
+		// /internal/ polling: still demoted when routine.
+		{"internal poll success", http.MethodGet, "/internal/health", http.StatusOK, slog.LevelDebug},
+		{"internal poll not modified", http.MethodGet, "/internal/health", http.StatusNotModified, slog.LevelDebug},
+		{"internal poll not found", http.MethodGet, "/internal/health", http.StatusNotFound, slog.LevelInfo},
+		{"internal poll server error", http.MethodGet, "/internal/status", http.StatusInternalServerError, slog.LevelInfo},
+		{"internal poll forbidden", http.MethodGet, "/internal/ui/", http.StatusForbidden, slog.LevelInfo},
+		// Non-GET/HEAD under /internal/ is never routine polling.
+		{"internal POST success", http.MethodPost, "/internal/status", http.StatusOK, slog.LevelInfo},
+
+		// Everything else logs at Info.
+		{"non-proxy non-internal success", http.MethodGet, "/version", http.StatusOK, slog.LevelInfo},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := accessLogLevel(tc.method, tc.path, tc.status)
+			if got != tc.want {
+				t.Errorf("accessLogLevel(%q, %q, %d) = %v, want %v",
+					tc.method, tc.path, tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConsolePollOutcomeStillQuietsProxy pins the invariant that the console
+// log path (isQuietPollOutcome) is SEPARATE from the access log and still
+// quietens proxy traffic regardless of status. The console has dedicated
+// proxy-handler logging of its own; do not let access-log fixes leak across.
+func TestConsolePollOutcomeStillQuietsProxy(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		status int
+		want   bool
+	}{
+		{"proxy success quieted on console", http.MethodPost, "/olla/proxy/v1/chat/completions", http.StatusOK, true},
+		{"proxy 500 still quieted on console", http.MethodPost, "/olla/proxy/v1/chat/completions", http.StatusInternalServerError, true},
+		{"internal poll success quieted", http.MethodGet, "/internal/health", http.StatusOK, true},
+		{"internal poll 500 not quieted", http.MethodGet, "/internal/status", http.StatusInternalServerError, false},
+		{"non-proxy non-internal not quieted", http.MethodGet, "/version", http.StatusOK, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := isQuietPollOutcome(tc.method, tc.path, tc.status)
+			if got != tc.want {
+				t.Errorf("isQuietPollOutcome(%q, %q, %d) = %v, want %v",
+					tc.method, tc.path, tc.status, got, tc.want)
+			}
+		})
+	}
+}
