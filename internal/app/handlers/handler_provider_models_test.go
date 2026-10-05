@@ -241,3 +241,246 @@ func TestProviderSpecificModelEndpoints(t *testing.T) {
 		},
 	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", tt.endpoint, nil)
+			w := httptest.NewRecorder()
+
+			// Call handler
+			tt.handler(w, req)
+
+			// Check response
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, constants.ContentTypeJSON, w.Header().Get(constants.HeaderContentType))
+
+			// Check format-specific response
+			tt.checkResponse(t, w.Body.Bytes())
+		})
+	}
+}
+
+// TestProviderModelFiltering tests that endpoints only return models from their provider type
+func TestProviderModelFiltering(t *testing.T) {
+	// Setup logger
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	styledLogger := logger.NewPlainStyledLogger(log)
+
+	// Create mixed endpoints
+	ollamaURL1, _ := url.Parse("http://ollama1:11434")
+	ollamaURL2, _ := url.Parse("http://ollama2:11434")
+	lmstudioURL, _ := url.Parse("http://lmstudio:1234")
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "ollama-1",
+			URL:       ollamaURL1,
+			URLString: ollamaURL1.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "ollama",
+		},
+		{
+			Name:      "ollama-2",
+			URL:       ollamaURL2,
+			URLString: ollamaURL2.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "ollama",
+		},
+		{
+			Name:      "lmstudio-1",
+			URL:       lmstudioURL,
+			URLString: lmstudioURL.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "lm-studio",
+		},
+	}
+
+	// Create registry
+	unifiedRegistry := registry.NewUnifiedMemoryModelRegistry(styledLogger, nil, nil, nil)
+	ctx := context.Background()
+
+	// Register endpoints
+	for _, ep := range endpoints {
+		unifiedRegistry.RegisterEndpoint(ep)
+	}
+
+	// Register different models on different providers
+	require.NoError(t, unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[0], []*domain.ModelInfo{{Name: "llama3:latest"}}))
+	require.NoError(t, unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[1], []*domain.ModelInfo{{Name: "mistral:latest"}}))
+	require.NoError(t, unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[2], []*domain.ModelInfo{{Name: "TheBloke/Llama-2-7B-Chat-GGUF"}}))
+
+	// Wait for async unification to complete
+	require.Eventually(t, func() bool {
+		models, err := unifiedRegistry.GetUnifiedModels(ctx)
+		return err == nil && len(models) >= 3
+	}, 5*time.Second, 10*time.Millisecond, "async unification did not complete")
+
+	// Create application
+	app := &Application{
+		modelRegistry:    unifiedRegistry,
+		repository:       &mockRepository{endpoints: endpoints},
+		converterFactory: converter.NewConverterFactory(),
+		logger:           styledLogger,
+	}
+
+	// Test Ollama endpoint returns only Ollama models
+	req := httptest.NewRequest("GET", "/olla/ollama/api/tags", nil)
+	w := httptest.NewRecorder()
+	app.ollamaModelsHandler(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var ollamaResponse converter.OllamaModelResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &ollamaResponse))
+	assert.Len(t, ollamaResponse.Models, 2) // llama3 and mistral from both ollama endpoints
+
+	// Test LM Studio endpoint returns only LM Studio models
+	req = httptest.NewRequest("GET", "/olla/lmstudio/v1/models", nil)
+	w = httptest.NewRecorder()
+	app.lmstudioOpenAIModelsHandler(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var lmstudioResponse converter.OpenAIModelResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &lmstudioResponse))
+	assert.Len(t, lmstudioResponse.Data, 1) // Only TheBloke model
+	assert.Equal(t, "TheBloke/Llama-2-7B-Chat-GGUF", lmstudioResponse.Data[0].ID)
+}
+
+// TestUnifiedModelsFormatFiltering tests that format parameter filters models by provider
+func TestUnifiedModelsFormatFiltering(t *testing.T) {
+	// Setup logger
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	styledLogger := logger.NewPlainStyledLogger(log)
+
+	// Create test endpoints with different providers
+	ollamaURL, _ := url.Parse("http://ollama:11434")
+	lmstudioURL, _ := url.Parse("http://lmstudio:1234")
+	openaiURL, _ := url.Parse("http://openai:8080")
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:      "ollama-1",
+			URL:       ollamaURL,
+			URLString: ollamaURL.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "ollama",
+		},
+		{
+			Name:      "lmstudio-1",
+			URL:       lmstudioURL,
+			URLString: lmstudioURL.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "lm-studio",
+		},
+		{
+			Name:      "openai-1",
+			URL:       openaiURL,
+			URLString: openaiURL.String(),
+			Status:    domain.StatusHealthy,
+			Type:      "openai",
+		},
+	}
+
+	// Create registry
+	unifiedRegistry := registry.NewUnifiedMemoryModelRegistry(styledLogger, nil, nil, nil)
+	ctx := context.Background()
+
+	// Register endpoints
+	for _, ep := range endpoints {
+		unifiedRegistry.RegisterEndpoint(ep)
+	}
+
+	// Register different models on different providers
+	require.NoError(t, unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[0],
+		[]*domain.ModelInfo{{Name: "llama3:latest"}, {Name: "mistral:latest"}}))
+	require.NoError(t, unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[1],
+		[]*domain.ModelInfo{{Name: "TheBloke/Llama-2-7B-Chat-GGUF"}}))
+	require.NoError(t, unifiedRegistry.RegisterModelsWithEndpoint(ctx, endpoints[2],
+		[]*domain.ModelInfo{{Name: "gpt-3.5-turbo"}, {Name: "gpt-4"}}))
+
+	// Wait for async unification to complete
+	require.Eventually(t, func() bool {
+		models, err := unifiedRegistry.GetUnifiedModels(ctx)
+		return err == nil && len(models) >= 5
+	}, 5*time.Second, 10*time.Millisecond, "async unification did not complete")
+
+	// Create application
+	app := &Application{
+		modelRegistry:    unifiedRegistry,
+		repository:       &mockRepository{endpoints: endpoints},
+		converterFactory: converter.NewConverterFactory(),
+		logger:           styledLogger,
+	}
+
+	tests := []struct {
+		name          string
+		query         string
+		expectedCount int
+		expectedIDs   []string
+	}{
+		{
+			name:          "no_filter_returns_all",
+			query:         "",
+			expectedCount: 5,
+			expectedIDs:   []string{"llama3:latest", "mistral:latest", "TheBloke/Llama-2-7B-Chat-GGUF", "gpt-3.5-turbo", "gpt-4"},
+		},
+		{
+			name:          "format_ollama_filters_models",
+			query:         "?format=ollama",
+			expectedCount: 2,
+			expectedIDs:   []string{"llama3:latest", "mistral:latest"},
+		},
+		{
+			name:          "format_lmstudio_filters_models",
+			query:         "?format=lmstudio",
+			expectedCount: 1,
+			expectedIDs:   []string{"TheBloke/Llama-2-7B-Chat-GGUF"},
+		},
+		{
+			name:          "format_openai_returns_all",
+			query:         "?format=openai",
+			expectedCount: 5,
+			expectedIDs:   []string{"llama3:latest", "mistral:latest", "TheBloke/Llama-2-7B-Chat-GGUF", "gpt-3.5-turbo", "gpt-4"},
+		},
+		{
+			name:          "format_unified_returns_all",
+			query:         "?format=unified",
+			expectedCount: 5,
+			expectedIDs:   []string{"llama3:latest", "mistral:latest", "TheBloke/Llama-2-7B-Chat-GGUF", "gpt-3.5-turbo", "gpt-4"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/olla/models"+tt.query, nil)
+			w := httptest.NewRecorder()
+
+			app.unifiedModelsHandler(w, req)
+
+			assert.Equal(t, http.StatusOK, w.Code)
+
+			// Check response based on format
+			if tt.query == "?format=ollama" {
+				// Ollama format returns a different structure
+				var ollamaResponse converter.OllamaModelResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &ollamaResponse))
+				assert.Len(t, ollamaResponse.Models, tt.expectedCount)
+			} else if tt.query == "?format=lmstudio" {
+				// LM Studio format returns a different structure
+				var lmstudioResponse converter.LMStudioModelResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &lmstudioResponse))
+				assert.Len(t, lmstudioResponse.Data, tt.expectedCount)
+			} else if tt.query == "?format=openai" {
+				// OpenAI format
+				var openaiResponse converter.OpenAIModelResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &openaiResponse))
+				assert.Len(t, openaiResponse.Data, tt.expectedCount)
+			} else {
+				// Unified format (default or explicit)
+				var response converter.UnifiedModelResponse
+				require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+				assert.Len(t, response.Data, tt.expectedCount)
+			}
+		})
+	}
+}
