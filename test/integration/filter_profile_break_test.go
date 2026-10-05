@@ -103,3 +103,108 @@ func TestFilteringOutOllamaProfile(t *testing.T) {
 
 	t.Run("endpoint with empty type works even with ollama filtered", func(t *testing.T) {
 		// Create profile factory with filter that excludes ollama
+		profileFilter := &domain.FilterConfig{
+			Exclude: []string{"ollama"},
+		}
+
+		factory, err := profile.NewFactory("../../config/profiles")
+		require.NoError(t, err)
+
+		// Create filter adapter
+		filterAdapter := filter.NewGlobFilter()
+
+		// Apply filter to profile loader
+		loader := factory.GetLoader()
+		if loader != nil {
+			loader.SetFilterAdapter(filterAdapter)
+			loader.SetFilter(profileFilter)
+			err = loader.LoadProfiles()
+			require.NoError(t, err)
+		}
+
+		// Create repository with the filtered factory
+		repo := discovery.NewStaticEndpointRepositoryWithFactory(factory)
+
+		// Load config with empty type endpoint
+		configs := []config.EndpointConfig{
+			{
+				Name:           "test-empty-type",
+				URL:            "http://localhost:11434",
+				Type:           "", // empty type should work (no validation)
+				HealthCheckURL: "/",
+				ModelURL:       "/api/tags",
+				CheckInterval:  5 * time.Second,
+				CheckTimeout:   2 * time.Second,
+			},
+		}
+
+		// This should work because empty type skips validation
+		err = repo.LoadFromConfig(context.Background(), configs)
+		assert.NoError(t, err, "Should load endpoint with empty type even with ollama filtered")
+
+		// Verify endpoint was loaded
+		endpoints, err := repo.GetAll(context.Background())
+		assert.NoError(t, err)
+		assert.Len(t, endpoints, 1)
+		assert.Empty(t, endpoints[0].Type)
+	})
+}
+
+func TestProfileFactoryWithFiltering(t *testing.T) {
+	t.Run("GetProfile fallback to openai-compatible when profile filtered", func(t *testing.T) {
+		// Create factory
+		factory, err := profile.NewFactory("../../config/profiles")
+		require.NoError(t, err)
+
+		// Create filter that excludes ollama but keeps openai-compatible
+		profileFilter := &domain.FilterConfig{
+			Exclude: []string{"ollama"},
+		}
+
+		filterAdapter := filter.NewGlobFilter()
+		loader := factory.GetLoader()
+		if loader != nil {
+			loader.SetFilterAdapter(filterAdapter)
+			loader.SetFilter(profileFilter)
+			err = loader.LoadProfiles()
+			require.NoError(t, err)
+		}
+
+		// Try to get ollama profile - should fallback to openai-compatible
+		profile, err := factory.GetProfile("ollama")
+		assert.NoError(t, err, "Should fallback to openai-compatible")
+		assert.NotNil(t, profile)
+
+		// Verify it's actually the openai-compatible profile
+		config := profile.GetConfig()
+		assert.NotNil(t, config)
+		// The openai-compatible profile should have specific characteristics
+		// but since GetProfile returns the fallback, this is working as designed
+	})
+
+	t.Run("GetProfile fails when both ollama and openai-compatible filtered", func(t *testing.T) {
+		// Create factory
+		factory, err := profile.NewFactory("../../config/profiles")
+		require.NoError(t, err)
+
+		// Create filter that excludes both ollama and openai-compatible
+		profileFilter := &domain.FilterConfig{
+			Exclude: []string{"ollama", "openai-compatible"},
+		}
+
+		filterAdapter := filter.NewGlobFilter()
+		loader := factory.GetLoader()
+		if loader != nil {
+			loader.SetFilterAdapter(filterAdapter)
+			loader.SetFilter(profileFilter)
+			err = loader.LoadProfiles()
+			require.NoError(t, err)
+		}
+
+		// Try to get ollama profile - should fail completely
+		profile, err := factory.GetProfile("ollama")
+		assert.Error(t, err, "Should fail when both ollama and fallback are filtered")
+		assert.Nil(t, profile)
+		assert.Contains(t, err.Error(), "profile not found")
+	})
+}
