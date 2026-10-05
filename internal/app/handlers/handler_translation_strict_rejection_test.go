@@ -34,3 +34,147 @@ func TestTranslationHandler_StrictRejection_DecisionAwareStatusAndHeaders(t *tes
 	chain := inspector.NewChain(styledLog)
 	bodyInspector, err := inspector.NewBodyInspector(styledLog)
 	require.NoError(t, err)
+	chain.AddInspector(bodyInspector)
+
+	trans, err := anthropic.NewTranslator(styledLog, config.AnthropicTranslatorConfig{})
+	require.NoError(t, err)
+
+	// Strict registry: the requested model exists nowhere in the fleet, so
+	// GetRoutableEndpointsForModel rejects with a genuine strict decision
+	// (action "rejected", reason model_not_found, status 404).
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{},
+		strict:            true,
+	}
+
+	app := &Application{
+		Config:           &config.Config{},
+		logger:           styledLog,
+		inspectorChain:   chain,
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		modelRegistry:    modelRegistry,
+		statsCollector:   &mockStatsCollector{},
+		proxyService: &mockProxyService{
+			proxyFunc: nil, // must never be reached
+		},
+	}
+
+	body := `{"model":"claude-not-registered","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w := httptest.NewRecorder()
+
+	app.translationHandler(trans).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusNotFound, w.Code, "must use the decision's status code, not a hardcoded default")
+	assert.Equal(t, "strict", w.Header().Get(constants.HeaderXOllaRoutingStrategy))
+	assert.Equal(t, "rejected", w.Header().Get(constants.HeaderXOllaRoutingDecision))
+	assert.Equal(t, "model_not_found", w.Header().Get(constants.HeaderXOllaRoutingReason))
+
+	// Anthropic-shaped JSON error body must be preserved - the route must never
+	// fall back to the plain-text writeNoRoutableEndpoints format.
+	var errResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	assert.Equal(t, "error", errResp["type"])
+	errObj, ok := errResp["error"].(map[string]interface{})
+	require.True(t, ok, "response must carry an Anthropic-shaped error object")
+	assert.Equal(t, "not_found_error", errObj["type"], "404 must map to Anthropic's not_found_error type")
+}
+
+// TestTranslationHandler_StrictRejection_ModelUnavailableMaps503 proves the 503 case
+// (model exists but only on unhealthy endpoints) also survives to the translation route,
+// where it previously would have been flattened to 404.
+func TestTranslationHandler_StrictRejection_ModelUnavailableMaps503(t *testing.T) {
+	t.Parallel()
+
+	styledLog := &mockStyledLogger{}
+
+	chain := inspector.NewChain(styledLog)
+	bodyInspector, err := inspector.NewBodyInspector(styledLog)
+	require.NoError(t, err)
+	chain.AddInspector(bodyInspector)
+
+	trans, err := anthropic.NewTranslator(styledLog, config.AnthropicTranslatorConfig{})
+	require.NoError(t, err)
+
+	// Model is known to the fleet but not present on the one healthy candidate returned
+	// by mockDiscoveryServiceForTranslation, so the strict registry rejects with 503.
+	modelRegistry := &mockSimpleModelRegistry{
+		endpointsForModel: map[string][]string{
+			"claude-somewhere-else": {"http://some-other-host:9999"},
+		},
+		strict: true,
+	}
+
+	app := &Application{
+		Config:           &config.Config{},
+		logger:           styledLog,
+		inspectorChain:   chain,
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		modelRegistry:    modelRegistry,
+		statsCollector:   &mockStatsCollector{},
+		proxyService: &mockProxyService{
+			proxyFunc: nil,
+		},
+	}
+
+	body := `{"model":"claude-somewhere-else","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w := httptest.NewRecorder()
+
+	app.translationHandler(trans).ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, w.Code, "model_unavailable must map to 503, not the hardcoded 404 default")
+	assert.Equal(t, "strict", w.Header().Get(constants.HeaderXOllaRoutingStrategy))
+	assert.Equal(t, "rejected", w.Header().Get(constants.HeaderXOllaRoutingDecision))
+	assert.Equal(t, "model_unavailable", w.Header().Get(constants.HeaderXOllaRoutingReason))
+
+	var errResp map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &errResp))
+	errObj, ok := errResp["error"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, "api_error", errObj["type"], "503 falls back to the generic api_error type per the Anthropic taxonomy")
+}
+
+// Repeated strict-routing rejections on the Anthropic route must stay bounded: the sampled
+// "Request rejected" line is the only diagnostic, not an ERROR per request on top of it.
+func TestTranslationHandler_StrictRejectionFloodLogsBounded(t *testing.T) {
+	t.Parallel()
+
+	log := newWarnCounter()
+	chain := inspector.NewChain(log)
+	bodyInspector, err := inspector.NewBodyInspector(log)
+	require.NoError(t, err)
+	chain.AddInspector(bodyInspector)
+
+	trans, err := anthropic.NewTranslator(log, config.AnthropicTranslatorConfig{})
+	require.NoError(t, err)
+
+	app := &Application{
+		Config:           &config.Config{},
+		logger:           log,
+		rejectLog:        newRejectLogs(log, nil),
+		inspectorChain:   chain,
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		modelRegistry:    &mockSimpleModelRegistry{endpointsForModel: map[string][]string{}, strict: true},
+		statsCollector:   &mockStatsCollector{},
+		proxyService:     &mockProxyService{},
+	}
+	h := app.translationHandler(trans)
+
+	const total = 300
+	for range total {
+		body := `{"model":"claude-not-registered","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`
+		req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(body))
+		req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		req.RemoteAddr = "203.0.113.7:4000"
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		require.Equal(t, http.StatusNotFound, w.Code)
+	}
+
+	assert.Equal(t, 1, log.count("Request rejected"))
+	assert.Zero(t, log.errorTotal(), "no ERROR of any message per rejection")
+	assert.Zero(t, log.count("Model routing rejected request"))
+}
