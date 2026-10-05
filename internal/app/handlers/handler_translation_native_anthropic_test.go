@@ -45,3 +45,97 @@ func postNativeAnthropic(t *testing.T, typ, body string, passthrough bool) (*htt
 	bodyInspector, err := inspector.NewBodyInspector(log)
 	require.NoError(t, err)
 	chain.AddInspector(bodyInspector)
+	trans, err := anthropic.NewTranslator(log, config.AnthropicTranslatorConfig{PassthroughEnabled: passthrough})
+	require.NoError(t, err)
+
+	mk := func(name, typ string) *domain.Endpoint {
+		raw := "http://" + name + ".test:8080"
+		u, _ := url.Parse(raw)
+		return &domain.Endpoint{Name: name, Type: typ, URL: u, URLString: raw, Status: domain.StatusHealthy}
+	}
+	fleet := []*domain.Endpoint{mk("ollama-1", domain.ProfileOllama), mk("target-1", typ)}
+
+	var offered []string
+	var forwardedPath string
+	app := &Application{
+		Config:         &config.Config{},
+		logger:         log,
+		inspectorChain: chain,
+		profileFactory: factory,
+		profileLookup:  factory,
+		discoveryService: &mockDiscoveryServiceWithFunc{getHealthyEndpointsFunc: func(context.Context) ([]*domain.Endpoint, error) {
+			return fleet, nil
+		}},
+		modelRegistry:  &mockSimpleModelRegistry{strict: true, endpointsForModel: map[string][]string{"native-model": {fleet[1].URLString}}},
+		statsCollector: &mockStatsCollector{},
+		proxyService: &mockProxyService{proxyFunc: func(_ context.Context, w http.ResponseWriter, r *http.Request, eps []*domain.Endpoint, _ *ports.RequestStats, _ logger.StyledLogger) error {
+			offered = offeredNames(eps)
+			forwardedPath = r.URL.Path
+			w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+			return nil
+		}},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/olla/anthropic/v1/messages", strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w := httptest.NewRecorder()
+	app.translationHandler(trans).ServeHTTP(w, req)
+	return w, offered, forwardedPath
+}
+
+func TestTranslationHandler_NativeAnthropic_SGLangAndLMDeployPassThrough(t *testing.T) {
+	t.Parallel()
+
+	for _, typ := range []string{domain.ProfileSGLang, domain.ProfileLMDeploy} {
+		t.Run(typ+"/passthrough", func(t *testing.T) {
+			t.Parallel()
+			w, offered, path := postNativeAnthropic(t, typ, nativeAnthropicPlainBody, true)
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, []string{"target-1"}, offered)
+			assert.Equal(t, string(constants.TranslatorModePassthrough), w.Header().Get(constants.HeaderXOllaMode))
+			assert.Equal(t, "/v1/messages", path)
+		})
+		t.Run(typ+"/translation when passthrough is globally off", func(t *testing.T) {
+			t.Parallel()
+			w, offered, path := postNativeAnthropic(t, typ, nativeAnthropicPlainBody, false)
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, []string{"target-1"}, offered)
+			assert.Empty(t, w.Header().Get(constants.HeaderXOllaMode))
+			assert.Equal(t, "/v1/chat/completions", path)
+		})
+	}
+}
+
+// SGLang takes tools natively; LMDeploy before 0.18 answers them with a
+// NotImplementedError, so its profile declares no_tool_use.
+func TestTranslationHandler_NativeAnthropic_ToolRequests(t *testing.T) {
+	t.Parallel()
+
+	t.Run("sglang tools pass through", func(t *testing.T) {
+		t.Parallel()
+		w, _, path := postNativeAnthropic(t, domain.ProfileSGLang, nativeAnthropicToolsBody, true)
+		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		assert.Equal(t, string(constants.TranslatorModePassthrough), w.Header().Get(constants.HeaderXOllaMode))
+		assert.Equal(t, "/v1/messages", path)
+	})
+	t.Run("lmdeploy tools translate", func(t *testing.T) {
+		t.Parallel()
+		w, offered, path := postNativeAnthropic(t, domain.ProfileLMDeploy, nativeAnthropicToolsBody, true)
+		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		assert.Equal(t, []string{"target-1"}, offered)
+		assert.Empty(t, w.Header().Get(constants.HeaderXOllaMode))
+		assert.Equal(t, "/v1/chat/completions", path)
+	})
+}
+
+// LMDeploy before 0.18 rejects tool_choice even when no tools are sent.
+func TestTranslationHandler_NativeAnthropic_LMDeployToolChoiceWithoutTools(t *testing.T) {
+	t.Parallel()
+
+	w, _, path := postNativeAnthropic(t, domain.ProfileLMDeploy, nativeAnthropicToolChoiceBody, true)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Empty(t, w.Header().Get(constants.HeaderXOllaMode))
+	assert.Equal(t, "/v1/chat/completions", path)
+}

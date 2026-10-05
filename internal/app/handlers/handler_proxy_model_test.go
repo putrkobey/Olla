@@ -140,3 +140,146 @@ func TestBodyInspectorIntegration(t *testing.T) {
 		},
 		{
 			name:          "Extracts model from Ollama format",
+			path:          "/api/generate",
+			body:          `{"model": "llama3.1:8b", "prompt": "Hello"}`,
+			expectedModel: "llama3.1:8b",
+		},
+		{
+			name:          "No model in request",
+			path:          "/v1/chat/completions",
+			body:          `{"messages": []}`,
+			expectedModel: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create request
+			req := httptest.NewRequest("POST", tt.path, bytes.NewBufferString(tt.body))
+			req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+
+			// Inspect
+			profile, err := chain.Inspect(context.Background(), req, tt.path)
+			require.NoError(t, err)
+
+			// Verify model extraction
+			assert.Equal(t, tt.expectedModel, profile.ModelName)
+
+			// Verify body is still readable
+			body, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			assert.Equal(t, tt.body, string(body))
+		})
+	}
+}
+
+// Simple mock implementations for testing
+type mockStyledLogger struct {
+	underlying *slog.Logger
+}
+
+func (m *mockStyledLogger) Debug(msg string, args ...any)                                {}
+func (m *mockStyledLogger) Info(msg string, args ...any)                                 {}
+func (m *mockStyledLogger) Warn(msg string, args ...any)                                 {}
+func (m *mockStyledLogger) Error(msg string, args ...any)                                {}
+func (m *mockStyledLogger) ResetLine()                                                   {}
+func (m *mockStyledLogger) InfoWithStatus(msg string, status string, args ...any)        {}
+func (m *mockStyledLogger) InfoWithCount(msg string, count int, args ...any)             {}
+func (m *mockStyledLogger) InfoWithEndpoint(msg string, endpoint string, args ...any)    {}
+func (m *mockStyledLogger) InfoWithHealthCheck(msg string, endpoint string, args ...any) {}
+func (m *mockStyledLogger) InfoWithNumbers(msg string, numbers ...int64)                 {}
+func (m *mockStyledLogger) WarnWithEndpoint(msg string, endpoint string, args ...any)    {}
+func (m *mockStyledLogger) ErrorWithEndpoint(msg string, endpoint string, args ...any)   {}
+func (m *mockStyledLogger) InfoHealthy(msg string, endpoint string, args ...any)         {}
+func (m *mockStyledLogger) InfoHealthStatus(msg string, name string, status domain.EndpointStatus, args ...any) {
+}
+func (m *mockStyledLogger) GetUnderlying() *slog.Logger                                         { return m.underlying }
+func (m *mockStyledLogger) WithRequestID(requestID string) logger.StyledLogger                  { return m }
+func (m *mockStyledLogger) WithPrefix(prefix string) logger.StyledLogger                        { return m }
+func (m *mockStyledLogger) WithAttrs(attrs ...slog.Attr) logger.StyledLogger                    { return m }
+func (m *mockStyledLogger) With(args ...any) logger.StyledLogger                                { return m }
+func (m *mockStyledLogger) InfoWithContext(msg string, endpoint string, ctx logger.LogContext)  {}
+func (m *mockStyledLogger) WarnWithContext(msg string, endpoint string, ctx logger.LogContext)  {}
+func (m *mockStyledLogger) ErrorWithContext(msg string, endpoint string, ctx logger.LogContext) {}
+func (m *mockStyledLogger) InfoConfigChange(oldName, newName string)                            {}
+
+type mockSimpleModelRegistry struct {
+	baseMockRegistry
+	endpointsForModel map[string][]string
+	// strict switches GetRoutableEndpointsForModel to genuine strict-routing
+	// behaviour (reject with nil endpoints) instead of the default fallback-to-all
+	// used by most existing tests. Defaults to false so current callers are unaffected.
+	strict bool
+}
+
+func (m *mockSimpleModelRegistry) GetEndpointsForModel(ctx context.Context, modelName string) ([]string, error) {
+	if endpoints, ok := m.endpointsForModel[modelName]; ok {
+		return endpoints, nil
+	}
+	return []string{}, nil
+}
+
+func (m *mockSimpleModelRegistry) IsModelAvailable(ctx context.Context, modelName string) bool {
+	_, ok := m.endpointsForModel[modelName]
+	return ok
+}
+
+func (m *mockSimpleModelRegistry) GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
+	modelEndpoints, _ := m.GetEndpointsForModel(ctx, modelName)
+
+	if len(modelEndpoints) == 0 {
+		if m.strict {
+			// genuine strict routing: model nowhere in the fleet, reject with no endpoints
+			return nil, &domain.ModelRoutingDecision{
+				Strategy:   "strict",
+				Action:     "rejected",
+				Reason:     "model_not_found",
+				StatusCode: 404,
+			}, fmt.Errorf("model %s not found on any endpoint", modelName)
+		}
+
+		// default (most existing tests): return all healthy as fallback
+		return healthyEndpoints, &domain.ModelRoutingDecision{
+			Strategy: "test",
+			Action:   "fallback",
+			Reason:   "model not found",
+		}, nil
+	}
+
+	// filter to only endpoints with the model
+	modelEndpointMap := make(map[string]bool)
+	for _, url := range modelEndpoints {
+		modelEndpointMap[url] = true
+	}
+
+	var routable []*domain.Endpoint
+	for _, endpoint := range healthyEndpoints {
+		if modelEndpointMap[endpoint.URLString] {
+			routable = append(routable, endpoint)
+		}
+	}
+
+	if len(routable) == 0 {
+		if m.strict {
+			return nil, &domain.ModelRoutingDecision{
+				Strategy:   "strict",
+				Action:     "rejected",
+				Reason:     "model_unavailable",
+				StatusCode: 503,
+			}, fmt.Errorf("model %s only available on unhealthy endpoints", modelName)
+		}
+
+		// model only on unhealthy endpoints; fallback for test compatibility
+		return healthyEndpoints, &domain.ModelRoutingDecision{
+			Strategy: "test",
+			Action:   "fallback",
+			Reason:   "model unavailable",
+		}, nil
+	}
+
+	return routable, &domain.ModelRoutingDecision{
+		Strategy: "test",
+		Action:   "routed",
+		Reason:   "model found",
+	}, nil
+}
