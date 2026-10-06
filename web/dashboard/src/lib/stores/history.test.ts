@@ -115,3 +115,121 @@ describe('history.append delta math', () => {
     vi.setSystemTime(1_000);
     history.append(makeStatus({ total_requests: 200 }));
     vi.setSystemTime(6_000);
+    // start_time UNCHANGED but counters went backwards: a malformed backend or
+    // a counter wrap. Must not render as a negative rate.
+    history.append(makeStatus({ total_requests: 50 }));
+    expect(history.samples[1].reqPerSec).toBe(0);
+  });
+});
+
+describe('history.append restart detection', () => {
+  it('keeps the buffer and re-seeds the baseline when start_time changes', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    history.append(makeStatus({ start_time: '2026-01-01T00:00:00Z', total_requests: 100 }));
+    vi.setSystemTime(6_000);
+    history.append(makeStatus({ start_time: '2026-01-01T00:00:00Z', total_requests: 110 }));
+    expect(history.length).toBe(2);
+
+    // Process restarted: counters reset, but the history (and any outage
+    // markers) is retained so recovery doesn't hide what just happened.
+    // Only the delta baseline re-seeds, so the first post-restart sample
+    // is a zero-rate fresh start.
+    vi.setSystemTime(11_000);
+    history.append(makeStatus({ start_time: '2026-01-02T00:00:00Z', total_requests: 5 }));
+    expect(history.length).toBe(3);
+    const last = history.samples[2];
+    expect(last.totalRequests).toBe(5);
+    expect(last.reqPerSec).toBe(0); // fresh zero-delta baseline
+    expect(history.samples[0].totalRequests).toBe(100); // pre-restart sample retained
+  });
+
+  it('re-seeds the baseline when the gap since the last sample is large', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    history.append(makeStatus({ total_requests: 100 }));
+    // Panel hidden for 60 s: the next delta would be a huge per-second spike
+    // over a period the user wasn't even watching.
+    vi.setSystemTime(61_000);
+    history.append(makeStatus({ total_requests: 600 }));
+    expect(history.samples[1].reqPerSec).toBe(0); // stale baseline re-seeded
+  });
+});
+
+describe('history ring buffer', () => {
+  it('caps at MAX_SAMPLES and evicts the oldest', () => {
+    for (let i = 0; i <= MAX_SAMPLES; i++) {
+      history.append(makeStatus({ total_requests: i }));
+    }
+    expect(history.length).toBe(MAX_SAMPLES);
+    // The i=0 sample was evicted; i=1 is now the oldest.
+    expect(history.samples[0].totalRequests).toBe(1);
+    expect(history.samples[MAX_SAMPLES - 1].totalRequests).toBe(MAX_SAMPLES);
+  });
+});
+
+describe('history.appendError (failed-poll markers)', () => {
+  it('pushes an error sample with no counter data', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    history.appendError();
+    expect(history.length).toBe(1);
+    expect(history.samples[0].error).toBe(true);
+    expect(history.samples[0].reqPerSec).toBe(0);
+    expect(history.samples[0].activeConnections).toBe(0);
+  });
+
+  it('does NOT update prev: the next good sample deltas against the last good baseline', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    history.append(makeStatus({ total_requests: 100 }));
+    vi.setSystemTime(6_000);
+    history.appendError(); // outage tick at 6 s
+    vi.setSystemTime(11_000);
+    history.append(makeStatus({ total_requests: 130 }));
+    // prev was NOT updated by the error tick, so the delta is 30 requests
+    // over 10 s (1 s -> 11 s) = 3 req/s, not a counter-reset zero.
+    expect(history.samples[2].reqPerSec).toBe(3);
+  });
+
+  it('keeps the stale-gap guard inactive across a visible outage', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    history.append(makeStatus({ total_requests: 100 }));
+    // Simulate 5 consecutive failed ticks at 5 s cadence (25 s total, under
+    // the 30 s stale-gap threshold but close). Each error updates lastSampleT.
+    for (let s = 6_000; s <= 26_000; s += 5_000) {
+      vi.setSystemTime(s);
+      history.appendError();
+    }
+    // Recovery tick at 31 s. Without the lastSampleT fix, prev.t (1 s) is
+    // >30 s ago and the stale-gap guard would zero the baseline, losing the
+    // real rate across the outage. The error ticks kept the timeline alive.
+    vi.setSystemTime(31_000);
+    history.append(makeStatus({ total_requests: 250 }));
+    const last = history.samples[history.samples.length - 1];
+    // 150 requests over 30 s = 5 req/s. If the guard had fired, this would
+    // be 0.
+    expect(last.reqPerSec).toBe(5);
+  });
+
+  it('does not trigger restart detection (start_time unchanged by errors)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    history.append(makeStatus({ start_time: '2026-01-01T00:00:00Z', total_requests: 100 }));
+    vi.setSystemTime(6_000);
+    history.appendError();
+    vi.setSystemTime(11_000);
+    // Same start_time: must NOT reset the buffer.
+    history.append(makeStatus({ start_time: '2026-01-01T00:00:00Z', total_requests: 110 }));
+    expect(history.length).toBe(3); // not reset
+  });
+
+  it('error samples are capped by the ring buffer like any other', () => {
+    for (let i = 0; i <= MAX_SAMPLES; i++) {
+      history.appendError();
+    }
+    expect(history.length).toBe(MAX_SAMPLES);
+    expect(history.samples.every((s) => s.error)).toBe(true);
+  });
+});
