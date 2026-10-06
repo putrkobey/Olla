@@ -87,3 +87,270 @@ func (p *ConfigurableProfile) GetModelResponseFormat() domain.ModelResponseForma
 	}
 }
 
+func (p *ConfigurableProfile) GetDetectionHints() domain.DetectionHints {
+	return domain.DetectionHints{
+		UserAgentPatterns: p.config.Detection.UserAgentPatterns,
+		ResponseHeaders:   p.config.Detection.Headers,
+		PathIndicators:    p.config.Detection.PathIndicators,
+	}
+}
+
+func (p *ConfigurableProfile) ParseModelsResponse(data []byte) ([]*domain.ModelInfo, error) {
+	if p.modelParser == nil {
+		return nil, fmt.Errorf("no model parser configured for format: %s", p.config.Request.ResponseFormat)
+	}
+	return p.modelParser.Parse(data)
+}
+
+func (p *ConfigurableProfile) GetTimeout() time.Duration {
+	if p.config.Characteristics.Timeout == 0 {
+		return 2 * time.Minute
+	}
+	return p.config.Characteristics.Timeout
+}
+
+func (p *ConfigurableProfile) GetMaxConcurrentRequests() int {
+	if p.config.Characteristics.MaxConcurrentRequests == 0 {
+		return 10
+	}
+	return p.config.Characteristics.MaxConcurrentRequests
+}
+
+func (p *ConfigurableProfile) GetDefaultPriority() int {
+	if p.config.Characteristics.DefaultPriority == 0 {
+		return 50
+	}
+	return p.config.Characteristics.DefaultPriority
+}
+
+func (p *ConfigurableProfile) GetConfig() *domain.ProfileConfig {
+	return p.config
+}
+
+func (p *ConfigurableProfile) ValidateEndpoint(endpoint *domain.Endpoint) error {
+	if endpoint.URL == nil {
+		return fmt.Errorf("%s endpoint requires URL", p.config.Name)
+	}
+
+	// ollama defaults to http, but we need to be explicit for safety
+	if endpoint.URL.Scheme == "" {
+		return fmt.Errorf("%s endpoint URL must include scheme (http:// or https://)", p.config.Name)
+	}
+
+	return nil
+}
+
+// InferenceProfile implementation
+
+func (p *ConfigurableProfile) GetModelCapabilities(modelName string, registry domain.ModelRegistry) domain.ModelCapabilities {
+	caps := domain.ModelCapabilities{
+		ChatCompletion:   true, // Default for most models
+		TextGeneration:   true, // Default for most models
+		StreamingSupport: p.config.Request.ParsingRules.SupportsStreaming,
+		MaxContextLength: 4096,
+		MaxOutputTokens:  2048,
+	}
+
+	// Check capability patterns from config
+
+	// Check for embeddings capability
+	if patterns, ok := p.config.Models.CapabilityPatterns["embeddings"]; ok {
+		for _, pat := range patterns {
+			if pattern.MatchesGlob(modelName, pat) {
+				caps.Embeddings = true
+				caps.ChatCompletion = false
+				caps.TextGeneration = false
+				break
+			}
+		}
+	}
+
+	// Check for vision capability
+	if patterns, ok := p.config.Models.CapabilityPatterns["vision"]; ok {
+		for _, pat := range patterns {
+			if pattern.MatchesGlob(modelName, pat) {
+				caps.VisionUnderstanding = true
+				break
+			}
+		}
+	}
+
+	// Check for code capability
+	if patterns, ok := p.config.Models.CapabilityPatterns["code"]; ok {
+		for _, pat := range patterns {
+			if pattern.MatchesGlob(modelName, pat) {
+				caps.CodeGeneration = true
+				break
+			}
+		}
+	}
+
+	// Function calling is typically supported by standard chat models
+	// but not by specialized models (vision, code, embeddings)
+	if !caps.Embeddings && !caps.VisionUnderstanding && !caps.CodeGeneration {
+		caps.FunctionCalling = true
+	}
+
+	// Check context patterns from config
+	for _, contextPattern := range p.config.Models.ContextPatterns {
+		if pattern.MatchesGlob(modelName, contextPattern.Pattern) {
+			caps.MaxContextLength = contextPattern.Context
+			break
+		}
+	}
+
+	return caps
+}
+
+func (p *ConfigurableProfile) IsModelSupported(modelName string, registry domain.ModelRegistry) bool {
+	// Configurable profiles are optimistic
+	return true
+}
+
+func (p *ConfigurableProfile) TransformModelName(fromName string, toFormat string) string {
+	// No transformation by default
+	return fromName
+}
+
+// containsSizeToken reports whether s contains token bounded by non-alphanumeric
+// characters (or the start/end of s), rather than a bare substring match. This
+// stops a size token like "7b" matching inside "17b" or "70b" while still
+// matching legitimate forms such as "llama-7b", "7b-chat" or "codellama:7b".
+// Model size patterns in profile YAML are bare tokens, not globs (see
+// config/profiles/llamacpp.yaml), so this is the sole matcher for them.
+func containsSizeToken(s, token string) bool {
+	if token == "" {
+		return false
+	}
+	for start := 0; start <= len(s)-len(token); {
+		idx := strings.Index(s[start:], token)
+		if idx == -1 {
+			return false
+		}
+		idx += start
+		end := idx + len(token)
+		beforeOK := idx == 0 || !isAlphaNumericByte(s[idx-1])
+		afterOK := end == len(s) || !isAlphaNumericByte(s[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = idx + 1
+	}
+	return false
+}
+
+func isAlphaNumericByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func (p *ConfigurableProfile) GetResourceRequirements(modelName string, registry domain.ModelRegistry) domain.ResourceRequirements {
+	// Check if we have resource patterns configured
+	if p.config.Resources.ModelSizes == nil && p.config.Resources.Defaults.MinMemoryGB == 0 {
+		// No resource config, assume cloud/remote
+		return domain.ResourceRequirements{
+			MinMemoryGB:         0,
+			RecommendedMemoryGB: 0,
+			RequiresGPU:         false,
+			MinGPUMemoryGB:      0,
+			EstimatedLoadTimeMS: 0,
+		}
+	}
+
+	lowerName := strings.ToLower(modelName)
+
+	// Find matching model size pattern
+	var baseReqs *domain.ResourceRequirements
+	for _, pattern := range p.config.Resources.ModelSizes {
+		for _, pat := range pattern.Patterns {
+			if containsSizeToken(lowerName, pat) {
+				baseReqs = &domain.ResourceRequirements{
+					MinMemoryGB:         pattern.MinMemoryGB,
+					RecommendedMemoryGB: pattern.RecommendedMemoryGB,
+					MinGPUMemoryGB:      pattern.MinGPUMemoryGB,
+					RequiresGPU:         p.config.Resources.Defaults.RequiresGPU,
+					EstimatedLoadTimeMS: int64(pattern.EstimatedLoadTimeMS),
+				}
+				break
+			}
+		}
+		if baseReqs != nil {
+			break
+		}
+	}
+
+	// Use defaults if no pattern matched. Copy rather than alias: the
+	// quantisation scaling below mutates baseReqs in place, and it would
+	// otherwise corrupt the shared config defaults for every later caller.
+	if baseReqs == nil {
+		defaults := p.config.Resources.Defaults
+		baseReqs = &defaults
+	}
+
+	// Apply quantization multipliers if configured
+	if p.config.Resources.Quantization.Multipliers != nil {
+		for quantType, multiplier := range p.config.Resources.Quantization.Multipliers {
+			if strings.Contains(lowerName, quantType) {
+				baseReqs.MinMemoryGB *= multiplier
+				baseReqs.RecommendedMemoryGB *= multiplier
+				baseReqs.MinGPUMemoryGB *= multiplier
+				break
+			}
+		}
+	}
+
+	return *baseReqs
+}
+
+func (p *ConfigurableProfile) GetOptimalConcurrency(modelName string) int {
+	// Check if we have concurrency limits configured
+	if len(p.config.Resources.ConcurrencyLimits) == 0 {
+		return p.GetMaxConcurrentRequests()
+	}
+
+	// Get resource requirements for this model
+	reqs := p.GetResourceRequirements(modelName, nil)
+
+	// Find the appropriate concurrency limit based on memory requirements
+	// Iterate from most restrictive to least restrictive
+	for _, limit := range p.config.Resources.ConcurrencyLimits {
+		if reqs.MinMemoryGB >= limit.MinMemoryGB {
+			return limit.MaxConcurrent
+		}
+	}
+
+	// Default to max concurrent requests if no limits match
+	return p.GetMaxConcurrentRequests()
+}
+
+func (p *ConfigurableProfile) GetRoutingStrategy() domain.RoutingStrategy {
+	return domain.RoutingStrategy{
+		PreferSameFamily:     false,
+		AllowFallback:        false,
+		MaxRetries:           3,
+		PreferLocalEndpoints: false, // TODO: Add IsLocal to config
+	}
+}
+
+func (p *ConfigurableProfile) ShouldBatchRequests() bool {
+	return false
+}
+
+func (p *ConfigurableProfile) GetRequestTimeout(modelName string) time.Duration {
+	baseTimeout := p.GetTimeout()
+
+	// Check if timeout scaling is configured
+	if p.config.Resources.TimeoutScaling.BaseTimeoutSeconds > 0 {
+		baseTimeout = time.Duration(p.config.Resources.TimeoutScaling.BaseTimeoutSeconds) * time.Second
+	}
+
+	// Add load time buffer if configured
+	if p.config.Resources.TimeoutScaling.LoadTimeBuffer {
+		reqs := p.GetResourceRequirements(modelName, nil)
+		if reqs.EstimatedLoadTimeMS > 0 {
+			loadBuffer := time.Duration(reqs.EstimatedLoadTimeMS) * time.Millisecond
+			baseTimeout += loadBuffer
+		}
+	}
+
+	return baseTimeout
+}

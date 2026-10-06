@@ -88,3 +88,94 @@ func TestCalculateBackoff(t *testing.T) {
 			success:            false,
 			expectedInterval:   maxBackoffSeconds, // 10s * 6 = 60s
 			expectedMultiplier: maxBackoffMultiplier,
+			description:        "Interval should be capped at MaxBackoffSeconds",
+		},
+		{
+			name: "already_at_max_multiplier_stays_at_max",
+			endpoint: &domain.Endpoint{
+				CheckInterval:     5 * time.Second,
+				BackoffMultiplier: maxBackoffMultiplier,
+			},
+			success:            false,
+			expectedInterval:   maxBackoffSeconds,
+			expectedMultiplier: maxBackoffMultiplier,
+			description:        "Once at max multiplier, should stay at max",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			interval, multiplier := calculateBackoff(tt.endpoint, tt.success)
+
+			assert.Equal(t, tt.expectedInterval, interval,
+				"Interval mismatch: %s", tt.description)
+			assert.Equal(t, tt.expectedMultiplier, multiplier,
+				"Multiplier mismatch: %s", tt.description)
+		})
+	}
+}
+
+// TestBackoffProgressionSequence verifies the complete exponential backoff sequence
+func TestBackoffProgressionSequence(t *testing.T) {
+	endpoint := &domain.Endpoint{
+		CheckInterval:       5 * time.Second,
+		BackoffMultiplier:   1,
+		ConsecutiveFailures: 0,
+	}
+
+	// Expected exponential progression
+	expectedSequence := []struct {
+		interval   time.Duration
+		multiplier int
+	}{
+		{5 * time.Second, 2},                      // First failure - normal interval
+		{10 * time.Second, 4},                     // Second failure - 2x interval
+		{20 * time.Second, 8},                     // Third failure - 4x interval
+		{40 * time.Second, maxBackoffMultiplier},  // Fourth failure - 8x interval (next multiplier capped)
+		{maxBackoffSeconds, maxBackoffMultiplier}, // Fifth failure - capped at max
+	}
+
+	for i, expected := range expectedSequence {
+		interval, multiplier := calculateBackoff(endpoint, false)
+
+		assert.Equal(t, expected.interval, interval,
+			"Failure %d: Expected interval %v, got %v", i+1, expected.interval, interval)
+		assert.Equal(t, expected.multiplier, multiplier,
+			"Failure %d: Expected multiplier %d, got %d", i+1, expected.multiplier, multiplier)
+
+		// Update endpoint for next iteration
+		endpoint.BackoffMultiplier = multiplier
+		endpoint.ConsecutiveFailures++
+	}
+
+	// Verify recovery resets backoff
+	interval, multiplier := calculateBackoff(endpoint, true)
+	assert.Equal(t, 5*time.Second, interval, "Success should reset to original interval")
+	assert.Equal(t, 1, multiplier, "Success should reset multiplier to 1")
+}
+
+// TestBackoffDoesNotUseConsecutiveFailures ensures we don't accidentally use ConsecutiveFailures
+// instead of BackoffMultiplier for the calculation (this was the bug we fixed)
+func TestBackoffDoesNotUseConsecutiveFailures(t *testing.T) {
+	// This test specifically guards against the regression where we used
+	// ConsecutiveFailures instead of BackoffMultiplier
+
+	endpoint := &domain.Endpoint{
+		CheckInterval:       5 * time.Second,
+		BackoffMultiplier:   2,  // Exponential multiplier
+		ConsecutiveFailures: 10, // This should NOT affect the calculation
+	}
+
+	interval, multiplier := calculateBackoff(endpoint, false)
+
+	// With BackoffMultiplier=2, we use current multiplier for interval, next will be 4
+	assert.Equal(t, 10*time.Second, interval,
+		"Backoff should use current BackoffMultiplier (2), not ConsecutiveFailures (10)")
+	assert.Equal(t, 4, multiplier,
+		"Multiplier should double from 2 to 4, not be affected by ConsecutiveFailures")
+
+	// If we were incorrectly using ConsecutiveFailures, we'd get:
+	// interval = 5s * (10 * 2) = 100s (wrong!)
+	assert.NotEqual(t, 100*time.Second, interval,
+		"Interval should NOT be based on ConsecutiveFailures")
+}
