@@ -299,3 +299,305 @@ func (bi *BodyInspector) extractModelName(body []byte) string {
 	if model := extractTopLevelModelFieldFromReader(bytes.NewReader(body)); model != "" {
 		return bi.normalizeModelName(model)
 	}
+
+	// Fall back to flexible map-based extraction to handle non-standard formats.
+	// This only succeeds for complete, valid JSON bodies.
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return ""
+	}
+
+	for key, value := range data {
+		if strings.EqualFold(key, "model") {
+			if modelStr, ok := value.(string); ok && modelStr != "" {
+				return bi.normalizeModelName(modelStr)
+			}
+		}
+	}
+
+	// Some APIs specify model per-message rather than at the request level
+	if messages, ok := data["messages"].([]interface{}); ok && len(messages) > 0 {
+		if firstMsg, ok := messages[0].(map[string]interface{}); ok {
+			if model, ok := firstMsg["model"].(string); ok && model != "" {
+				return bi.normalizeModelName(model)
+			}
+		}
+	}
+
+	return ""
+}
+
+// extractTopLevelModelFieldFromReader scans JSON from r (which may be a truncated stream)
+// with a streaming decoder and returns the value of the first top-level "model" string key.
+// Non-model field values are skipped using token-level iteration so large nested values
+// (e.g. base64 image payloads in "messages") are never buffered into memory.
+// This allows correct extraction even when "model" appears after large fields.
+func extractTopLevelModelFieldFromReader(r io.Reader) string {
+	dec := json.NewDecoder(r)
+
+	// Consume the opening '{' of the top-level object.
+	tok, err := dec.Token()
+	if err != nil {
+		return ""
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return ""
+	}
+
+	for dec.More() {
+		// Read the key token. At this position the decoder always yields a string key.
+		keyTok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+
+		key, ok := keyTok.(string)
+		if !ok {
+			// Malformed JSON - key position must be a string.
+			return ""
+		}
+
+		if strings.EqualFold(key, "model") {
+			// Read the value as a raw message; the value is small so allocation is fine.
+			var val json.RawMessage
+			if err := dec.Decode(&val); err != nil {
+				return ""
+			}
+			var modelStr string
+			if err := json.Unmarshal(val, &modelStr); err == nil && modelStr != "" {
+				return modelStr
+			}
+			// Value wasn't a string - keep scanning.
+			continue
+		}
+
+		// Skip the value for this key using token-level iteration so we never buffer
+		// a large nested value (e.g. a messages array containing base64 images).
+		if err := skipValueTokens(dec); err != nil {
+			// Truncated JSON or I/O error - stop scanning.
+			return ""
+		}
+	}
+
+	return ""
+}
+
+// skipValueTokens advances dec past the next JSON value at the current read position.
+// It uses token-level iteration to avoid allocating a buffer for the entire value,
+// which is important when skipping large nested arrays or objects (e.g. vision payloads).
+func skipValueTokens(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		// Scalar value (string, number, bool, null) - already consumed.
+		return nil
+	}
+	if delim != '{' && delim != '[' {
+		// Unexpected closing delimiter at value position - treat as error.
+		return fmt.Errorf("unexpected closing delimiter %v", delim)
+	}
+	// Track open/close depth to handle arbitrarily nested structures.
+	depth := 1
+	for depth > 0 {
+		tok, err = dec.Token()
+		if err != nil {
+			return err
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+	}
+	return nil
+}
+
+func (bi *BodyInspector) normalizeModelName(model string) string {
+	model = strings.TrimSpace(model)
+	model = strings.ToLower(model)
+	// Only whitespace and case are normalised here. Tags are left alone on purpose:
+	// the registry applies Ollama's default tag (a bare "foo" is "foo:latest"), and only
+	// for Ollama-sourced models, after an exact lookup misses. Doing it here would hand
+	// every other platform a name it does not serve. Aliases are resolved in the handler.
+	return model
+}
+
+// readCloser combines a reader (e.g. io.MultiReader) with the original body's Closer so that
+// Close properly drains/releases the underlying connection rather than becoming a no-op.
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// detectRequiredCapabilities analyzes the request body to determine what capabilities are needed
+func (bi *BodyInspector) detectRequiredCapabilities(body []byte) *domain.ModelCapabilities {
+	if len(body) == 0 {
+		return nil
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil
+	}
+
+	caps := &domain.ModelCapabilities{
+		// Default capabilities - most models support these
+		ChatCompletion:   true,
+		TextGeneration:   true,
+		StreamingSupport: true,
+	}
+
+	// Check for streaming preference
+	if stream, ok := data["stream"].(bool); ok {
+		caps.StreamingSupport = stream
+	}
+
+	// Check for function/tool calling
+	if tools, ok := data["tools"]; ok && tools != nil {
+		caps.FunctionCalling = true
+	}
+	if functions, ok := data["functions"]; ok && functions != nil {
+		caps.FunctionCalling = true
+	}
+	if toolChoice, ok := data["tool_choice"]; ok && toolChoice != nil {
+		caps.FunctionCalling = true
+	}
+	if functionCall, ok := data["function_call"]; ok && functionCall != nil {
+		caps.FunctionCalling = true
+	}
+
+	// Check for vision requirements in messages
+	if messages, ok := data["messages"].([]interface{}); ok {
+		for _, msg := range messages {
+			if msgMap, ok := msg.(map[string]interface{}); ok {
+				// Check content for vision elements
+				if content, ok := msgMap["content"]; ok {
+					if bi.hasVisionContent(content) {
+						caps.VisionUnderstanding = true
+					}
+				}
+			}
+		}
+	}
+
+	// Check for embeddings endpoint
+	if input, ok := data["input"]; ok && input != nil {
+		// If there's an "input" field, this is likely an embeddings request
+		caps.Embeddings = true
+		caps.ChatCompletion = false
+		caps.TextGeneration = false
+	}
+
+	// Check for code generation hints
+	if bi.hasCodeGenerationHints(data) {
+		caps.CodeGeneration = true
+	}
+
+	return caps
+}
+
+// hasVisionContent checks if the content contains image data
+func (bi *BodyInspector) hasVisionContent(content interface{}) bool {
+	switch v := content.(type) {
+	case string:
+		// Simple text content, no vision
+		return false
+	case []interface{}:
+		// Multi-modal content array
+		for _, item := range v {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				itemType, _ := itemMap["type"].(string)
+				if itemType == "image_url" || itemType == "image" {
+					return true
+				}
+				// Check for base64 image data
+				if itemType == "text" {
+					if text, ok := itemMap["text"].(string); ok && strings.HasPrefix(text, "data:image/") {
+						return true
+					}
+				}
+			}
+		}
+	case map[string]interface{}:
+		// Check if it's an image object
+		if imgType, ok := v["type"].(string); ok && (imgType == "image_url" || imgType == "image") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasCodeGenerationHints checks for indicators that code generation is needed
+func (bi *BodyInspector) hasCodeGenerationHints(data map[string]interface{}) bool {
+	// Check for code-related parameters
+	if bi.hasCodeParameters(data) {
+		return true
+	}
+
+	// Check system prompts for code indicators
+	return bi.hasCodeInSystemPrompt(data)
+}
+
+// hasCodeParameters checks for explicit code-related parameters
+func (bi *BodyInspector) hasCodeParameters(data map[string]interface{}) bool {
+	if lang, ok := data["language"].(string); ok && lang != "" {
+		return true
+	}
+	if codeModel, ok := data["code_model"].(bool); ok && codeModel {
+		return true
+	}
+	return false
+}
+
+// hasCodeInSystemPrompt checks for code keywords in system prompts
+func (bi *BodyInspector) hasCodeInSystemPrompt(data map[string]interface{}) bool {
+	messages, ok := data["messages"].([]interface{})
+	if !ok {
+		return false
+	}
+
+	for _, msg := range messages {
+		if bi.isSystemMessageWithCodeKeywords(msg) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSystemMessageWithCodeKeywords checks if a message is a system message containing code keywords
+func (bi *BodyInspector) isSystemMessageWithCodeKeywords(msg interface{}) bool {
+	msgMap, ok := msg.(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	role, _ := msgMap["role"].(string)
+	if role != "system" {
+		return false
+	}
+
+	content, ok := msgMap["content"].(string)
+	if !ok {
+		return false
+	}
+
+	return bi.containsCodeKeywords(content)
+}
+
+// containsCodeKeywords checks if content contains code-related keywords
+func (bi *BodyInspector) containsCodeKeywords(content string) bool {
+	lowerContent := strings.ToLower(content)
+	codeKeywords := []string{"code", "programming", "function", "class", "debug", "implement"}
+	for _, keyword := range codeKeywords {
+		if strings.Contains(lowerContent, keyword) {
+			return true
+		}
+	}
+	return false
+}
