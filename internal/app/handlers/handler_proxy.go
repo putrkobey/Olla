@@ -378,3 +378,765 @@ func (a *Application) getCompatibleEndpoints(ctx context.Context, pr *proxyReque
 func (a *Application) executeProxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoints []*domain.Endpoint, pr *proxyRequest) error {
 	ctx, r = a.prepareProxyContext(ctx, r, pr)
 
+	return a.proxyService.ProxyRequestToEndpoints(ctx, w, r, endpoints, pr.stats, pr.requestLogger)
+}
+
+func (a *Application) logRequestStart(pr *proxyRequest, endpointCount int) {
+	// Log essential operational info at INFO level
+	logFields := []any{
+		"client_ip", pr.clientIP,
+		"method", pr.method,
+		"path", pr.path,
+		"compatible_endpoints", endpointCount,
+	}
+
+	// Add user agent if present
+	if pr.userAgent != "" {
+		logFields = append(logFields, "user_agent", pr.userAgent)
+	}
+
+	// Add model if identified
+	if pr.model != "" {
+		logFields = append(logFields, "model", pr.model)
+	}
+
+	// Add content length if it's a POST/PUT with body
+	if pr.contentLength > 0 {
+		logFields = append(logFields, "content_length", pr.contentLength)
+	}
+
+	// translator_mode is only set on translation handler requests
+	if pr.translatorMode != "" {
+		logFields = append(logFields, "translator_mode", string(pr.translatorMode))
+	}
+
+	// A request with no routable endpoint is about to be logged by logRequestRejected, which
+	// carries the same identifying fields and is sampled. Writing Info here as well would
+	// leave an unthrottled line per request for a client repeating an unknown model.
+	if endpointCount == 0 {
+		pr.requestLogger.Debug("Request received", logFields...)
+	} else {
+		pr.requestLogger.Info("Request received", logFields...)
+	}
+
+	// Log additional details at DEBUG level
+	debugFields := []any{
+		"target_path", pr.targetPath,
+		"path_resolution_ms", pr.stats.PathResolutionMs,
+		"query", pr.query,
+		"content_type", pr.contentType,
+	}
+
+	pr.requestLogger.Debug("Request details", debugFields...)
+}
+
+// logRequestRejected records a request that never reached the proxy engine because
+// endpoint selection produced no routable target. Kept distinct from logRequestResult's
+// "completed"/"failed" outcomes so a fail-fast rejection (e.g. strict model_not_found)
+// is surfaced as a rejection rather than a successful completion (#191).
+func (a *Application) logRequestRejected(pr *proxyRequest, status int, reason string) {
+	if !a.rejectLog.allowRequest(pr.clientIP, status) {
+		return
+	}
+	duration := time.Since(pr.stats.StartTime)
+
+	logFields := []any{
+		"client_ip", pr.clientIP,
+		"path", pr.path,
+		"status", status,
+		"reason", reason,
+		"duration_ms", duration.Milliseconds(),
+	}
+
+	if pr.model != "" {
+		logFields = append(logFields, "model", pr.model)
+	}
+
+	// routing fields explain why nothing was routable (strategy/action/reason)
+	if rd := pr.stats.RoutingDecision; rd != nil {
+		if rd.Strategy != "" {
+			logFields = append(logFields, "routing_strategy", rd.Strategy)
+		}
+		if rd.Action != "" {
+			logFields = append(logFields, "routing_action", rd.Action)
+		}
+		if rd.Reason != "" {
+			logFields = append(logFields, "routing_reason", rd.Reason)
+		}
+	}
+
+	pr.requestLogger.Warn("Request rejected", logFields...)
+}
+
+func (a *Application) logRequestResult(pr *proxyRequest, err error) {
+	// A chunked body over the size cap fails mid-read and is answered 413 by handleProxyError.
+	// It is a client rejection, so it takes the sampled path rather than an ERROR per request.
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		a.logRequestRejected(pr, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+
+	duration := time.Since(pr.stats.StartTime)
+
+	if err != nil {
+		logFields := a.buildLogFields(pr, duration)
+		// What the client actually got, so a truncated 200 reads differently from a 502.
+		if pr.upstreamStatus > 0 {
+			logFields = append(logFields, "http_status", pr.upstreamStatus)
+		}
+		pr.requestLogger.Error("Request failed", append([]any{"error", err}, logFields...)...)
+	} else {
+		// Log essential completion info at INFO level
+		infoFields := []any{
+			"endpoint", pr.stats.EndpointName,
+			"duration_ms", duration.Milliseconds(),
+			"status", "completed",
+		}
+
+		if pr.upstreamStatus > 0 {
+			infoFields = append(infoFields, "http_status", pr.upstreamStatus)
+		}
+
+		if pr.model != "" {
+			infoFields = append(infoFields, "model", pr.model)
+		}
+
+		if pr.stats.TotalBytes > 0 {
+			infoFields = append(infoFields, "total_bytes", pr.stats.TotalBytes)
+		}
+
+		// translator_mode is only set on translation handler requests
+		if pr.translatorMode != "" {
+			infoFields = append(infoFields, "translator_mode", string(pr.translatorMode))
+		}
+
+		infoFields = appendProviderMetricFields(infoFields, pr.stats.ProviderMetrics)
+
+		// routing fields at INFO so operators can see the strategy without enabling DEBUG
+		if rd := pr.stats.RoutingDecision; rd != nil {
+			if rd.Strategy != "" {
+				infoFields = append(infoFields, "routing_strategy", rd.Strategy)
+			}
+			if rd.Action != "" {
+				infoFields = append(infoFields, "routing_action", rd.Action)
+			}
+			if rd.Reason != "" {
+				infoFields = append(infoFields, "routing_reason", rd.Reason)
+			}
+		}
+
+		// "disabled" carries no signal; omit it to avoid noise in deployments without sticky sessions
+		if pr.stickyOutcome != "" && pr.stickyOutcome != "disabled" {
+			infoFields = append(infoFields, "sticky_outcome", pr.stickyOutcome)
+		}
+
+		// the client-supplied session id, logged alongside the outcome so affinity
+		// routing can be traced without enabling DEBUG
+		if pr.sessionID != "" {
+			infoFields = append(infoFields, "session_id", pr.sessionID)
+		}
+
+		// FallbackReasonNone is the empty string (passthrough succeeded); omit it
+		// because it would appear on the majority of requests and adds no signal
+		if pr.translatorFallbackReason != "" {
+			infoFields = append(infoFields, "fallback_reason", pr.translatorFallbackReason)
+		}
+
+		// A backend 5xx is a backend fault the operator should see when filtering on WARN.
+		// It is per request by design: unlike Olla's own rejections (sampled by
+		// logRequestRejected) this is the only record of what the backend said. Backend 4xx
+		// is the caller's problem and stays at Info.
+		if pr.upstreamStatus >= http.StatusInternalServerError {
+			pr.requestLogger.Warn("Request completed", infoFields...)
+		} else {
+			pr.requestLogger.Info("Request completed", infoFields...)
+		}
+
+		// Log detailed metrics at DEBUG level
+		debugFields := a.buildLogFields(pr, duration)
+		pr.requestLogger.Debug("Request metrics", debugFields...)
+	}
+}
+
+// appendProviderMetricFields adds the backend-reported usage fields that are worth an INFO line.
+func appendProviderMetricFields(fields []any, pm *domain.ProviderMetrics) []any {
+	if pm == nil {
+		return fields
+	}
+	if pm.InputTokens > 0 {
+		fields = append(fields, "input_tokens", pm.InputTokens)
+	}
+	if pm.OutputTokens > 0 {
+		fields = append(fields, "output_tokens", pm.OutputTokens)
+	}
+	if pm.TotalTokens > 0 {
+		fields = append(fields, "total_tokens", pm.TotalTokens)
+	}
+	if pm.TokensPerSecond > 0 {
+		fields = append(fields, "tokens_per_sec", fmt.Sprintf("%.1f", pm.TokensPerSecond))
+	}
+	if pm.TTFTMs > 0 {
+		fields = append(fields, "ttft_ms", pm.TTFTMs)
+	}
+	// the model the backend actually ran, which can differ from the requested alias
+	if pm.Model != "" {
+		fields = append(fields, "provider_model", pm.Model)
+	}
+	return fields
+}
+
+func (a *Application) buildLogFields(pr *proxyRequest, duration time.Duration) []any {
+	fields := []any{
+		"endpoint", pr.stats.EndpointName,
+		"model", pr.model,
+		"client_ip", pr.clientIP,
+		"total_bytes", pr.stats.TotalBytes,
+		"duration_ms", duration.Milliseconds(),
+		"latency_ms", pr.stats.Latency,
+		"request_processing_ms", pr.stats.RequestProcessingMs,
+		"backend_response_ms", pr.stats.BackendResponseMs,
+		"first_data_ms", pr.stats.FirstDataMs,
+		"streaming_ms", pr.stats.StreamingMs,
+		"header_processing_ms", pr.stats.HeaderProcessingMs,
+		"path_resolution_ms", pr.stats.PathResolutionMs,
+		"selection_ms", pr.stats.SelectionMs,
+	}
+
+	if pr.stats.EndpointName == "" {
+		fields = append(fields, "target_path", pr.targetPath)
+	}
+
+	// "none" means no sticky session is active, which adds no useful signal at DEBUG
+	if pr.stickySource != "" && pr.stickySource != "none" {
+		fields = append(fields, "sticky_source", pr.stickySource)
+	}
+	// also carried here so failed requests and the detailed metrics line keep
+	// the session id (the success path logs it at INFO)
+	if pr.sessionID != "" {
+		fields = append(fields, "session_id", pr.sessionID)
+	}
+
+	// Add provider metrics if available (detailed view)
+	if pr.stats.ProviderMetrics != nil {
+		pm := pr.stats.ProviderMetrics
+		if pm.InputTokens > 0 {
+			fields = append(fields, "input_tokens", pm.InputTokens)
+		}
+		if pm.OutputTokens > 0 {
+			fields = append(fields, "output_tokens", pm.OutputTokens)
+		}
+		if pm.TotalTokens > 0 {
+			fields = append(fields, "total_tokens", pm.TotalTokens)
+		}
+		if pm.TokensPerSecond > 0 {
+			fields = append(fields, "tokens_per_sec", pm.TokensPerSecond)
+		}
+		if pm.TTFTMs > 0 {
+			fields = append(fields, "ttft_ms", pm.TTFTMs)
+		}
+		if pm.PromptMs > 0 {
+			fields = append(fields, "prompt_ms", pm.PromptMs)
+		}
+		if pm.GenerationMs > 0 {
+			fields = append(fields, "generation_ms", pm.GenerationMs)
+		}
+		if pm.Model != "" {
+			fields = append(fields, "provider_model", pm.Model)
+		}
+		if pm.FinishReason != "" {
+			fields = append(fields, "finish_reason", pm.FinishReason)
+		}
+	}
+
+	return fields
+}
+
+func (a *Application) handleEndpointError(w http.ResponseWriter, pr *proxyRequest, err error) {
+	pr.requestLogger.Error("Failed to get endpoints", "error", err)
+	http.Error(w, fmt.Sprintf("Service unavailable: %v", err), http.StatusBadGateway)
+}
+
+// only send error response if we haven't started streaming yet.
+// w.Started() is the real "response already committed" signal: Header().Set does
+// not commit anything, only WriteHeader/Write do, so a Content-Type-presence check
+// used to let this guard misfire on any handler that set headers before failing.
+// This still prevents double-writing a response after a partial stream
+// (learned this the hard way when users got html error messages appended to their json).
+func (a *Application) handleProxyError(w *core.ResponseStartedWriter, err error) {
+	if w.Started() {
+		return
+	}
+
+	// A chunked (no Content-Length) request body that exceeds the configured
+	// cap is caught mid-read by the http.MaxBytesReader SizeValidator.CreateMiddleware
+	// installs on r.Body, not by the pre-check that handles known-Content-Length
+	// oversize requests. That surfaces here as a generic read error wrapped up
+	// through retry.go's body preservation - without this check it would fall
+	// through to a misleading 502, when the real cause is the same "body too
+	// large" condition the pre-check rejects with 413. Match that response
+	// exactly so the client sees one consistent envelope regardless of which
+	// path caught the oversize body.
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	http.Error(w, fmt.Sprintf("Proxy error: %v", err), http.StatusBadGateway)
+}
+
+// logNoCompatibleFallback records the widen-to-all fallback; translator routes expect it for a
+// chat-less fleet and log it at Debug (see RequestProfile.QuietNoMatchFallback).
+func logNoCompatibleFallback(log logger.StyledLogger, profile *domain.RequestProfile, total int) {
+	logFn := log.Warn
+	if profile.QuietNoMatchFallback {
+		logFn = log.Debug
+	}
+	logFn("No compatible endpoints found for path, falling back to all endpoints",
+		"path", profile.Path,
+		"supported_by", profile.SupportedBy,
+		"total_endpoints", total)
+}
+
+func (a *Application) stripRoutePrefix(ctx context.Context, path string) string {
+	return util.StripRoutePrefix(ctx, path, constants.ContextRoutePrefixKey)
+}
+
+// three-stage filtering pipeline that progressively narrows down endpoints.
+// starts broad (platform compatibility), then capabilities (vision, embeddings),
+// finally specific model availability. each stage falls back gracefully.
+func (a *Application) filterEndpointsByProfile(endpoints []*domain.Endpoint, profile *domain.RequestProfile, logger logger.StyledLogger) []*domain.Endpoint {
+	var profileFiltered []*domain.Endpoint
+
+	// stage 1: platform compatibility (ollama can't handle openai requests etc)
+	if profile == nil || len(profile.SupportedBy) == 0 {
+		logger.Debug("No profile filtering applied", "total_endpoints", len(endpoints))
+		profileFiltered = endpoints
+	} else {
+		compatible := make([]*domain.Endpoint, 0, len(endpoints))
+		for _, endpoint := range endpoints {
+			// Normalise endpoint type to handle variations (e.g., lmstudio -> lm-studio)
+			normalizedType := NormaliseProviderType(endpoint.Type)
+			if profile.IsCompatibleWith(normalizedType) {
+				compatible = append(compatible, endpoint)
+			}
+		}
+
+		if len(compatible) == 0 {
+			if profile.FailClosedOnNoMatch {
+				// Provider-scoped request (e.g. /olla/vllm/) with zero healthy
+				// endpoints of that type: return the empty set so the caller's
+				// existing no-routable-endpoints path produces a proper 404/503,
+				// instead of silently crossing into another provider type.
+				// Debug, not Warn: a client can repeat this at wire speed. The sampled
+				// "Request rejected" line carries the cause ("No <type> endpoints available").
+				logger.Debug("No compatible endpoints found for provider-scoped path, failing closed",
+					"path", profile.Path,
+					"supported_by", profile.SupportedBy,
+					"total_endpoints", len(endpoints))
+				return nil
+			}
+			logNoCompatibleFallback(logger, profile, len(endpoints))
+			profileFiltered = endpoints
+		} else {
+			logger.Debug("Filtered endpoints by profile compatibility",
+				"path", profile.Path,
+				"compatible_count", len(compatible),
+				"total_count", len(endpoints),
+				"supported_by", profile.SupportedBy)
+			profileFiltered = compatible
+		}
+	}
+
+	// stage 2: capability filtering (vision requests need vision models).
+	// only for model-less requests: capability tags are heuristic, so when the
+	// caller names a model, stage 3 alone decides which endpoints host it. a
+	// tag on some other model must never evict the hosts of the requested one.
+	if profile != nil && profile.ModelName == "" && profile.ModelCapabilities != nil && a.modelRegistry != nil {
+		capabilityFiltered, refusal := a.filterEndpointsByCapabilities(profileFiltered, profile, logger)
+		if refusal != nil {
+			// empty result makes dispatchToEndpoints answer with the decision's 503
+			profile.RoutingDecision = refusal
+			return []*domain.Endpoint{}
+		}
+		if len(capabilityFiltered) > 0 {
+			profileFiltered = capabilityFiltered
+		}
+	}
+
+	// stage 3: specific model filtering using routing strategy
+	if profile != nil && profile.ModelName != "" && a.modelRegistry != nil {
+		ctx := context.Background()
+
+		// aliases map one name to multiple backend-specific models, so they
+		// need dedicated resolution rather than the standard single-model path
+		if a.aliasResolver != nil && a.aliasResolver.IsAlias(profile.ModelName) {
+			return a.resolveAliasEndpoints(ctx, profile, profileFiltered, logger)
+		}
+
+		// use new routing strategy method
+		routableEndpoints, decision, err := a.modelRegistry.GetRoutableEndpointsForModel(ctx, profile.ModelName, profileFiltered)
+
+		// store routing decision for headers and metrics
+		if decision != nil {
+			profile.RoutingDecision = decision
+		}
+
+		if err != nil {
+			// handle routing errors based on decision
+			if decision != nil && decision.StatusCode > 0 {
+				// no per-request WARN here: the final "Request rejected" line carries the
+				// decision (routing_* fields) and is sampled per client
+				// return empty to trigger appropriate error response
+				return []*domain.Endpoint{}
+			}
+
+			logger.Warn("Model routing failed, using all compatible endpoints",
+				"model", profile.ModelName,
+				"error", err)
+			return profileFiltered
+		}
+
+		logger.Debug("Model routing decision",
+			"model", profile.ModelName,
+			"strategy", decision.Strategy,
+			"action", decision.Action,
+			"routable", len(routableEndpoints),
+			"compatible", len(profileFiltered))
+
+		return routableEndpoints
+	}
+
+	return profileFiltered
+}
+
+// resolveAliasEndpoints handles model alias resolution. When a request uses an alias
+// model name, this finds all endpoints that serve any of the aliased actual model names
+// and stores a rewrite map in the profile so the proxy can replace the model name in
+// the request body with the one the selected backend recognises.
+func (a *Application) resolveAliasEndpoints(ctx context.Context, profile *domain.RequestProfile, candidates []*domain.Endpoint, logger logger.StyledLogger) []*domain.Endpoint {
+	aliasName := profile.ModelName
+
+	// resolve the alias to find endpoint → actual model name mapping
+	endpointToModel, err := a.aliasResolver.ResolveEndpoints(ctx, aliasName, a.modelRegistry)
+	if err != nil || len(endpointToModel) == 0 {
+		logFields := []any{"alias", aliasName}
+		if err != nil {
+			logFields = append(logFields, "error", err)
+		}
+		// Debug: a strict-routing miss is rejected right after this, and the sampled
+		// "Request rejected" line reports it. Warning here would write one line per request.
+		logger.Debug("Model alias resolved to no endpoints, falling back to standard routing",
+			logFields...)
+
+		// fall through to standard routing in case the alias name itself is a known model
+		return a.routeByAliasName(ctx, aliasName, profile, candidates)
+	}
+
+	// filter candidates to only those that have one of the aliased models
+	var aliasEndpoints []*domain.Endpoint
+	for _, endpoint := range candidates {
+		if _, ok := endpointToModel[endpoint.GetURLString()]; ok {
+			aliasEndpoints = append(aliasEndpoints, endpoint)
+		}
+	}
+
+	if len(aliasEndpoints) == 0 {
+		logger.Debug("No healthy endpoints found for model alias",
+			"alias", aliasName,
+			"resolved_endpoints", len(endpointToModel))
+
+		// The alias resolved to real target models, but none of them are on a healthy/
+		// compatible candidate. Rather than synthesising a rejection here, consult the
+		// routing strategy for the alias name itself, exactly like the "resolved to no
+		// endpoints at all" branch above - this is what lets optimistic routing with
+		// fallback_behavior: all substitute a different endpoint instead of the request
+		// being unconditionally rejected (#191 follow-up). Trade-off accepted: the
+		// resulting rejection reason/status is whatever the registry reports for an
+		// unknown model (typically model_not_found/404) rather than the alias-specific
+		// model_unavailable/503 this branch used to synthesise; consistency with the
+		// policy engine wins over status-code precision.
+		return a.routeByAliasName(ctx, aliasName, profile, candidates)
+	}
+
+	// store the rewrite map in the profile for use during request proxying
+	profile.SetInspectionMeta(constants.ContextModelAliasMapKey, endpointToModel)
+
+	// set routing decision so downstream headers/metrics stay consistent
+	profile.RoutingDecision = ports.NewRoutingDecision("alias", ports.RoutingActionRouted,
+		fmt.Sprintf("alias %q resolved to %d endpoint(s)", aliasName, len(aliasEndpoints)))
+
+	// collect unique actual model names so the log shows what the backends serve,
+	// not just the alias name the client requested
+	actualModels := make([]string, 0, len(endpointToModel))
+	seen := make(map[string]struct{}, len(endpointToModel))
+	for _, m := range endpointToModel {
+		if _, dup := seen[m]; !dup {
+			seen[m] = struct{}{}
+			actualModels = append(actualModels, m)
+		}
+	}
+
+	logger.Info("Model alias resolved",
+		"alias", aliasName,
+		"matched_endpoints", len(aliasEndpoints),
+		"actual_models", actualModels,
+		"total_candidates", len(candidates))
+
+	return aliasEndpoints
+}
+
+// routeByAliasName is the shared tail for both resolveAliasEndpoints fallback paths:
+// alias resolution producing no endpoints at all, and alias resolution producing
+// endpoints that don't intersect the healthy/compatible candidate set. Both cases treat
+// the alias name as if it were a plain model name and hand the decision to the configured
+// routing strategy, rather than the handler synthesising its own rejection - this is what
+// lets fallback_behavior: all under optimistic routing substitute a different endpoint
+// instead of always rejecting (#191 follow-up). It does NOT set the alias rewrite map:
+// any endpoints returned here were not confirmed to serve one of the alias's actual
+// target models, so the proxy must forward the original request body unchanged.
+func (a *Application) routeByAliasName(ctx context.Context, aliasName string, profile *domain.RequestProfile, candidates []*domain.Endpoint) []*domain.Endpoint {
+	routableEndpoints, decision, routeErr := a.modelRegistry.GetRoutableEndpointsForModel(ctx, aliasName, candidates)
+	if decision != nil {
+		profile.RoutingDecision = decision
+	}
+
+	// A rejection must fail fast exactly like the non-alias path in filterEndpointsByProfile.
+	// Returning candidates here would silently proxy to a compatible-but-wrong backend and
+	// ignore the routing verdict (#191). Keyed on status code rather than the "rejected"
+	// action string because writeNoRoutableEndpoints uses the same status-code contract,
+	// and not every registry implementation reports rejections as "rejected" -
+	// MemoryModelRegistry's base GetRoutableEndpointsForModel uses "no_model"/"no_healthy"
+	// with 404/503. Keying on the action string would silently miss those and reintroduce
+	// the bug this fix closes.
+	if decision != nil && decision.StatusCode >= http.StatusBadRequest {
+		return []*domain.Endpoint{}
+	}
+
+	if routeErr != nil || len(routableEndpoints) == 0 {
+		return candidates
+	}
+	return routableEndpoints
+}
+
+// filterEndpointsByCapabilities narrows endpoints to hosts of a model with the capabilities a
+// model-less request needs. It returns a rejection decision, and no endpoints, only when models
+// with the capability exist and every host serving one is unhealthy: the request would otherwise
+// fall back to hosts of a different kind. Capability tags are heuristic, so every other "nothing
+// matched" case, including a capable host that is healthy but outside the candidates, keeps the
+// unfiltered fallback.
+func (a *Application) filterEndpointsByCapabilities(endpoints []*domain.Endpoint, profile *domain.RequestProfile, logger logger.StyledLogger) ([]*domain.Endpoint, *domain.ModelRoutingDecision) {
+	if profile.ModelCapabilities == nil {
+		return endpoints, nil
+	}
+
+	requiredCapabilities := a.extractRequiredCapabilities(profile.ModelCapabilities)
+	if len(requiredCapabilities) == 0 {
+		return endpoints, nil
+	}
+
+	capableModels := a.findCapableModels(requiredCapabilities, logger)
+	if len(capableModels) == 0 {
+		logger.Warn("No models found with required capabilities",
+			"model", profile.ModelName,
+			"capabilities", requiredCapabilities)
+		return endpoints, nil
+	}
+
+	// decide the refusal first: the filter below warns about falling back unfiltered, which
+	// is wrong (and one unsampled line per request) when the outcome is a refusal
+	if refusal := a.capabilityRefusalFor(endpoints, capableModels, profile, requiredCapabilities, logger); refusal != nil {
+		return []*domain.Endpoint{}, refusal
+	}
+	return a.filterEndpointsByCapableModels(endpoints, capableModels, requiredCapabilities, logger), nil
+}
+
+// capabilityRefusalFor returns the capability_unavailable decision when none of candidates
+// hosts a capable model and every capable host the request could be sent to is unhealthy;
+// otherwise nil. Capable hosts of a type the request can't use (an Ollama embedder for a
+// TEI-only /embed) are ignored: they can never be candidates, so letting them veto the refusal
+// would send the request to hosts of the wrong kind.
+func (a *Application) capabilityRefusalFor(candidates []*domain.Endpoint, capableModels map[string]bool, profile *domain.RequestProfile, requiredCapabilities []string, logger logger.StyledLogger) *domain.ModelRoutingDecision {
+	if anyCapableHost(candidates, capableModels) {
+		return nil
+	}
+	servable := a.servableCapableHosts(capableModels, profile)
+	if len(servable) == 0 || !a.allCapableHostsUnhealthy(servable) {
+		return nil
+	}
+	// Debug, not Warn: the "Request rejected" line already records routing_reason=capability_unavailable,
+	// and a client retrying while the backend is down would otherwise log a Warn per request.
+	logger.Debug("Models with the required capabilities exist but none are on a healthy endpoint",
+		"capabilities", requiredCapabilities,
+		"capable_endpoints", len(capableModels))
+	return ports.NewRoutingDecision(constants.RoutingStrategyCapability, ports.RoutingActionRejected,
+		constants.RoutingReasonCapabilityUnavailable)
+}
+
+// capabilityRefusal is the refusal check for callers with no candidate endpoints left, such
+// as a provider route whose provider type has no routable host. A model-less request that
+// needs a capability only a downed host has is refused here rather than masked as a 404.
+func (a *Application) capabilityRefusal(profile *domain.RequestProfile, logger logger.StyledLogger) *domain.ModelRoutingDecision {
+	if profile == nil || profile.ModelName != "" || profile.ModelCapabilities == nil || a.modelRegistry == nil {
+		return nil
+	}
+	required := a.extractRequiredCapabilities(profile.ModelCapabilities)
+	if len(required) == 0 {
+		return nil
+	}
+	capableModels := a.findCapableModels(required, logger)
+	if len(capableModels) == 0 {
+		return nil
+	}
+	return a.capabilityRefusalFor(nil, capableModels, profile, required, logger)
+}
+
+// servableCapableHosts narrows capableModels to known hosts whose type the request can be
+// sent to. When endpoint state can't be read the result is empty, which keeps the fallback
+// rather than refusing on a guess.
+func (a *Application) servableCapableHosts(capableModels map[string]bool, profile *domain.RequestProfile) map[string]bool {
+	servable := make(map[string]bool, len(capableModels))
+	if a.discoveryService == nil || profile == nil {
+		return servable
+	}
+	all, err := a.discoveryService.GetEndpoints(context.Background())
+	if err != nil {
+		return servable
+	}
+	// provider routes confine candidates to the provider's types, so judge the same set
+	scope := &domain.RequestProfile{SupportedBy: profile.ProviderScope}
+	for _, ep := range all {
+		if capableModels[ep.GetURLString()] && profile.IsCompatibleWith(NormaliseProviderType(ep.Type)) && scope.IsCompatibleWith(NormaliseProviderType(ep.Type)) {
+			servable[ep.GetURLString()] = true
+		}
+	}
+	return servable
+}
+
+// anyCapableHost reports whether any of endpoints serves a capable model.
+func anyCapableHost(endpoints []*domain.Endpoint, capableModels map[string]bool) bool {
+	for _, endpoint := range endpoints {
+		if capableModels[endpoint.GetURLString()] {
+			return true
+		}
+	}
+	return false
+}
+
+// allCapableHostsUnhealthy reports whether no host serving a capable model is healthy. The
+// registry keeps a model's source endpoints while the host is down, so the capable set still
+// names hosts the healthy list no longer contains. "Healthy" is the same list the candidates
+// come from (Busy hosts are excluded and never receive proxied traffic), so a Busy capable
+// host counts as down. When health cannot be read the answer is no, which keeps the old
+// fallback rather than refusing on a guess.
+func (a *Application) allCapableHostsUnhealthy(capableModels map[string]bool) bool {
+	if a.discoveryService == nil {
+		return false
+	}
+	healthy, err := a.discoveryService.GetHealthyEndpoints(context.Background())
+	if err != nil {
+		return false
+	}
+	return !anyCapableHost(healthy, capableModels)
+}
+
+func (a *Application) extractRequiredCapabilities(caps *domain.ModelCapabilities) []string {
+	requiredCapabilities := make([]string, 0, 7)
+
+	if caps.VisionUnderstanding {
+		requiredCapabilities = append(requiredCapabilities, "vision")
+	}
+	if caps.FunctionCalling {
+		requiredCapabilities = append(requiredCapabilities, "function_calling")
+	}
+	if caps.Embeddings {
+		requiredCapabilities = append(requiredCapabilities, "embeddings")
+	}
+	if caps.Rerank {
+		requiredCapabilities = append(requiredCapabilities, "rerank")
+	}
+	if caps.Classification {
+		requiredCapabilities = append(requiredCapabilities, "classification")
+	}
+	if caps.CodeGeneration {
+		requiredCapabilities = append(requiredCapabilities, "code")
+	}
+
+	return requiredCapabilities
+}
+
+// finds endpoints hosting at least one single model that has ALL required
+// capabilities (intersection is per model, not per endpoint, so an endpoint
+// with a vision model and a separate tools model doesn't satisfy both).
+// uses nil return to signal "no capability support" vs empty map for "no matches"
+func (a *Application) findCapableModels(requiredCapabilities []string, logger logger.StyledLogger) map[string]bool {
+	ctx := context.Background()
+	hasCapabilitySupport := false
+	var capableByID map[string]*domain.UnifiedModel
+
+	for _, capability := range requiredCapabilities {
+		models, err := a.modelRegistry.GetModelsByCapability(ctx, capability)
+		if err != nil {
+			logger.Warn("Failed to get models by capability",
+				"capability", capability,
+				"error", err)
+			continue
+		}
+
+		if len(models) > 0 {
+			hasCapabilitySupport = true
+		}
+
+		next := make(map[string]*domain.UnifiedModel, len(models))
+		for _, model := range models {
+			if capableByID == nil || capableByID[model.ID] != nil {
+				next[model.ID] = model
+			}
+		}
+		capableByID = next
+	}
+
+	// nil means "don't filter", empty map means "no matches found"
+	if !hasCapabilitySupport {
+		return nil
+	}
+
+	capableEndpoints := make(map[string]bool)
+	for _, model := range capableByID {
+		for _, sourceEndpoint := range model.SourceEndpoints {
+			capableEndpoints[sourceEndpoint.EndpointURL] = true
+		}
+	}
+	return capableEndpoints
+}
+
+func (a *Application) filterEndpointsByCapableModels(endpoints []*domain.Endpoint, capableModels map[string]bool, requiredCapabilities []string, logger logger.StyledLogger) []*domain.Endpoint {
+	// nil check differentiates "no capability support" from "no matches"
+	if capableModels == nil {
+		logger.Debug("Registry doesn't support capability queries, skipping capability filtering",
+			"capabilities", requiredCapabilities)
+		return endpoints
+	}
+
+	capableEndpoints := make([]*domain.Endpoint, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if capableModels[endpoint.GetURLString()] {
+			capableEndpoints = append(capableEndpoints, endpoint)
+		}
+	}
+
+	if len(capableEndpoints) == 0 {
+		logger.Warn("No endpoints have models with required capabilities, using unfiltered",
+			"capabilities", requiredCapabilities,
+			"available_endpoints", len(endpoints))
+		return endpoints
+	}
+
+	logger.Debug("Filtered endpoints by capabilities",
+		"capabilities", requiredCapabilities,
+		"capable_count", len(capableEndpoints),
+		"total_count", len(endpoints))
+
+	return capableEndpoints
+}
