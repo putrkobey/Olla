@@ -291,3 +291,296 @@ describe('OverviewPanel discovered-models tile', () => {
         buildEndpoint({ name: 'b', model_count: 2 }),
         buildEndpoint({ name: 'c', model_count: 0 }),
       ]
+    );
+
+    const tile = tileByLabel('Discovered models');
+    expect(tile).toBeTruthy();
+    const value = tile!.querySelector('.value')?.textContent?.trim();
+    expect(value).toBe('6');
+    expect(tile!.textContent).toMatch(/across 3 endpoints/);
+  });
+
+  it('renders zero across zero endpoints without throwing', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(buildStatus(), []);
+
+    const tile = tileByLabel('Discovered models');
+    expect(tile).toBeTruthy();
+    expect(tile!.querySelector('.value')?.textContent?.trim()).toBe('0');
+    expect(tile!.textContent).toMatch(/across 0 endpoints/);
+  });
+});
+
+describe('OverviewPanel latency-range tile', () => {
+  it('shows the no-data placeholder, not "0ms", when every endpoint is idle', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus(),
+      [
+        buildEndpoint({ name: 'a', min_latency_ms: 0, max_latency_ms: 0 }),
+        buildEndpoint({ name: 'b', min_latency_ms: 0, max_latency_ms: 0 }),
+      ]
+    );
+
+    const tile = tileByLabel('Latency range');
+    expect(tile).toBeTruthy();
+    const value = tile!.querySelector('.value')?.textContent?.trim();
+    expect(value).toContain('—');
+    expect(value).not.toContain('0ms');
+  });
+
+  it('renders fleet min-max from per-endpoint min/max when traffic exists', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus(),
+      [
+        buildEndpoint({ name: 'fast-active', min_latency_ms: 12, max_latency_ms: 80 }),
+        buildEndpoint({ name: 'slow-active', min_latency_ms: 40, max_latency_ms: 1500 }),
+      ]
+    );
+
+    const tile = tileByLabel('Latency range');
+    expect(tile).toBeTruthy();
+    const value = tile!.querySelector('.value')?.textContent?.trim();
+    expect(value).toBe('12ms–1.5s');
+  });
+
+  it('ignores idle endpoints when reducing the fleet min (mixed idle/busy)', async () => {
+    // An idle endpoint arrives as min=max=0; if it entered the min reduction
+    // the tile would read "0ms-80ms", presenting an empty measurement as a
+    // real fast request. The fleet min must come from endpoints with traffic.
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus(),
+      [
+        buildEndpoint({ name: 'idle', min_latency_ms: 0, max_latency_ms: 0 }),
+        buildEndpoint({ name: 'busy', min_latency_ms: 12, max_latency_ms: 80 }),
+      ]
+    );
+
+    const tile = tileByLabel('Latency range');
+    expect(tile).toBeTruthy();
+    const value = tile!.querySelector('.value')?.textContent?.trim();
+    // Exact-match: any "0ms" leaking from the idle endpoint would surface as
+    // a "0ms-80ms" floor. "80ms" itself contains the substring "0ms", so the
+    // exact equality is the load-bearing assertion here, not a substring deny.
+    expect(value).toBe('12ms–80ms');
+  });
+});
+
+describe('OverviewPanel backend-types tile', () => {
+  it('counts by type, sorted by count desc then name', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus(),
+      [
+        buildEndpoint({ name: 'a', type: 'ollama' }),
+        buildEndpoint({ name: 'b', type: 'ollama' }),
+        buildEndpoint({ name: 'c', type: 'ollama' }),
+        buildEndpoint({ name: 'd', type: 'lm-studio' }),
+        buildEndpoint({ name: 'e', type: 'lm-studio' }),
+        buildEndpoint({ name: 'f', type: 'openai' }),
+      ]
+    );
+
+    const tile = tileByLabel('Backend types');
+    expect(tile).toBeTruthy();
+
+    // Rendered as one chip per type, not a single wrapping line of prose -
+    // check both the chip count/order and each chip's own text, so a
+    // count/name transposition would fail even if the joined text matched.
+    const chips = [...tile!.querySelectorAll('.backend-type-chip')];
+    expect(chips).toHaveLength(3);
+    expect(chips.map((c) => c.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+      '3 ollama',
+      '2 lm-studio',
+      '1 openai',
+    ]);
+  });
+
+  it('falls back to the no-data dash on an empty fleet', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(buildStatus(), []);
+
+    const tile = tileByLabel('Backend types');
+    expect(tile).toBeTruthy();
+    expect(tile!.querySelector('.value')?.textContent?.trim()).toContain('—');
+  });
+});
+
+describe('OverviewPanel security detail in sub', () => {
+  it('surfaces status, blocked IPs and the rate/size split', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus({
+        security: {
+          status: 'elevated',
+          blocked_ips: 2,
+          violations: { rate_limits: 5, size_limits: 9 },
+        },
+      }),
+      [buildEndpoint({ name: 'ep' })]
+    );
+
+    const tile = tileByLabel('Security violations');
+    expect(tile).toBeTruthy();
+    const sub = tile!.querySelector('.sub')?.textContent?.trim();
+    expect(sub).toContain('elevated');
+    expect(sub).toContain('2 blocked IPs');
+    expect(sub).toMatch(/5 rate/);
+    expect(sub).toMatch(/9 size/);
+  });
+});
+
+describe('OverviewPanel system-status tile (profile)', () => {
+  it('renders the proxy profile when present', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(buildStatus(), [buildEndpoint({ name: 'ep' })]);
+
+    const tile = tileByLabel('System status');
+    expect(tile).toBeTruthy();
+    expect(tile!.querySelector('.sub')?.textContent).toMatch(/balanced profile/);
+  });
+});
+
+describe('OverviewPanel banner isolation from panel dim', () => {
+  // Structural regression: opacity/filter on an ancestor compound down the
+  // subtree, so a CSS override on .banner is a no-op. The banner must live
+  // OUTSIDE the [data-state]-bearing wrapper to stay at full contrast during
+  // an outage. Assert the DOM structure, not computed style - jsdom has no
+  // layout, and the bug was exactly that the banner's own opacity was 1
+  // while its effective alpha was still dimmed by the ancestor.
+  it('renders the StatusBanner as a sibling of, not inside, the data-state wrapper', async () => {
+    // Force the panel into the stale state by driving the overview store to
+    // an error response, then asserting structure.
+    global.fetch = vi.fn(async () => jsonResponse({ system: { status: 'healthy' } }));
+    overview.refresh();
+    // Any completed fetch leaves overview.status reflecting the response; we
+    // just need the panel mounted so its DOM is queryable. Drive it stale by
+    // forcing the store's error path through a failed fetch on refresh.
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    // Plant stale data and force the store status to stale so the wrapper
+    // carries data-state='stale' and the banner renders.
+    await refreshTyped(buildStatus(), [buildEndpoint({ name: 'ep' })]);
+    // The store exposes status but no setter; swap fetch to a 500 and refresh
+    // to flip status to 'error', which the panel maps to data-state='error'.
+    global.fetch = vi.fn(async () => ({ status: 500, ok: false, headers: { get: () => null } }));
+    overview.refresh();
+    await vi.waitFor(() => expect(overview.status === 'error' || overview.status === 'stale').toBe(true));
+    flushSync();
+
+    const panel = document.getElementById('panel-overview')!;
+    expect(panel).toBeTruthy();
+    const dimmed = panel.querySelector('[data-state="stale"], [data-state="error"]');
+    expect(dimmed).toBeTruthy();
+    expect(dimmed!.getAttribute('data-state')).toMatch(/stale|error/);
+
+    const banner = panel.querySelector('.banner');
+    expect(banner).toBeTruthy();
+    // The banner must NOT be inside the dimmed wrapper - it should be a
+    // sibling of it within the panel root.
+    expect(dimmed!.contains(banner)).toBe(false);
+    expect(banner!.parentElement).toBe(panel);
+  });
+});
+
+describe('OverviewPanel no-traffic tile states', () => {
+  // When the backend reports has_traffic=false the response rate arrives as
+  // "N/A" and success_rate derived numbers become meaningless. The tiles must
+  // drop to a no-data caption rather than present "N/A" / "100% of traffic".
+
+  it('renders a dash and "no traffic yet" on the Response rate tile when has_traffic is false', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus({
+        system: {
+          success_rate: 'N/A',
+          total_requests: 0,
+          total_failures: 0,
+          has_traffic: false,
+        },
+      }),
+      [buildEndpoint({ name: 'ep', request_count: 0 })]
+    );
+    // refreshTyped's default sentinel keys on system.status, which stays
+    // 'healthy' across these tests and so resolves on the prior test's data.
+    // Wait specifically for the field under test before reading the DOM.
+    await vi.waitFor(() => expect(overview.data?.system?.has_traffic).toBe(false));
+    flushSync();
+
+    const tile = tileByLabel('Response rate');
+    expect(tile).toBeTruthy();
+    const value = tile!.querySelector('.value')?.textContent?.trim();
+    expect(value).toContain('—');
+    expect(value).not.toContain('N/A');
+    expect(tile!.querySelector('.sub')?.textContent?.trim()).toMatch(/no traffic yet/);
+  });
+
+  it('renders "no traffic yet" on the Total failures tile sub when has_traffic is false', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus({
+        system: {
+          success_rate: 'N/A',
+          total_requests: 0,
+          total_failures: 0,
+          has_traffic: false,
+        },
+      }),
+      [buildEndpoint({ name: 'ep', request_count: 0 })]
+    );
+    await vi.waitFor(() => expect(overview.data?.system?.has_traffic).toBe(false));
+    flushSync();
+
+    const tile = tileByLabel('Total failures');
+    expect(tile).toBeTruthy();
+    const sub = tile!.querySelector('.sub')?.textContent?.trim();
+    // Must not show "100.0% of traffic" - the regression that motivated this.
+    expect(sub).toMatch(/no traffic yet/);
+    expect(sub).not.toMatch(/of traffic/);
+  });
+
+  it('still shows the live rate and failure percentage once traffic arrives', async () => {
+    component = mount(OverviewPanel, { target: document.body });
+    flushSync();
+
+    await refreshTyped(
+      buildStatus({
+        system: { success_rate: '95.0%', total_requests: 100, total_failures: 5, has_traffic: true },
+      }),
+      [buildEndpoint({ name: 'ep', request_count: 100 })]
+    );
+    await vi.waitFor(() => expect(overview.data?.system?.success_rate).toBe('95.0%'));
+    flushSync();
+
+    const rateTile = tileByLabel('Response rate');
+    expect(rateTile!.querySelector('.value')?.textContent?.trim()).toBe('95.0%');
+    expect(rateTile!.querySelector('.sub')?.textContent?.trim()).toMatch(/failures logged/);
+
+    const failTile = tileByLabel('Total failures');
+    // 100 - 95.0 = 5.0% of traffic.
+    expect(failTile!.querySelector('.sub')?.textContent?.trim()).toBe('5.0% of traffic');
+  });
+});
