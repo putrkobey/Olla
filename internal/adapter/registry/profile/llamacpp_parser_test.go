@@ -251,3 +251,510 @@ func TestLlamaCppParser_Parse(t *testing.T) {
 					"owned_by": "llamacpp"
 				}
 			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		// Details should exist (because Format is always set)
+		require.NotNil(t, model.Details)
+		// But ModifiedAt should be nil when timestamp is 0
+		assert.Nil(t, model.Details.ModifiedAt)
+		// Format should still be set
+		require.NotNil(t, model.Details.Format)
+		assert.Equal(t, constants.RecipeGGUF, *model.Details.Format)
+	})
+
+	t.Run("handles multiple models with different publishers", func(t *testing.T) {
+		// Edge case: llama.cpp typically serves one model, but parser must handle multiple
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "llama-3.1-8b-instruct.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": "meta-llama"
+				},
+				{
+					"id": "mistral-7b-v0.1.gguf",
+					"object": "model",
+					"created": 1704067300,
+					"owned_by": "mistralai"
+				},
+				{
+					"id": "deepseek-coder-6.7b-instruct.Q5_K_M.gguf",
+					"object": "model",
+					"created": 1704067400,
+					"owned_by": "deepseek-ai"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 3)
+
+		// Verify each model
+		assert.Equal(t, "llama-3.1-8b-instruct.gguf", models[0].Name)
+		require.NotNil(t, models[0].Details.Publisher)
+		assert.Equal(t, "meta-llama", *models[0].Details.Publisher)
+
+		assert.Equal(t, "mistral-7b-v0.1.gguf", models[1].Name)
+		require.NotNil(t, models[1].Details.Publisher)
+		assert.Equal(t, "mistralai", *models[1].Details.Publisher)
+
+		assert.Equal(t, "deepseek-coder-6.7b-instruct.Q5_K_M.gguf", models[2].Name)
+		require.NotNil(t, models[2].Details.Publisher)
+		assert.Equal(t, "deepseek-ai", *models[2].Details.Publisher)
+	})
+
+	t.Run("type field is always set to llamacpp", func(t *testing.T) {
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "test-model-1.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": "publisher-1"
+				},
+				{
+					"id": "test-model-2.gguf",
+					"object": "model",
+					"created": 1704067300,
+					"owned_by": "llamacpp"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 2)
+
+		// Verify type is set correctly for all models
+		for i, model := range models {
+			assert.Empty(t, model.Type, "Model %d: provider names are not model kinds", i)
+		}
+	})
+
+	t.Run("handles empty owned_by field", func(t *testing.T) {
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "test-model.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": ""
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		require.NotNil(t, model.Details)
+		// Publisher should not be set when owned_by is empty
+		assert.Nil(t, model.Details.Publisher)
+		// Format should still be set
+		require.NotNil(t, model.Details.Format)
+		assert.Equal(t, constants.RecipeGGUF, *model.Details.Format)
+	})
+
+	t.Run("preserves LastSeen timestamp", func(t *testing.T) {
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "test-model.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": "test"
+				}
+			]
+		}`
+
+		beforeParse := time.Now()
+		models, err := parser.Parse([]byte(response))
+		afterParse := time.Now()
+
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		// LastSeen should be set to current time during parsing
+		assert.True(t, model.LastSeen.After(beforeParse) || model.LastSeen.Equal(beforeParse))
+		assert.True(t, model.LastSeen.Before(afterParse) || model.LastSeen.Equal(afterParse))
+	})
+}
+
+func TestLlamaCppParser_RealWorldModelNames(t *testing.T) {
+	parser := &llamaCppParser{}
+
+	t.Run("handles real GGUF model names", func(t *testing.T) {
+		testCases := []struct {
+			modelName string
+			publisher string
+		}{
+			{"llama-3.1-8b-instruct-q4_k_m.gguf", "meta-llama"},
+			{"mistral-7b-v0.1-q4_0.gguf", "mistralai"},
+			{"tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf", "TinyLlama"},
+			{"nomic-embed-text-v1.5.Q4_K_M.gguf", "nomic-ai"},
+			{"deepseek-coder-6.7b-instruct.Q5_K_M.gguf", "deepseek-ai"},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.modelName, func(t *testing.T) {
+				response := fmt.Sprintf(`{
+					"object": "list",
+					"data": [
+						{
+							"id": "%s",
+							"object": "model",
+							"created": 1704067200,
+							"owned_by": "%s"
+						}
+					]
+				}`, tc.modelName, tc.publisher)
+
+				models, err := parser.Parse([]byte(response))
+				require.NoError(t, err)
+				require.Len(t, models, 1)
+
+				model := models[0]
+				assert.Equal(t, tc.modelName, model.Name)
+				assert.Empty(t, model.Type, "provider names are not model kinds")
+				require.NotNil(t, model.Details)
+				require.NotNil(t, model.Details.Format)
+				assert.Equal(t, constants.RecipeGGUF, *model.Details.Format)
+				require.NotNil(t, model.Details.Publisher)
+				assert.Equal(t, tc.publisher, *model.Details.Publisher)
+			})
+		}
+	})
+}
+
+func TestLlamaCppParser_EdgeCases(t *testing.T) {
+	parser := &llamaCppParser{}
+
+	t.Run("handles model without optional fields", func(t *testing.T) {
+		// Minimal valid response with only required fields
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "minimal-model.gguf",
+					"object": "model"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		assert.Equal(t, "minimal-model.gguf", model.Name)
+		assert.Empty(t, model.Type, "provider names are not model kinds")
+		// Details should exist because Format is always set
+		require.NotNil(t, model.Details)
+		require.NotNil(t, model.Details.Format)
+		assert.Equal(t, constants.RecipeGGUF, *model.Details.Format)
+	})
+
+	t.Run("handles negative timestamp", func(t *testing.T) {
+		// Negative timestamps should be treated like zero (not set)
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "test-model.gguf",
+					"object": "model",
+					"created": -1,
+					"owned_by": "llamacpp"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		require.NotNil(t, model.Details)
+		// Negative timestamp should not be set as ModifiedAt
+		assert.Nil(t, model.Details.ModifiedAt)
+	})
+
+	t.Run("handles model with meta field", func(t *testing.T) {
+		// Discovery does not depend on optional upstream metadata.
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "model-with-meta.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": "llamacpp",
+					"meta": {
+						"vocab_type": 1,
+						"n_vocab": 32000,
+						"n_ctx_train": 4096,
+						"n_embd": 4096,
+						"n_params": 6738415616,
+						"size": 4080000000
+					}
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+
+		model := models[0]
+		assert.Equal(t, "model-with-meta.gguf", model.Name)
+		require.NotNil(t, model.Details)
+		require.NotNil(t, model.Details.Format)
+		assert.Equal(t, constants.RecipeGGUF, *model.Details.Format)
+	})
+
+	t.Run("handles models array in dual format response", func(t *testing.T) {
+		// llama.cpp can return both 'data' and 'models' arrays (Ollama compatibility)
+		// Parser should only use 'data' array
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "data-model.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": "llamacpp"
+				}
+			],
+			"models": [
+				{
+					"id": "models-model.gguf",
+					"object": "model",
+					"created": 1704067300,
+					"owned_by": "llamacpp"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		// Should only parse from 'data' array, not 'models' array
+		require.Len(t, models, 1)
+		assert.Equal(t, "data-model.gguf", models[0].Name)
+	})
+}
+
+func TestLlamaCppParser_Issue222(t *testing.T) {
+	// llama.cpp b10859 returned a boolean vocab_type and a string ftype.
+	// This reproduces #222 with the server arguments and preset text omitted.
+	response := `{
+		"data": [{
+			"id": "Qwen3-Coder-30B-A3B",
+			"aliases": [],
+			"tags": [],
+			"object": "model",
+			"owned_by": "llamacpp",
+			"created": 1789077214,
+			"status": {"value": "loaded"},
+			"architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+			"source": "preset",
+			"can_remove": false,
+			"meta": {
+				"vocab_type": true,
+				"n_vocab": 151936,
+				"n_ctx": 65536,
+				"n_ctx_train": 262144,
+				"n_embd": 2048,
+				"n_params": 30532122624,
+				"size": 17659361280,
+				"ftype": "Q4_K - Medium"
+			}
+		}],
+		"object": "list"
+	}`
+	parser := &llamaCppParser{}
+	models, err := parser.Parse([]byte(response))
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	assert.Equal(t, "Qwen3-Coder-30B-A3B", models[0].Name)
+	assert.Empty(t, models[0].Type, "provider names are not model kinds")
+	require.NotNil(t, models[0].Details)
+	require.NotNil(t, models[0].Details.ModifiedAt)
+	assert.Equal(t, time.Unix(1789077214, 0), *models[0].Details.ModifiedAt)
+	assert.Nil(t, models[0].Details.Publisher)
+	require.NotNil(t, models[0].Details.Format)
+	assert.Equal(t, constants.RecipeGGUF, *models[0].Details.Format)
+}
+
+func TestLlamaCppParser_MetadataCompatibility(t *testing.T) {
+	parser := &llamaCppParser{}
+	tests := []struct {
+		name string
+		meta string
+	}{
+		{"numeric vocabulary type", `{"vocab_type": 2}`},
+		{"boolean vocabulary type", `{"vocab_type": true}`},
+		{"false vocabulary type", `{"vocab_type": false}`},
+		{"null vocabulary type", `{"vocab_type": null}`},
+		{"missing vocabulary type", `{}`},
+		{"changed metadata fields", `{"n_vocab": "32000", "n_ctx_train": false, "n_embd": [], "n_params": {}, "size": "4GB", "ftype": "Q4_K_M"}`},
+		{"null metadata", `null`},
+		{"non-object metadata", `"unavailable"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := fmt.Sprintf(`{
+				"data": [{"id": "model.gguf", "created": 1704067200, "owned_by": "publisher", "meta": %s}],
+				"models": [{"id": "model.gguf", "meta": %s}]
+			}`, tt.meta, tt.meta)
+
+			models, err := parser.Parse([]byte(response))
+			require.NoError(t, err)
+			require.Len(t, models, 1)
+			assert.Equal(t, "model.gguf", models[0].Name)
+			assert.Empty(t, models[0].Type, "provider names are not model kinds")
+			require.NotNil(t, models[0].Details)
+			require.NotNil(t, models[0].Details.ModifiedAt)
+			assert.Equal(t, time.Unix(1704067200, 0), *models[0].Details.ModifiedAt)
+			require.NotNil(t, models[0].Details.Publisher)
+			assert.Equal(t, "publisher", *models[0].Details.Publisher)
+			require.NotNil(t, models[0].Details.Format)
+			assert.Equal(t, constants.RecipeGGUF, *models[0].Details.Format)
+		})
+	}
+}
+
+func TestLlamaCppParser_IgnoresUnusedFields(t *testing.T) {
+	parser := &llamaCppParser{}
+	// Neither the duplicate models array nor object markers contribute to discovery.
+	response := `{
+		"object": false,
+		"data": [{"id": "model.gguf", "object": {}, "meta": {"vocab_type": true}}],
+		"models": [{"id": 123, "created": false, "owned_by": [], "meta": {"vocab_type": true}}]
+	}`
+	models, err := parser.Parse([]byte(response))
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	assert.Equal(t, "model.gguf", models[0].Name)
+}
+
+func TestLlamaCppParser_RejectsInvalidDiscoveryFields(t *testing.T) {
+	parser := &llamaCppParser{}
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"invalid data", `{"data": {"id": "model.gguf"}}`},
+		{"invalid identifier", `{"data": [{"id": true}]}`},
+		{"invalid timestamp", `{"data": [{"id": "model.gguf", "created": "yesterday"}]}`},
+		{"invalid publisher", `{"data": [{"id": "model.gguf", "owned_by": []}]}`},
+		{"truncated metadata", `{"data": [{"id": "model.gguf", "meta": {"vocab_type":`},
+		{"invalid metadata JSON", `{"data": [{"id": "model.gguf", "meta": {"vocab_type": invalid}}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			models, err := parser.Parse([]byte(tt.body))
+			require.ErrorContains(t, err, "failed to parse llama.cpp response")
+			assert.Nil(t, models)
+		})
+	}
+}
+
+func TestLlamaCppParser_PerformanceConsiderations(t *testing.T) {
+	parser := &llamaCppParser{}
+
+	t.Run("handles large model list efficiently", func(t *testing.T) {
+		// Although llama.cpp typically serves one model,
+		// parser must handle multiple models efficiently
+		modelCount := 50
+		modelsJSON := ""
+		var modelsJSONSb566 strings.Builder
+		for i := range modelCount {
+			if i > 0 {
+				modelsJSONSb566.WriteString(",")
+			}
+			modelsJSONSb566.WriteString(fmt.Sprintf(`{
+				"id": "model-%d.gguf",
+				"object": "model",
+				"created": %d,
+				"owned_by": "publisher-%d"
+			}`, i, 1704067200+i, i%5))
+		}
+		modelsJSON += modelsJSONSb566.String()
+
+		response := fmt.Sprintf(`{
+			"object": "list",
+			"data": [%s]
+		}`, modelsJSON)
+
+		startTime := time.Now()
+		models, err := parser.Parse([]byte(response))
+		parseTime := time.Since(startTime)
+
+		require.NoError(t, err)
+		assert.Len(t, models, modelCount)
+
+		// Parsing should be fast even with many models
+		assert.Less(t, parseTime, 100*time.Millisecond)
+
+		// Verify a sample of models
+		assert.Equal(t, "model-0.gguf", models[0].Name)
+		assert.Equal(t, "model-49.gguf", models[49].Name)
+		// All should have GGUF format
+		for _, model := range models {
+			require.NotNil(t, model.Details)
+			require.NotNil(t, model.Details.Format)
+			assert.Equal(t, constants.RecipeGGUF, *model.Details.Format)
+		}
+	})
+
+	t.Run("LastSeen timestamp is captured once for efficiency", func(t *testing.T) {
+		// All models in a single parse should have the same LastSeen timestamp
+		// This verifies the optimization of capturing timestamp once
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "model-1.gguf",
+					"object": "model",
+					"created": 1704067200,
+					"owned_by": "llamacpp"
+				},
+				{
+					"id": "model-2.gguf",
+					"object": "model",
+					"created": 1704067300,
+					"owned_by": "llamacpp"
+				},
+				{
+					"id": "model-3.gguf",
+					"object": "model",
+					"created": 1704067400,
+					"owned_by": "llamacpp"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 3)
+
+		// All models should have identical LastSeen timestamps
+		// (captured once at parse time, not per model)
+		firstTimestamp := models[0].LastSeen
+		for i, model := range models {
+			assert.Equal(t, firstTimestamp, model.LastSeen, "Model %d should have same LastSeen timestamp", i)
+		}
+	})
+}

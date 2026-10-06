@@ -49,3 +49,54 @@ func TestStreamingBackendError_ErrorBodyCapped(t *testing.T) {
 		name:                  "cap-test-translator",
 		implementsErrorWriter: true,
 		writeErrorFunc: func(w http.ResponseWriter, err error, statusCode int) {
+			w.WriteHeader(statusCode)
+		},
+		transformRequestFunc: func(_ context.Context, _ *http.Request) (*translator.TransformedRequest, error) {
+			return &translator.TransformedRequest{
+				OpenAIRequest: map[string]interface{}{
+					"model":    "test-model",
+					"stream":   true,
+					"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+				},
+				ModelName:   "test-model",
+				IsStreaming: true,
+			}, nil
+		},
+	}
+
+	app := &Application{
+		logger:           &mockStyledLogger{},
+		proxyService:     &mockProxyService{proxyFunc: proxyFunc},
+		statsCollector:   &mockStatsCollector{},
+		repository:       &mockEndpointRepository{},
+		inspectorChain:   inspector.NewChain(&mockStyledLogger{}),
+		profileFactory:   &mockProfileFactory{},
+		discoveryService: &mockDiscoveryServiceForTranslation{},
+		Config:           &config.Config{},
+	}
+
+	reqBody := `{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewBufferString(reqBody))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+
+	// Run the handler in a goroutine so we can apply a local deadline. A deadlock
+	// (missing LimitReader + CloseWithError) would hang here indefinitely.
+	type result struct {
+		code int
+	}
+	ch := make(chan result, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		app.translationHandler(trans).ServeHTTP(rec, req)
+		ch <- result{code: rec.Code}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.code != http.StatusInternalServerError {
+			t.Errorf("expected 500 from backend error path, got %d", r.code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler deadlocked — LimitReader cap or CloseWithError may be missing")
+	}
+}
