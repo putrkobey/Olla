@@ -126,3 +126,259 @@ func TestLifecycleUnifier_ModelTTLCleanup(t *testing.T) {
 
 	// Wait for TTL to expire
 	time.Sleep(200 * time.Millisecond)
+
+	// Model should be removed
+	model, err = unifier.ResolveModel(ctx, "test-model")
+	assert.Error(t, err)
+	assert.Nil(t, model)
+}
+
+func TestLifecycleUnifier_CircuitBreaker(t *testing.T) {
+	config := DefaultConfig()
+	config.CircuitBreaker.Enabled = true
+	config.CircuitBreaker.FailureThreshold = 3
+	config.CircuitBreaker.OpenDuration = 100 * time.Millisecond
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
+	endpoint := &domain.Endpoint{
+		URLString: "http://test-endpoint",
+		Name:      "test-endpoint",
+	}
+
+	// Record failures to trip the circuit breaker
+	for i := range 3 {
+		unifier.RecordEndpointFailure(endpoint.URLString, fmt.Errorf("failure %d", i))
+	}
+
+	// Check circuit breaker stats
+	stats := unifier.GetCircuitBreakerStats()
+	assert.NotEmpty(t, stats)
+	assert.Equal(t, "open", stats[endpoint.URLString].State)
+
+	// UnifyModels should fail when circuit is open
+	_, err = unifier.UnifyModels(ctx, []*domain.ModelInfo{}, endpoint)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "circuit breaker open")
+
+	// Wait for circuit to transition to half-open
+	time.Sleep(150 * time.Millisecond)
+}
+
+func TestLifecycleUnifier_EndpointRemoval(t *testing.T) {
+	config := DefaultConfig()
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
+	endpoint1 := &domain.Endpoint{
+		URLString: "http://endpoint1",
+		Name:      "endpoint1",
+	}
+	endpoint2 := &domain.Endpoint{
+		URLString: "http://endpoint2",
+		Name:      "endpoint2",
+	}
+
+	// Add models from both endpoints
+	models := []*domain.ModelInfo{
+		{
+			Name: "shared-model",
+			Size: 1000,
+			Details: &domain.ModelDetails{
+				Digest: strPtr("shared123"),
+				State:  strPtr("loaded"),
+			},
+		},
+		{
+			Name: "unique-model",
+			Size: 2000,
+			Details: &domain.ModelDetails{
+				Digest: strPtr("unique123"),
+				State:  strPtr("loaded"),
+			},
+		},
+	}
+
+	// Register from endpoint1
+	unified1, err := unifier.UnifyModels(ctx, models, endpoint1)
+	assert.NoError(t, err)
+	assert.Len(t, unified1, 2)
+
+	// Register shared model from endpoint2
+	unified2, err := unifier.UnifyModels(ctx, models[:1], endpoint2)
+	assert.NoError(t, err)
+	assert.Len(t, unified2, 1)
+
+	// Verify shared model has both endpoints
+	sharedModel, err := unifier.ResolveModel(ctx, "shared-model")
+	assert.NoError(t, err)
+	assert.Len(t, sharedModel.SourceEndpoints, 2)
+
+	// Remove endpoint1
+	err = unifier.RemoveEndpoint(ctx, endpoint1.URLString)
+	assert.NoError(t, err)
+
+	// Shared model should still exist with only endpoint2
+	sharedModel, err = unifier.ResolveModel(ctx, "shared-model")
+	assert.NoError(t, err)
+	assert.Len(t, sharedModel.SourceEndpoints, 1)
+	assert.Equal(t, endpoint2.URLString, sharedModel.SourceEndpoints[0].EndpointURL)
+
+	// Unique model should be removed
+	uniqueModel, err := unifier.ResolveModel(ctx, "unique-model")
+	assert.Error(t, err)
+	assert.Nil(t, uniqueModel)
+}
+
+func TestLifecycleUnifier_StateTransitions(t *testing.T) {
+	config := DefaultConfig()
+	config.EnableStateTransitionLogging = true
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
+	endpoint := &domain.Endpoint{
+		URLString: "http://test-endpoint",
+		Name:      "test-endpoint",
+	}
+
+	// Add model
+	models := []*domain.ModelInfo{
+		{
+			Name: "test-model",
+			Size: 1000,
+			Details: &domain.ModelDetails{
+				State: strPtr("loaded"),
+			},
+		},
+	}
+
+	unified, err := unifier.UnifyModels(ctx, models, endpoint)
+	assert.NoError(t, err)
+	assert.Len(t, unified, 1)
+
+	// Record failures to mark endpoint offline
+	for i := range config.MaxConsecutiveFailures {
+		unifier.RecordEndpointFailure(endpoint.URLString, fmt.Errorf("failure %d", i))
+	}
+
+	// Verify endpoint state
+	state := unifier.GetEndpointState(endpoint.URLString)
+	assert.NotNil(t, state)
+	assert.Equal(t, domain.EndpointStateOffline, state.State)
+}
+
+func TestLifecycleUnifier_ConcurrentOperations(t *testing.T) {
+	config := DefaultConfig()
+	logger := createTestLogger()
+
+	unifier := NewLifecycleUnifier(config, logger).(*LifecycleUnifier)
+
+	ctx := context.Background()
+	err := unifier.Start(ctx)
+	require.NoError(t, err)
+	defer unifier.Stop(ctx)
+
+	// Run concurrent operations
+	done := make(chan bool, 3)
+
+	// Goroutine 1: Add models
+	go func() {
+		for i := range 10 {
+			endpoint := &domain.Endpoint{
+				URLString: fmt.Sprintf("http://endpoint%d", i),
+				Name:      fmt.Sprintf("endpoint%d", i),
+			}
+			models := []*domain.ModelInfo{
+				{
+					Name: fmt.Sprintf("model%d", i),
+					Size: int64(i * 1000),
+				},
+			}
+			unifier.UnifyModels(ctx, models, endpoint)
+		}
+		done <- true
+	}()
+
+	// Goroutine 2: Query models
+	go func() {
+		for range 20 {
+			unifier.GetAllModels(ctx)
+			time.Sleep(10 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 3: Record failures
+	go func() {
+		for i := range 15 {
+			url := fmt.Sprintf("http://endpoint%d", i%5)
+			unifier.RecordEndpointFailure(url, errors.New("test error"))
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Wait for all goroutines
+	for range 3 {
+		<-done
+	}
+
+	// Verify no panic and data is consistent
+	models, err := unifier.GetAllModels(ctx)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, models)
+}
+
+// Helper functions
+func strPtr(s string) *string {
+	return &s
+}
+
+func createTestLogger() logger.StyledLogger {
+	opts := &slog.HandlerOptions{Level: slog.LevelError}
+	handler := slog.NewTextHandler(os.Stderr, opts)
+	slogLogger := slog.New(handler)
+	return logger.NewPlainStyledLogger(slogLogger)
+}
+
+// The state decoration UnifyModels adds must be what the catalogue serves
+// afterwards, not just what the call returned.
+func TestLifecycleUnifier_StateDecorationPersistsInCatalogue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	u := NewLifecycleUnifier(DefaultConfig(), createTestLogger()).(*LifecycleUnifier)
+	endpoint := &domain.Endpoint{URLString: "http://test-endpoint", Name: "test-endpoint"}
+
+	returned, err := u.UnifyModels(ctx, []*domain.ModelInfo{{Name: "llama3:8b"}}, endpoint)
+	require.NoError(t, err)
+	require.Len(t, returned, 1)
+	require.NotNil(t, returned[0].SourceEndpoints[0].StateInfo)
+
+	byID, err := u.ResolveModel(ctx, returned[0].ID)
+	require.NoError(t, err)
+	assert.NotNil(t, byID.SourceEndpoints[0].StateInfo, "ResolveModel lost the decoration")
+	assert.False(t, byID.SourceEndpoints[0].LastStateCheck.IsZero())
+
+	all, err := u.GetAllModels(ctx)
+	require.NoError(t, err)
+	require.Len(t, all, 1)
+	assert.NotNil(t, all[0].SourceEndpoints[0].StateInfo, "GetAllModels lost the decoration")
+}
