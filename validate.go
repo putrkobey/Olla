@@ -47,3 +47,152 @@ func buildValidationReport(items []validationItem) (report string, exitCode int)
 				fmt.Fprintf(&buf, "         - %s\n", w)
 			}
 			clean = false
+		default:
+			fmt.Fprintf(&buf, "[OK]   %-12s %s\n", item.Name, item.Detail)
+		}
+	}
+
+	// Ignored keys are an advisory only: Olla loads such files fine, so they
+	// stay out of the WARN/FAIL path and cannot change the exit code (CI that
+	// validates shipped-derived configs must not start failing because of them).
+	for _, item := range items {
+		if len(item.Ignored) == 0 {
+			continue
+		}
+		fmt.Fprintf(&buf, "\nIgnored keys in %s (%d) - not read by Olla, no effect on the result:\n", item.IgnoredIn, len(item.Ignored))
+		shown, more := capUnknownKeys(item.Ignored)
+		for _, k := range shown {
+			fmt.Fprintf(&buf, "         - %s\n", k)
+		}
+		if more > 0 {
+			fmt.Fprintf(&buf, "         - and %d more\n", more)
+		}
+	}
+
+	buf.WriteString("\n")
+	if clean {
+		buf.WriteString("Result: PASS - all configuration files are valid\n")
+		return buf.String(), 0
+	}
+	buf.WriteString("Result: FAIL - one or more configuration files could not be fully parsed\n")
+	return buf.String(), 1
+}
+
+// runValidateConfig loads the main config, models.yaml and all profiles the
+// same way the running server would, and builds a validation report. Kept
+// thin and deliberately not directly unit-tested (it touches the real
+// filesystem and package-level singletons in the config/unifier packages) -
+// buildValidationReport carries the testable logic, and this function is
+// exercised end-to-end by running the binary against the shipped configs.
+func runValidateConfig(configFile string) (string, int) {
+	var items []validationItem
+
+	cfg, err := config.Load(configFile)
+	if err != nil {
+		items = append(items, validationItem{Name: "config.yaml", Err: err})
+	} else {
+		source := cfg.Filename
+		if source == "" {
+			source = "(none found, using built-in defaults)"
+		} else {
+			source = "loaded from " + source
+		}
+		items = append(items, validationItem{Name: "config.yaml", Detail: source, IgnoredIn: cfg.Filename, Ignored: append(unknownKeyStrings(cfg.UnknownKeys), deprecatedProxyRetryKeys(cfg)...)})
+	}
+
+	_, modelErr := unifier.LoadModelConfig()
+	modelSource := unifier.ConfigSource()
+	if modelSource == "" {
+		modelSource = "using embedded defaults"
+	} else {
+		modelSource = "loaded from " + modelSource
+	}
+	items = append(items, validationItem{
+		Name:     "models.yaml",
+		Detail:   modelSource,
+		Warnings: unifier.ConfigWarnings(),
+		Err:      modelErr,
+	})
+
+	profileFactory, profileErr := profile.NewFactoryWithDefaults()
+	if profileErr != nil {
+		items = append(items, validationItem{Name: "profiles", Err: profileErr})
+	} else {
+		count := len(profileFactory.GetAvailableProfiles())
+		items = append(items, validationItem{
+			Name:     "profiles",
+			Detail:   fmt.Sprintf("%d profile(s) loaded", count),
+			Warnings: profileFactory.LoadWarnings(),
+		})
+	}
+
+	return buildValidationReport(items)
+}
+
+// deprecatedProxyRetryKeys lists the legacy proxy keys the operator set.
+func deprecatedProxyRetryKeys(cfg *config.Config) []string {
+	var set []string
+	if cfg.Proxy.MaxRetries != 0 {
+		set = append(set, "proxy.max_retries")
+	}
+	if cfg.Proxy.RetryBackoff != 0 {
+		set = append(set, "proxy.retry_backoff")
+	}
+	return set
+}
+
+// deprecatedProxyRetryFields names the legacy proxy.max_retries / retry_backoff
+// keys when the operator set them, or returns "". Both defaults are zero, so a
+// non-zero value can only have come from the file. They were never read, and are
+// deliberately not mapped onto proxy.retry: the old default of 3 would silently
+// cap failover for anyone who copied it from an example.
+func deprecatedProxyRetryFields(cfg *config.Config) string {
+	set := deprecatedProxyRetryKeys(cfg)
+	if len(set) == 0 {
+		return ""
+	}
+	return strings.Join(set, " and ") + " do nothing and will be removed; failover is controlled by proxy.retry (enabled, max_attempts, non_idempotent)"
+}
+
+// warnDeprecatedProxyRetry emits one startup WARN when the legacy keys are set.
+func warnDeprecatedProxyRetry(warn func(msg string, args ...any), cfg *config.Config) {
+	if msg := deprecatedProxyRetryFields(cfg); msg != "" {
+		warn("Deprecated config keys have no effect: " + msg)
+	}
+}
+
+func unknownKeyStrings(keys []config.UnknownKey) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k.String())
+	}
+	return out
+}
+
+// maxUnknownKeysShown bounds how many ignored keys are printed. The count still
+// reports the true total; a pathological config should not produce a huge log line.
+const maxUnknownKeysShown = 100
+
+// capUnknownKeys splits keys into the ones to print and the number left out.
+func capUnknownKeys(keys []string) (shown []string, more int) {
+	if len(keys) <= maxUnknownKeysShown {
+		return keys, 0
+	}
+	return keys[:maxUnknownKeysShown], len(keys) - maxUnknownKeysShown
+}
+
+// warnUnknownKeys emits a single startup WARN listing the ignored keys (capped
+// at maxUnknownKeysShown), so a config with many typos is one log line rather
+// than a flood. Silent when the config is clean.
+func warnUnknownKeys(warn func(msg string, args ...any), keys []config.UnknownKey) {
+	if len(keys) == 0 {
+		return
+	}
+	shown, more := capUnknownKeys(unknownKeyStrings(keys))
+	list := strings.Join(shown, ", ")
+	if more > 0 {
+		list += fmt.Sprintf(", and %d more", more)
+	}
+	warn("Ignoring unknown keys in config (not read by Olla, check for typos)",
+		"count", len(keys), "keys", list)
+}
