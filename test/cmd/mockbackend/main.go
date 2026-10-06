@@ -59,3 +59,64 @@ func main() {
 	// Chat completions: the route Olla proxies inference requests through.
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		if !authorised(w, r, *requireHeader, *requireValue) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "mock-cmpl-001",
+			"object":  "chat.completion",
+			"created": time.Now().Unix(),
+			"model":   "mock-model",
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"message": map[string]any{
+						"role":    "assistant",
+						"content": "mock-backend: auth accepted",
+					},
+					"finish_reason": "stop",
+				},
+			},
+			"usage": map[string]any{"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+		})
+	})
+
+	slog.Info("mockbackend listening",
+		"addr", *addr,
+		"require_header", *requireHeader,
+	)
+
+	srv := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	if err := srv.ListenAndServe(); err != nil {
+		fmt.Fprintf(os.Stderr, "mockbackend: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// authorised checks the required credential and writes a 401 response when it
+// is absent or wrong. Returns true when the request may proceed.
+func authorised(w http.ResponseWriter, r *http.Request, header, value string) bool {
+	if header == "" {
+		return true
+	}
+	got := strings.TrimSpace(r.Header.Get(header))
+	if got == value {
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("WWW-Authenticate", `Bearer realm="mockbackend"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": fmt.Sprintf("missing or invalid %s header", header),
+			"type":    "authentication_error",
+			"code":    "invalid_api_key",
+		},
+	})
+	return false
+}

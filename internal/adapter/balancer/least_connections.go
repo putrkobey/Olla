@@ -42,3 +42,47 @@ func (l *LeastConnectionsSelector) Select(ctx context.Context, endpoints []*doma
 		if endpoint.Status.IsRoutable() {
 			routable = append(routable, endpoint)
 		}
+	}
+
+	if len(routable) == 0 {
+		return nil, errors.New("no routable endpoints available")
+	}
+
+	// Read each candidate's count directly instead of building a map of every
+	// tracked endpoint via GetConnectionStats - Select runs per request, and
+	// most of that map would be discarded unread.
+	//
+	// tied collects every endpoint sharing the current minimum, not just the
+	// first one found, so a rotating cursor can distribute selection among
+	// them instead of a strict less-than always favouring registration order.
+	tied := make([]*domain.Endpoint, 0, len(routable))
+	minConnections := int64(-1)
+
+	for _, endpoint := range routable {
+		connections := l.statsCollector.GetConnectionCount(endpoint.URLString)
+
+		switch {
+		case minConnections == -1 || connections < minConnections:
+			minConnections = connections
+			tied = tied[:0]
+			tied = append(tied, endpoint)
+		case connections == minConnections:
+			tied = append(tied, endpoint)
+		}
+	}
+
+	if len(tied) == 1 {
+		return tied[0], nil
+	}
+
+	idx := l.cursor.Add(1) - 1
+	return tied[idx%uint64(len(tied))], nil
+}
+
+func (l *LeastConnectionsSelector) IncrementConnections(endpoint *domain.Endpoint) {
+	l.statsCollector.RecordConnection(endpoint, 1)
+}
+
+func (l *LeastConnectionsSelector) DecrementConnections(endpoint *domain.Endpoint) {
+	l.statsCollector.RecordConnection(endpoint, -1)
+}
