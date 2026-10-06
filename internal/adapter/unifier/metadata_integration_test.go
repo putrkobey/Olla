@@ -200,3 +200,205 @@ func TestDefaultUnifier_MetadataExtraction(t *testing.T) {
 			},
 		},
 		{
+			name:     "Ollama completion-only model has neither vision nor function calling",
+			models:   parseOllamaModels(t, `{"models":[{"name":"llama3:8b","details":{"family":"llama"},"capabilities":["completion"]}]}`),
+			endpoint: createTestEndpoint("http://localhost:11434", "Ollama"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.Contains(t, model.Capabilities, "text-generation")
+				assert.NotContains(t, model.Capabilities, "vision")
+				assert.NotContains(t, model.Capabilities, "function_calling")
+			},
+		},
+		{
+			name:     "TEI embedding kind gets embedding capabilities and no text-generation",
+			models:   parseTEIModels(t, `{"model_id":"BAAI/bge-small-en-v1.5","model_type":{"embedding":{"pooling":"cls"}}}`),
+			endpoint: createTestEndpoint("http://localhost:3000", "TEI"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.ElementsMatch(t, []string{"embeddings", "similarity", "vector-search"}, model.Capabilities)
+			},
+		},
+		{
+			name:     "TEI reranker kind gets rerank and no text-generation",
+			models:   parseTEIModels(t, `{"model_id":"BAAI/bge-reranker-base","model_type":{"reranker":{}}}`),
+			endpoint: createTestEndpoint("http://localhost:3001", "TEI"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.Contains(t, model.Capabilities, "rerank")
+				assert.Contains(t, model.Capabilities, "classification", "TEI /predict serves rerankers")
+				assert.NotContains(t, model.Capabilities, "text-generation")
+				assert.NotContains(t, model.Capabilities, "embeddings")
+			},
+		},
+		{
+			name:     "TEI classifier kind gets classification and no text-generation",
+			models:   parseTEIModels(t, `{"model_id":"SamLowe/roberta-base-go_emotions","model_type":{"classifier":{"id2label":{"0":"joy"}}}}`),
+			endpoint: createTestEndpoint("http://localhost:3002", "TEI"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.Contains(t, model.Capabilities, "classification")
+				assert.NotContains(t, model.Capabilities, "text-generation")
+				assert.NotContains(t, model.Capabilities, "embeddings")
+			},
+		},
+		{
+			name:     "TEI without model_type stays an embedding model",
+			models:   parseTEIModels(t, `{"model_id":"legacy/embedder"}`),
+			endpoint: createTestEndpoint("http://localhost:3003", "TEI"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.Contains(t, model.Capabilities, "embeddings")
+				assert.NotContains(t, model.Capabilities, "text-generation")
+			},
+		},
+		{
+			name: "Ultra long context model",
+			models: []*domain.ModelInfo{
+				{
+					Name: "claude-3-opus",
+					Details: &domain.ModelDetails{
+						MaxContextLength: ptrInt64(2000000),
+						ParameterSize:    ptrString("175B"),
+					},
+				},
+			},
+			endpoint: createTestEndpoint("http://localhost:8080", "Custom"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.Equal(t, int64(2000000), *model.MaxContextLength)
+				assert.Contains(t, model.Capabilities, "ultra-long-context")
+				assert.Contains(t, model.Capabilities, "long-context")
+			},
+		},
+		{
+			name: "PreserveFamily wins over the deepseek pattern",
+			models: []*domain.ModelInfo{
+				{
+					Name: "deepseek-coder-v2:16b",
+					// No Details.Family - forces the extractor to run rather
+					// than short-circuiting on a provider-supplied family.
+				},
+			},
+			endpoint: createTestEndpoint("http://localhost:11434", "Ollama"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				assert.Equal(t, "deepseek-coder-v2", model.Family)
+				assert.Empty(t, model.Variant)
+			},
+		},
+		{
+			name: "Model with metadata confidence",
+			models: []*domain.ModelInfo{
+				{
+					Name: "unknown-model-7b",
+					Size: 7000000000,
+					// No details, should have low confidence
+				},
+			},
+			endpoint: createTestEndpoint("http://localhost:11434", "Ollama"),
+			expectedModel: func(t *testing.T, model *domain.UnifiedModel) {
+				// Confidence score reflects metadata completeness
+				confidence, ok := model.Metadata["metadata_confidence"].(float64)
+				assert.True(t, ok, "metadata_confidence should be present")
+				assert.Less(t, confidence, 0.5, "Low confidence expected for minimal metadata")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unified, err := unifier.UnifyModels(ctx, tt.models, tt.endpoint)
+			require.NoError(t, err)
+			require.Len(t, unified, 1)
+
+			tt.expectedModel(t, unified[0])
+		})
+	}
+}
+
+// TestDefaultUnifier_MetadataMerging verifies that metadata from multiple endpoints
+// is properly merged without loss, enriching the unified model representation.
+func TestDefaultUnifier_MetadataMerging(t *testing.T) {
+	ctx := context.Background()
+	unifier := NewDefaultUnifier()
+
+	models1 := []*domain.ModelInfo{
+		{
+			Name: "llama3.2:1b",
+			Size: 1000000000,
+			Details: &domain.ModelDetails{
+				Digest: ptrString("sha256:abc123"),
+				Family: ptrString("llama"),
+			},
+		},
+	}
+	endpoint1 := createTestEndpoint("http://localhost:11434", "Ollama")
+	_, err := unifier.UnifyModels(ctx, models1, endpoint1)
+	require.NoError(t, err)
+
+	// Complementary metadata from second endpoint enriches the model
+	models2 := []*domain.ModelInfo{
+		{
+			Name: "llama3.2:1b",
+			Type: "llm",
+			Details: &domain.ModelDetails{
+				Digest:            ptrString("sha256:abc123"),
+				ParameterSize:     ptrString("1.2B"),
+				QuantizationLevel: ptrString("Q4_K_M"),
+				MaxContextLength:  ptrInt64(128000),
+				Publisher:         ptrString("meta"),
+			},
+		},
+	}
+	endpoint2 := createTestEndpoint("http://localhost:1234", "LM Studio")
+	_, err = unifier.UnifyModels(ctx, models2, endpoint2)
+	require.NoError(t, err)
+
+	model, err := unifier.(*DefaultUnifier).ResolveModel(ctx, "llama3.2:1b")
+	require.NoError(t, err)
+
+	assert.Equal(t, "llama", model.Family)
+	assert.Empty(t, model.Variant)
+	assert.Equal(t, "1.2b", model.ParameterSize)
+	assert.Equal(t, "q4km", model.Quantization)
+	assert.Equal(t, int64(128000), *model.MaxContextLength)
+	assert.Contains(t, model.Capabilities, "long-context")
+	assert.Equal(t, "meta", model.Metadata["publisher"])
+	assert.Len(t, model.SourceEndpoints, 2)
+
+	// Platform diversity and publisher information preserved through merging
+	assert.Contains(t, model.Metadata, "platform")
+	assert.Contains(t, model.Metadata, "publisher")
+}
+
+func ptrTime(t time.Time) *time.Time {
+	return &t
+}
+
+func ptrInt64(i int64) *int64 {
+	return &i
+}
+
+// Provider parsers once put their own name in ModelInfo.Type, which the
+// unifier copies into metadata and the LM Studio listing then reported as the
+// model's type. None of them may do that, and the listing must fall back to
+// "llm" for a model whose kind the backend doesn't say.
+func TestDefaultUnifier_ProviderNameIsNotModelType(t *testing.T) {
+	ctx := context.Background()
+	body := `{"data":[{"id":"acme/chatty-7b","object":"model","owned_by":"acme"}]}`
+
+	for _, prof := range []string{
+		domain.ProfileVLLM, domain.ProfileSGLang, domain.ProfileLemonade, domain.ProfileLMDeploy,
+		domain.ProfileLlamaCpp, domain.ProfileVLLMMLX, domain.ProfileDockerMR, domain.ProfileOpenAICompatible,
+	} {
+		t.Run(prof, func(t *testing.T) {
+			unified, err := NewDefaultUnifier().UnifyModels(ctx, parseProfileModels(t, prof, body), createTestEndpoint("http://localhost:8000", prof))
+			require.NoError(t, err)
+			require.Len(t, unified, 1)
+
+			assert.Empty(t, domain.ModelKindFromMetadata(unified[0].Metadata), "no kind reported by the backend")
+
+			// the LM Studio listing only lists models it has an alias for
+			unified[0].Aliases = append(unified[0].Aliases, domain.AliasEntry{Name: "acme/chatty-7b", Source: "lmstudio"})
+			resp, err := converter.NewLMStudioConverter().ConvertToFormat(unified, ports.ModelFilters{})
+			require.NoError(t, err)
+			data := resp.(converter.LMStudioModelResponse).Data
+			require.Len(t, data, 1)
+			assert.Equal(t, "llm", data[0].Type)
+		})
+	}
+}
