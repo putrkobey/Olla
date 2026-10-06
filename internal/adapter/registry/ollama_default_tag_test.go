@@ -130,3 +130,136 @@ func TestUnifiedRegistry_OllamaDefaultTag_GetUnifiedModel(t *testing.T) {
 	reg := buildUnified(t,
 		tagFixture{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"all-minilm:latest"}},
 		tagFixture{url: vllmURL, name: "vllm-1", typ: domain.ProfileVLLM, models: []string{"only-vllm:latest"}},
+	)
+	ctx := context.Background()
+
+	m, err := reg.GetUnifiedModel(ctx, "all-minilm")
+	require.NoError(t, err)
+	assert.Equal(t, "all-minilm:latest", m.ID, "the unified ID keeps the native name")
+
+	_, err = reg.GetUnifiedModel(ctx, "only-vllm")
+	assert.Error(t, err, "a non-ollama latest tag must not answer to the bare name")
+}
+
+// Ollama lists "FOO:latest" and vLLM lists "foo:latest". The unifier merges them
+// case-insensitively, but only the Ollama host answers to the bare "foo".
+func TestUnifiedRegistry_OllamaDefaultTag_MixedCaseKeepsToOllama(t *testing.T) {
+	t.Parallel()
+
+	reg := buildUnified(t,
+		tagFixture{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"FOO:latest"}},
+		tagFixture{url: vllmURL, name: "vllm-1", typ: domain.ProfileVLLM, models: []string{"foo:latest"}},
+	)
+	ctx := context.Background()
+
+	got, err := reg.GetEndpointsForModel(ctx, "foo")
+	require.NoError(t, err)
+	assert.Equal(t, []string{ollamaURL}, got, "the bare name must not reach the vLLM host")
+
+}
+
+// The inspector lowercases names, so "Qwen/Foo" reaches the registry as written or
+// lowered. vLLM's existing case-insensitive catalogue match must beat the Ollama
+// default-tag fallback.
+func TestUnifiedRegistry_OllamaDefaultTag_ExactCatalogueMatchBeatsFallback(t *testing.T) {
+	t.Parallel()
+
+	reg := buildUnified(t,
+		tagFixture{url: vllmURL, name: "vllm-1", typ: domain.ProfileVLLM, models: []string{"Qwen/Foo"}},
+		tagFixture{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"qwen/foo:latest"}},
+	)
+	ctx := context.Background()
+
+	for _, name := range []string{"Qwen/Foo", "qwen/foo"} {
+		got, err := reg.GetEndpointsForModel(ctx, name)
+		require.NoError(t, err)
+		assert.Equal(t, []string{vllmURL}, got, name)
+		assert.Equal(t, name, reg.CanonicalModelName(name), "an exact match keeps its spelling")
+	}
+}
+
+// An alias target in a different case still canonicalises to the Ollama native name.
+func TestUnifiedRegistry_OllamaDefaultTag_MixedCaseCanonicalName(t *testing.T) {
+	t.Parallel()
+
+	reg := buildUnified(t,
+		tagFixture{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"all-minilm:latest"}},
+	)
+
+	assert.Equal(t, "all-minilm:latest", reg.CanonicalModelName("ALL-MINILM"))
+	assert.Equal(t, "all-minilm:latest", reg.CanonicalModelName("all-minilm"))
+}
+
+func TestUnifiedRegistry_OllamaDefaultTag_CanonicalName(t *testing.T) {
+	t.Parallel()
+
+	reg := buildUnified(t,
+		tagFixture{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"all-minilm:latest", "foo:latest"}},
+		tagFixture{url: vllmURL, name: "vllm-1", typ: domain.ProfileVLLM, models: []string{"foo", "bar:latest"}},
+	)
+
+	assert.Equal(t, "all-minilm:latest", reg.CanonicalModelName("all-minilm"), "bare name resolves to the native name")
+	assert.Equal(t, "all-minilm:latest", reg.CanonicalModelName("all-minilm:latest"))
+	assert.Equal(t, "foo", reg.CanonicalModelName("foo"), "an exact match wins, so the spelling is kept")
+	assert.Equal(t, "bar", reg.CanonicalModelName("bar"), "a non-ollama latest tag does not canonicalise")
+	assert.Equal(t, "unknown", reg.CanonicalModelName("unknown"))
+	assert.Empty(t, reg.CanonicalModelName(""))
+}
+
+// With unification disabled the base registry serves lookups, so it needs the
+// same rule or the fix would only hold for one configuration.
+func TestBaseRegistries_OllamaDefaultTag(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	build := func(t *testing.T) (*MemoryModelRegistry, *RoutingRegistry) {
+		t.Helper()
+		base := NewMemoryModelRegistry(createTestLogger())
+		routing := NewRoutingRegistry(NewMemoryModelRegistry(createTestLogger()), nil, nil, createTestLogger())
+		for _, f := range []tagFixture{
+			{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"all-minilm:latest", "foo:latest"}},
+			{url: vllmURL, name: "vllm-1", typ: domain.ProfileVLLM, models: []string{"foo", "bar:latest"}},
+		} {
+			require.NoError(t, base.RegisterModelsWithEndpoint(ctx, newEndpoint(f), modelInfos(f.models)))
+			require.NoError(t, routing.RegisterModelsWithEndpoint(ctx, newEndpoint(f), modelInfos(f.models)))
+		}
+		return base, routing
+	}
+
+	base, routing := build(t)
+	for name, reg := range map[string]domain.ModelRegistry{"memory": base, "routing": routing} {
+		t.Run(name, func(t *testing.T) {
+			got, err := reg.GetEndpointsForModel(ctx, "all-minilm")
+			require.NoError(t, err)
+			assert.Equal(t, []string{ollamaURL}, got)
+			assert.True(t, reg.IsModelAvailable(ctx, "all-minilm"))
+
+			got, err = reg.GetEndpointsForModel(ctx, "foo")
+			require.NoError(t, err)
+			assert.Equal(t, []string{vllmURL}, got, "exact vllm foo wins")
+
+			got, err = reg.GetEndpointsForModel(ctx, "bar")
+			require.NoError(t, err)
+			assert.Empty(t, got, "vllm bar:latest is not ollama-sourced")
+			assert.False(t, reg.IsModelAvailable(ctx, "bar"))
+		})
+	}
+
+	assert.Equal(t, "all-minilm:latest", base.CanonicalModelName("all-minilm"))
+	assert.Equal(t, "foo", base.CanonicalModelName("foo"))
+	assert.Equal(t, "all-minilm:latest", routing.CanonicalModelName("all-minilm"))
+}
+
+// A bare name that stopped resolving when the host dropped the model must not be served from a stale cache.
+func TestUnifiedRegistry_OllamaDefaultTag_DroppedWithEndpoint(t *testing.T) {
+	t.Parallel()
+
+	reg := buildUnified(t, tagFixture{url: ollamaURL, name: "ollama-1", typ: domain.ProfileOllama, models: []string{"all-minilm:latest"}})
+	ctx := context.Background()
+	require.NoError(t, reg.RemoveEndpoint(ctx, ollamaURL))
+
+	got, err := reg.GetEndpointsForModel(ctx, "all-minilm")
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	assert.Equal(t, "all-minilm", reg.CanonicalModelName("all-minilm"))
+}

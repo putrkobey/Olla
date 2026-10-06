@@ -196,3 +196,202 @@ model_extraction:
     glm4: glm
     glm4moe: glm
     granitemoe: granite
+    granitehybrid: granite
+    exaone4: exaone
+    magistral: mistral
+    codestral: mistral
+    ministral: mistral
+    "seed-oss": "seed-oss"
+    seed_oss: "seed-oss"
+    olmo2: olmo
+    internlm2: internlm
+    internlm3: internlm
+    smollm2: smollm
+    smollm3: smollm
+
+  # Model famailies and their publishers
+  publisher_mappings:
+    llama: meta
+    codellama: meta
+    gemma: google
+    phi: microsoft
+    mistral: mistral
+    mixtral: mistral
+    qwen: alibaba
+    yi: 01-ai
+    deepseek: deepseek
+    starcoder: bigcode
+    falcon: tii
+    vicuna: lmsys
+    bloom: bigscience
+    opt: meta
+    gpt2: openai
+    gptj: eleutherai
+    gptneox: eleutherai
+    devstral: mistral
+    magistral: mistral
+    codestral: mistral
+    ministral: mistral
+    glm: zai-org
+    "gpt-oss": openai
+    kimi: moonshotai
+    granite: ibm
+    nemotron: nvidia
+    exaone: lg-ai
+    hunyuan: tencent
+    minimax: minimax
+    "seed-oss": bytedance
+    olmo: allenai
+    internlm: internlm
+    smollm: huggingfacetb
+    "command-r": cohere
+    forge: tensorfoundry
+
+quantization:
+  # Standardises quantisation formats
+  mappings:
+    # K-quants
+    Q4_K_M: q4km
+    Q4_K_S: q4ks
+    Q3_K_L: q3kl
+    Q3_K_M: q3km
+    Q3_K_S: q3ks
+    Q5_K_M: q5km
+    Q5_K_S: q5ks
+    Q6_K: q6k
+    Q2_K: q2k
+    
+    # Standard quants
+    Q4_0: q4
+    Q4_1: q4_1
+    Q5_0: q5
+    Q5_1: q5_1
+    Q8_0: q8
+    
+    # Float formats
+    F16: f16
+    FP16: f16
+    F32: f32
+    FP32: f32
+    BF16: bf16
+    
+    # GPTQ and AWQ
+    GPTQ_4BIT: gptq4
+    GPTQ-4BIT: gptq4
+    AWQ_4BIT: awq4
+    AWQ-4BIT: awq4
+    
+    # Integer formats
+    INT8: int8
+    INT4: int4
+    
+    # Extended formats
+    Q4_K_XL: q4kxl
+
+    # gpt-oss / Nemotron FP4 formats
+    MXFP4: mxfp4
+    NVFP4: nvfp4
+
+capabilities:
+  # Capabilities by model type
+  type_capabilities:
+    llm:
+      - text-generation
+      - chat
+      - completion
+    vlm:
+      - text-generation
+      - vision
+      - multimodal
+      - image-understanding
+    embeddings:
+      - embeddings
+      - similarity
+      - vector-search
+    embedding:
+      - embeddings
+      - similarity
+      - vector-search
+    # reranker and classifier models (e.g. TEI) score or label text rather than
+    # generate it, so they carry no text-generation capability. Rerankers are
+    # sequence-classification models, so TEI's /predict serves them too.
+    reranker:
+      - rerank
+      - classification
+    classifier:
+      - classification
+
+  # Capabilities inferred from model names
+  name_patterns:
+    - pattern: "(code|coder|codegen|starcoder)"
+      capabilities:
+        - code-generation
+        - programming
+        - code-completion
+        
+    - pattern: "(instruct|chat|assistant)"
+      capabilities:
+        - instruction-following
+        - chat
+        
+    - pattern: "(reasoning|think)"
+      capabilities:
+        - reasoning
+        - logic
+
+    - pattern: "(math|mathstral)"
+      capabilities:
+        - mathematics
+        - problem-solving
+        
+    - pattern: "(vision|vlm|llava|bakllava)"
+      capabilities:
+        - vision
+        - multimodal
+        - image-understanding
+
+    # rerankers: BAAI/bge-reranker-v2-m3, jinaai/jina-reranker-v2-base-multilingual,
+    # mixedbread-ai/mxbai-rerank-large-v1, Qwen/Qwen3-Reranker-0.6B, cross-encoder/msmarco-*
+    # (a reranker, unlike the msmarco bi-encoders below). Backends such
+    # as vLLM don't report a model kind, so the name is all there is.
+    - pattern: "(rerank|cross-encoder/ms-?marco)"
+      capabilities:
+        - rerank
+
+    # embedders on backends that don't report a kind. Anchored on the family
+    # name plus a size so bge-reranker and gte-multilingual-reranker don't match.
+    # "embed" may carry a version digit (snowflake-arctic-embed2). The
+    # sentence-transformers MiniLM, MPNet and DistilBERT encoders (all-*, paraphrase-*,
+    # multi-qa-*, msmarco-*) are only ever embedders, as are the stella-base/large/zh models.
+    - pattern: '(\bembed(ding)?s?(\b|\d)|\bembeddinggemma|\b(all|paraphrase)(-multilingual)?-(minilm|mpnet)|\b(multi-qa|msmarco)-(minilm|mpnet|distilbert)|\bstella_en_|\bstella-(base|large|zh)-|\bbge-(small|base|large|m3|en|zh|multilingual|code|gemma)|\be5-(small|base|large|mistral)|\bgte-(small|base|large|qwen|multilingual-base|modernbert-base))'
+      capabilities:
+        - embeddings
+        - similarity
+        - vector-search
+
+  # Context length categories (in tokens)
+  context_thresholds:
+    extended_context: 32000
+    long_context: 100000
+    ultra_long_context: 1000000
+
+special_rules:
+  # Models that keep their original family names
+  preserve_family:
+    - nomic-bert
+    - deepseek-coder-v2
+    # Kimi-K2 GGUF files often report general.architecture "deepseek2" or
+    # "deepseek" (Kimi-K2 and DeepSeek-V3 share the same underlying
+    # transformer architecture). Architecture-based lookup runs before
+    # name-pattern matching, so without this the arch string would win and
+    # misclassify a Kimi model as deepseek. Preserving "kimi" makes the name
+    # win instead, whenever the name itself says kimi.
+    - kimi
+
+  # Generic names that need architecture info
+  generic_names:
+    - model
+    - unknown
+    - test
+    - temp
+    - default
