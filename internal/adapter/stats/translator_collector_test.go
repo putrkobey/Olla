@@ -396,3 +396,402 @@ func TestTranslatorCollector_MultipleTranslators(t *testing.T) {
 		if translatorStats.TotalRequests != expectedTotal {
 			t.Errorf("Translator %s: expected %d total requests, got %d", translator.name, expectedTotal, translatorStats.TotalRequests)
 		}
+
+		if translatorStats.PassthroughRequests != int64(translator.passthroughReqs) {
+			t.Errorf("Translator %s: expected %d passthrough requests, got %d", translator.name, translator.passthroughReqs, translatorStats.PassthroughRequests)
+		}
+
+		if translatorStats.TranslationRequests != int64(translator.translationReqs) {
+			t.Errorf("Translator %s: expected %d translation requests, got %d", translator.name, translator.translationReqs, translatorStats.TranslationRequests)
+		}
+
+		// Verify fallback counter for translation requests
+		if translatorStats.FallbackCannotPassthrough != int64(translator.translationReqs) {
+			t.Errorf("Translator %s: expected %d fallback cannot passthrough, got %d", translator.name, translator.translationReqs, translatorStats.FallbackCannotPassthrough)
+		}
+	}
+}
+
+// TestTranslatorCollector_StreamingVsNonStreaming verifies streaming mode tracking
+func TestTranslatorCollector_StreamingVsNonStreaming(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record streaming requests
+	for range 7 {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        true,
+			Latency:        100 * time.Millisecond,
+			IsStreaming:    true,
+		}
+		collector.Record(event)
+	}
+
+	// Record non-streaming requests
+	for range 3 {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        true,
+			Latency:        100 * time.Millisecond,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+	}
+
+	// Verify streaming breakdown
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.StreamingRequests != 7 {
+		t.Errorf("Expected 7 streaming requests, got %d", anthropicStats.StreamingRequests)
+	}
+	if anthropicStats.NonStreamingRequests != 3 {
+		t.Errorf("Expected 3 non-streaming requests, got %d", anthropicStats.NonStreamingRequests)
+	}
+	if anthropicStats.TotalRequests != 10 {
+		t.Errorf("Expected 10 total requests, got %d", anthropicStats.TotalRequests)
+	}
+}
+
+// TestTranslatorCollector_SuccessVsError verifies success and error tracking
+func TestTranslatorCollector_SuccessVsError(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record successful requests
+	for range 8 {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        true,
+			Latency:        100 * time.Millisecond,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+	}
+
+	// Record failed requests
+	for range 2 {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        false,
+			Latency:        50 * time.Millisecond,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+	}
+
+	// Verify success/failure breakdown
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.SuccessfulRequests != 8 {
+		t.Errorf("Expected 8 successful requests, got %d", anthropicStats.SuccessfulRequests)
+	}
+	if anthropicStats.FailedRequests != 2 {
+		t.Errorf("Expected 2 failed requests, got %d", anthropicStats.FailedRequests)
+	}
+	if anthropicStats.TotalRequests != 10 {
+		t.Errorf("Expected 10 total requests, got %d", anthropicStats.TotalRequests)
+	}
+}
+
+// TestTranslatorCollector_LatencyTracking verifies latency calculation
+func TestTranslatorCollector_LatencyTracking(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record requests with different latencies
+	latencies := []time.Duration{
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		150 * time.Millisecond,
+		250 * time.Millisecond,
+	}
+
+	totalLatency := int64(0)
+	for _, latency := range latencies {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        true,
+			Latency:        latency,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+		totalLatency += latency.Milliseconds()
+	}
+
+	// Verify latency stats
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.TotalLatency != totalLatency {
+		t.Errorf("Expected total latency %dms, got %dms", totalLatency, anthropicStats.TotalLatency)
+	}
+
+	expectedAvg := totalLatency / int64(len(latencies))
+	if anthropicStats.AverageLatency != expectedAvg {
+		t.Errorf("Expected average latency %dms, got %dms", expectedAvg, anthropicStats.AverageLatency)
+	}
+}
+
+// TestTranslatorCollector_LatencyWithFailures verifies latency calculation includes only successful requests
+func TestTranslatorCollector_LatencyWithFailures(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record successful requests
+	for range 3 {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        true,
+			Latency:        100 * time.Millisecond,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+	}
+
+	// Record failed request with higher latency (should NOT be included in total)
+	event := ports.TranslatorRequestEvent{
+		TranslatorName: "anthropic",
+		Model:          "claude-3-5-sonnet-20241022",
+		Mode:           constants.TranslatorModePassthrough,
+		FallbackReason: constants.FallbackReasonNone,
+		Success:        false,
+		Latency:        500 * time.Millisecond,
+		IsStreaming:    false,
+	}
+	collector.Record(event)
+
+	// Verify latency calculation
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	// Total latency includes only successful requests (3 * 100 = 300)
+	expectedTotal := int64(300)
+	if anthropicStats.TotalLatency != expectedTotal {
+		t.Errorf("Expected total latency %dms, got %dms", expectedTotal, anthropicStats.TotalLatency)
+	}
+
+	// Average latency is calculated using successful requests only (300 / 3 = 100)
+	expectedAvg := expectedTotal / 3
+	if anthropicStats.AverageLatency != expectedAvg {
+		t.Errorf("Expected average latency %dms, got %dms", expectedAvg, anthropicStats.AverageLatency)
+	}
+}
+
+// TestTranslatorCollector_ZeroLatency verifies zero latency handling
+func TestTranslatorCollector_ZeroLatency(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record request with zero latency
+	event := ports.TranslatorRequestEvent{
+		TranslatorName: "anthropic",
+		Model:          "claude-3-5-sonnet-20241022",
+		Mode:           constants.TranslatorModePassthrough,
+		FallbackReason: constants.FallbackReasonNone,
+		Success:        true,
+		Latency:        0,
+		IsStreaming:    false,
+	}
+	collector.Record(event)
+
+	// Verify stats
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.TotalLatency != 0 {
+		t.Errorf("Expected total latency 0ms, got %dms", anthropicStats.TotalLatency)
+	}
+	if anthropicStats.AverageLatency != 0 {
+		t.Errorf("Expected average latency 0ms, got %dms", anthropicStats.AverageLatency)
+	}
+}
+
+// TestTranslatorCollector_ZeroSuccessfulRequests verifies latency calculation with zero successful requests
+func TestTranslatorCollector_ZeroSuccessfulRequests(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record only failed requests
+	for range 3 {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModePassthrough,
+			FallbackReason: constants.FallbackReasonNone,
+			Success:        false,
+			Latency:        100 * time.Millisecond,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+	}
+
+	// Verify average latency is 0 when no successful requests
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.SuccessfulRequests != 0 {
+		t.Errorf("Expected 0 successful requests, got %d", anthropicStats.SuccessfulRequests)
+	}
+	if anthropicStats.AverageLatency != 0 {
+		t.Errorf("Expected average latency 0ms (no successful requests), got %dms", anthropicStats.AverageLatency)
+	}
+}
+
+// TestTranslatorCollector_AllFallbackReasons verifies tracking of all fallback reasons
+func TestTranslatorCollector_AllFallbackReasons(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record translation with each fallback reason
+	fallbackReasons := []constants.TranslatorFallbackReason{
+		constants.FallbackReasonNoCompatibleEndpoints,
+		constants.FallbackReasonTranslatorDoesNotSupportPassthrough,
+		constants.FallbackReasonCannotPassthrough,
+	}
+
+	for _, reason := range fallbackReasons {
+		event := ports.TranslatorRequestEvent{
+			TranslatorName: "anthropic",
+			Model:          "claude-3-5-sonnet-20241022",
+			Mode:           constants.TranslatorModeTranslation,
+			FallbackReason: reason,
+			Success:        true,
+			Latency:        100 * time.Millisecond,
+			IsStreaming:    false,
+		}
+		collector.Record(event)
+	}
+
+	// Verify each fallback reason is counted
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.FallbackNoCompatibleEndpoints != 1 {
+		t.Errorf("Expected 1 fallback no compatible endpoints, got %d", anthropicStats.FallbackNoCompatibleEndpoints)
+	}
+	if anthropicStats.FallbackTranslatorDoesNotSupportPassthrough != 1 {
+		t.Errorf("Expected 1 fallback translator does not support passthrough, got %d", anthropicStats.FallbackTranslatorDoesNotSupportPassthrough)
+	}
+	if anthropicStats.FallbackCannotPassthrough != 1 {
+		t.Errorf("Expected 1 fallback cannot passthrough, got %d", anthropicStats.FallbackCannotPassthrough)
+	}
+}
+
+// TestTranslatorCollector_FallbackReasonOnlyForTranslation verifies fallback reasons are only recorded for translation mode
+func TestTranslatorCollector_FallbackReasonOnlyForTranslation(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Record passthrough request with fallback reason (should be ignored)
+	event := ports.TranslatorRequestEvent{
+		TranslatorName: "anthropic",
+		Model:          "claude-3-5-sonnet-20241022",
+		Mode:           constants.TranslatorModePassthrough,
+		FallbackReason: constants.FallbackReasonNoCompatibleEndpoints, // Should be ignored
+		Success:        true,
+		Latency:        100 * time.Millisecond,
+		IsStreaming:    false,
+	}
+	collector.Record(event)
+
+	// Verify no fallback reason recorded for passthrough
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	if anthropicStats.PassthroughRequests != 1 {
+		t.Errorf("Expected 1 passthrough request, got %d", anthropicStats.PassthroughRequests)
+	}
+	if anthropicStats.FallbackNoCompatibleEndpoints != 0 {
+		t.Errorf("Expected 0 fallback (passthrough mode), got %d", anthropicStats.FallbackNoCompatibleEndpoints)
+	}
+}
+
+// TestTranslatorCollector_EmptyStats verifies empty state
+func TestTranslatorCollector_EmptyStats(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	// Verify empty stats
+	stats := collector.GetStats()
+	if len(stats) != 0 {
+		t.Errorf("Expected 0 translators, got %d", len(stats))
+	}
+}
+
+// TestTranslatorCollector_MixedModesConcurrent verifies thread-safety with mixed modes
+func TestTranslatorCollector_MixedModesConcurrent(t *testing.T) {
+	collector := NewTranslatorCollector()
+
+	const numGoroutines = 100
+	const requestsPerGoroutine = 20
+
+	var wg sync.WaitGroup
+
+	// Launch goroutines with mixed modes, streaming states, and success states
+	for i := range numGoroutines {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := range requestsPerGoroutine {
+				mode := constants.TranslatorModePassthrough
+				fallback := constants.FallbackReasonNone
+				if (id+j)%2 == 0 {
+					mode = constants.TranslatorModeTranslation
+					fallback = constants.FallbackReasonNoCompatibleEndpoints
+				}
+
+				event := ports.TranslatorRequestEvent{
+					TranslatorName: "anthropic",
+					Model:          "claude-3-5-sonnet-20241022",
+					Mode:           mode,
+					FallbackReason: fallback,
+					Success:        (id+j)%3 != 0, // 2/3 success rate
+					Latency:        time.Duration(100+id+j) * time.Millisecond,
+					IsStreaming:    (id+j)%2 == 0,
+				}
+				collector.Record(event)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify final stats
+	stats := collector.GetStats()
+	anthropicStats := stats["anthropic"]
+
+	expectedTotal := int64(numGoroutines * requestsPerGoroutine)
+	if anthropicStats.TotalRequests != expectedTotal {
+		t.Errorf("Expected %d total requests, got %d", expectedTotal, anthropicStats.TotalRequests)
+	}
+
+	// Verify total equals sum of successful and failed
+	if anthropicStats.TotalRequests != anthropicStats.SuccessfulRequests+anthropicStats.FailedRequests {
+		t.Errorf("Total requests (%d) should equal successful (%d) + failed (%d)",
+			anthropicStats.TotalRequests, anthropicStats.SuccessfulRequests, anthropicStats.FailedRequests)
+	}
+
+	// Verify total equals sum of passthrough and translation
+	if anthropicStats.TotalRequests != anthropicStats.PassthroughRequests+anthropicStats.TranslationRequests {
+		t.Errorf("Total requests (%d) should equal passthrough (%d) + translation (%d)",
+			anthropicStats.TotalRequests, anthropicStats.PassthroughRequests, anthropicStats.TranslationRequests)
+	}
+
+	// Verify total equals sum of streaming and non-streaming
+	if anthropicStats.TotalRequests != anthropicStats.StreamingRequests+anthropicStats.NonStreamingRequests {
+		t.Errorf("Total requests (%d) should equal streaming (%d) + non-streaming (%d)",
+			anthropicStats.TotalRequests, anthropicStats.StreamingRequests, anthropicStats.NonStreamingRequests)
+	}
+}
