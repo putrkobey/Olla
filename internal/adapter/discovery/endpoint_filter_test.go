@@ -213,3 +213,219 @@ func TestDiscoveryServiceEndpointFiltering(t *testing.T) {
 			assert.ElementsMatch(t, tt.expectedModels, registeredNames,
 				"Registered models should match expected after filtering")
 		})
+	}
+}
+
+func TestGetEndpointFilterConfig(t *testing.T) {
+	config := DiscoveryConfig{
+		Interval: 30 * time.Second,
+		Timeout:  10 * time.Second,
+	}
+
+	tests := []struct {
+		name               string
+		endpoint           *domain.Endpoint
+		setFilterOverrides map[string]*domain.FilterConfig
+		expectedFilter     *domain.FilterConfig
+	}{
+		{
+			name: "use endpoint's own filter when no override",
+			endpoint: &domain.Endpoint{
+				Name:      "test-endpoint",
+				URLString: "http://localhost:11434",
+				ModelFilter: &domain.FilterConfig{
+					Exclude: []string{"*embed*"},
+				},
+			},
+			setFilterOverrides: nil,
+			expectedFilter: &domain.FilterConfig{
+				Exclude: []string{"*embed*"},
+			},
+		},
+		{
+			name: "override takes precedence over endpoint filter",
+			endpoint: &domain.Endpoint{
+				Name:      "test-endpoint",
+				URLString: "http://localhost:11434",
+				ModelFilter: &domain.FilterConfig{
+					Exclude: []string{"*embed*"},
+				},
+			},
+			setFilterOverrides: map[string]*domain.FilterConfig{
+				"test-endpoint": {
+					Include: []string{"llama*"},
+				},
+			},
+			expectedFilter: &domain.FilterConfig{
+				Include: []string{"llama*"},
+			},
+		},
+		{
+			name: "no filter when endpoint has none and no override",
+			endpoint: &domain.Endpoint{
+				Name:        "test-endpoint",
+				URLString:   "http://localhost:11434",
+				ModelFilter: nil,
+			},
+			setFilterOverrides: nil,
+			expectedFilter:     nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test logger
+			slogLogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+				Level: slog.LevelError,
+			}))
+			testLogger := logger.NewPlainStyledLogger(slogLogger)
+
+			// Create discovery service
+			service := NewModelDiscoveryService(
+				&mockDiscoveryClient{},
+				&mockEndpointRepository{},
+				&mockModelRegistry{},
+				config,
+				testLogger,
+			)
+
+			// Set filter overrides if any
+			for name, filter := range tt.setFilterOverrides {
+				service.SetEndpointFilterConfig(name, filter)
+			}
+
+			// Get filter config
+			filterConfig := service.getEndpointFilterConfig(tt.endpoint)
+
+			// Verify result
+			if tt.expectedFilter == nil {
+				assert.Nil(t, filterConfig)
+			} else {
+				require.NotNil(t, filterConfig)
+				assert.Equal(t, tt.expectedFilter.Include, filterConfig.Include)
+				assert.Equal(t, tt.expectedFilter.Exclude, filterConfig.Exclude)
+			}
+		})
+	}
+}
+
+// Extended mock for testing with specific models
+type mockDiscoveryClientWithModels struct {
+	models []*domain.ModelInfo
+	mu     sync.Mutex
+}
+
+func (m *mockDiscoveryClientWithModels) DiscoverModels(ctx context.Context, endpoint *domain.Endpoint) ([]*domain.ModelInfo, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.models == nil {
+		return nil, errors.New("no models configured")
+	}
+
+	return m.models, nil
+}
+
+func (m *mockDiscoveryClientWithModels) HealthCheck(ctx context.Context, endpoint *domain.Endpoint) error {
+	return nil
+}
+
+func (m *mockDiscoveryClientWithModels) GetMetrics() DiscoveryMetrics {
+	return DiscoveryMetrics{}
+}
+
+// Extended mock for capturing registered models
+type mockModelRegistryWithCapture struct {
+	registeredModels map[string][]*domain.ModelInfo
+	mu               sync.Mutex
+}
+
+func (m *mockModelRegistryWithCapture) RegisterModel(ctx context.Context, endpointURL string, model *domain.ModelInfo) error {
+	return nil
+}
+
+func (m *mockModelRegistryWithCapture) RegisterModels(ctx context.Context, endpointURL string, models []*domain.ModelInfo) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.registeredModels[endpointURL] = models
+	return nil
+}
+
+func (m *mockModelRegistryWithCapture) GetModel(ctx context.Context, modelName string) (*domain.UnifiedModel, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) GetModels(ctx context.Context) ([]*domain.UnifiedModel, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) GetAllModels(ctx context.Context) (map[string][]*domain.ModelInfo, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) RemoveEndpointModels(ctx context.Context, endpointURL string) error {
+	return nil
+}
+
+func (m *mockModelRegistryWithCapture) GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
+	return healthyEndpoints, &domain.ModelRoutingDecision{
+		Strategy: "mock",
+		Action:   "routed",
+		Reason:   "mock routing",
+	}, nil
+}
+
+func (m *mockModelRegistryWithCapture) HasModel(ctx context.Context, modelName string) bool {
+	return false
+}
+
+func (m *mockModelRegistryWithCapture) GetModelStatistics(ctx context.Context) map[string]interface{} {
+	return nil
+}
+
+func (m *mockModelRegistryWithCapture) GetEndpointModels(ctx context.Context, endpointURL string) ([]*domain.ModelInfo, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) AddObserver(observer func(event string, data interface{})) {}
+
+func (m *mockModelRegistryWithCapture) NotifyObservers(event string, data interface{}) {}
+
+func (m *mockModelRegistryWithCapture) StartCleanup(ctx context.Context, interval time.Duration) {}
+
+func (m *mockModelRegistryWithCapture) GetModelsForEndpoint(ctx context.Context, endpointURL string) ([]*domain.ModelInfo, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) GetEndpointsForModel(ctx context.Context, modelName string) ([]string, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) IsModelAvailable(ctx context.Context, modelName string) bool {
+	return false
+}
+
+func (m *mockModelRegistryWithCapture) RemoveEndpoint(ctx context.Context, endpointURL string) error {
+	return nil
+}
+
+func (m *mockModelRegistryWithCapture) GetStats(ctx context.Context) (domain.RegistryStats, error) {
+	return domain.RegistryStats{}, nil
+}
+
+func (m *mockModelRegistryWithCapture) ModelsToStrings(models []*domain.ModelInfo) []string {
+	return nil
+}
+
+func (m *mockModelRegistryWithCapture) ModelsToString(models []*domain.ModelInfo) string {
+	return ""
+}
+
+func (m *mockModelRegistryWithCapture) GetEndpointModelMap(ctx context.Context) (map[string]*domain.EndpointModels, error) {
+	return nil, nil
+}
+
+func (m *mockModelRegistryWithCapture) GetModelsByCapability(ctx context.Context, capability string) ([]*domain.UnifiedModel, error) {
+	return []*domain.UnifiedModel{}, nil
+}
