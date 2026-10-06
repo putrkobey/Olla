@@ -77,3 +77,240 @@ func NewUnificationError(operation, platformType, sourceModel string, err error)
 		PlatformType: platformType,
 		SourceModel:  sourceModel,
 		Err:          err,
+	}
+}
+
+// IsEquivalent checks if two unified models represent the same underlying model
+func (u *UnifiedModel) IsEquivalent(other *UnifiedModel) bool {
+	if u == nil || other == nil {
+		return false
+	}
+	return u.ID == other.ID
+}
+
+// HasAlias checks if the unified model has a specific alias
+func (u *UnifiedModel) HasAlias(alias string) bool {
+	for _, a := range u.Aliases {
+		if a.Name == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// Clone returns a deep copy that shares no mutable memory with the receiver,
+// including nested Metadata maps and slices. The unifier catalog and the
+// registry publish *UnifiedModel pointers to lock-free readers, so every writer
+// must clone, mutate the clone and swap it in rather than touch a published model.
+func (u *UnifiedModel) Clone() *UnifiedModel {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	if u.MaxContextLength != nil {
+		v := *u.MaxContextLength
+		c.MaxContextLength = &v
+	}
+	if u.Aliases != nil {
+		c.Aliases = make([]AliasEntry, len(u.Aliases))
+		copy(c.Aliases, u.Aliases)
+	}
+	if u.Capabilities != nil {
+		c.Capabilities = make([]string, len(u.Capabilities))
+		copy(c.Capabilities, u.Capabilities)
+	}
+	if u.SourceEndpoints != nil {
+		c.SourceEndpoints = make([]SourceEndpoint, len(u.SourceEndpoints))
+		for i, se := range u.SourceEndpoints {
+			if se.StateInfo != nil {
+				info := *se.StateInfo
+				info.Metadata = cloneMetadataMap(se.StateInfo.Metadata)
+				se.StateInfo = &info
+			}
+			c.SourceEndpoints[i] = se
+		}
+	}
+	c.Metadata = cloneMetadataMap(u.Metadata)
+	return &c
+}
+
+func cloneMetadataMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = cloneMetadataValue(v)
+	}
+	return out
+}
+
+// cloneMetadataValue copies the container types that metadata is known to carry
+// (the unifier keeps a map[string]bool under "platforms"). Scalars and unknown
+// types are shared, which is safe because nothing mutates them in place.
+func cloneMetadataValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return cloneMetadataMap(t)
+	case map[string]bool:
+		out := make(map[string]bool, len(t))
+		for k, b := range t {
+			out[k] = b
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(t))
+		for k, s := range t {
+			out[k] = s
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = cloneMetadataValue(e)
+		}
+		return out
+	case []string:
+		return append([]string(nil), t...)
+	default:
+		return v
+	}
+}
+
+// GetAliasStrings returns a slice of alias names for backward compatibility
+func (u *UnifiedModel) GetAliasStrings() []string {
+	aliases := make([]string, len(u.Aliases))
+	for i, a := range u.Aliases {
+		aliases[i] = a.Name
+	}
+	return aliases
+}
+
+// GetEndpointByURL returns the source endpoint for a given URL
+func (u *UnifiedModel) GetEndpointByURL(url string) *SourceEndpoint {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == url {
+			return &u.SourceEndpoints[i]
+		}
+	}
+	return nil
+}
+
+// AddOrUpdateEndpoint adds or updates a source endpoint
+func (u *UnifiedModel) AddOrUpdateEndpoint(endpoint SourceEndpoint) {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == endpoint.EndpointURL {
+			u.SourceEndpoints[i] = endpoint
+			return
+		}
+	}
+	u.SourceEndpoints = append(u.SourceEndpoints, endpoint)
+}
+
+// RemoveEndpoint removes a source endpoint by URL
+func (u *UnifiedModel) RemoveEndpoint(url string) bool {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == url {
+			u.SourceEndpoints = append(u.SourceEndpoints[:i], u.SourceEndpoints[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// GetTotalDiskSize calculates total disk size across all endpoints
+func (u *UnifiedModel) GetTotalDiskSize() int64 {
+	var total int64
+	for _, endpoint := range u.SourceEndpoints {
+		total += endpoint.DiskSize
+	}
+	return total
+}
+
+// IsAvailable checks if the model is available on any endpoint
+func (u *UnifiedModel) IsAvailable() bool {
+	return len(u.SourceEndpoints) > 0
+}
+
+// GetLoadedEndpoints returns endpoints where the model is loaded
+func (u *UnifiedModel) GetLoadedEndpoints() []SourceEndpoint {
+	var loaded []SourceEndpoint
+	for _, endpoint := range u.SourceEndpoints {
+		if endpoint.ModelState == ModelStateLoaded {
+			loaded = append(loaded, endpoint)
+		}
+	}
+	return loaded
+}
+
+// GetHealthyEndpoints returns endpoints that are online and have the model available
+func (u *UnifiedModel) GetHealthyEndpoints() []SourceEndpoint {
+	var healthy []SourceEndpoint
+	for _, endpoint := range u.SourceEndpoints {
+		if endpoint.IsHealthy() {
+			healthy = append(healthy, endpoint)
+		}
+	}
+	return healthy
+}
+
+// UpdateEndpointState updates the state of a specific endpoint
+func (u *UnifiedModel) UpdateEndpointState(endpointURL string, state ModelState, stateInfo *EndpointStateInfo) {
+	for i := range u.SourceEndpoints {
+		if u.SourceEndpoints[i].EndpointURL == endpointURL {
+			u.SourceEndpoints[i].ModelState = state
+			u.SourceEndpoints[i].StateInfo = stateInfo
+			u.SourceEndpoints[i].LastStateCheck = time.Now()
+			if state == ModelStateOffline {
+				u.SourceEndpoints[i].State = "offline"
+			}
+			return
+		}
+	}
+}
+
+// MarkEndpointOffline marks a specific endpoint as offline
+func (u *UnifiedModel) MarkEndpointOffline(endpointURL string, reason string) {
+	u.UpdateEndpointState(endpointURL, ModelStateOffline, &EndpointStateInfo{
+		State:           EndpointStateOffline,
+		LastStateChange: time.Now(),
+		LastError:       reason,
+	})
+}
+
+// IsHealthy checks if the endpoint is healthy
+func (s *SourceEndpoint) IsHealthy() bool {
+	// Check new typed state first
+	if s.ModelState != "" {
+		return s.ModelState.IsHealthy()
+	}
+	// Fall back to string state for compatibility
+	return s.State == "loaded" || s.State == "available"
+}
+
+// GetEffectiveState returns the effective state considering both endpoint and model states
+func (s *SourceEndpoint) GetEffectiveState() ModelState {
+	// If endpoint is offline, model is offline too
+	if s.StateInfo != nil && !s.StateInfo.State.IsHealthy() {
+		return ModelStateOffline
+	}
+
+	// Use typed state if available
+	if s.ModelState != "" {
+		return s.ModelState
+	}
+
+	// Map string state to typed state for compatibility
+	switch s.State {
+	case "loaded":
+		return ModelStateLoaded
+	case "available", "not-loaded":
+		return ModelStateAvailable
+	case "offline":
+		return ModelStateOffline
+	case "error":
+		return ModelStateError
+	default:
+		return ModelStateUnknown
+	}
+}
