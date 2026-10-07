@@ -256,3 +256,779 @@ func TestGetRecentModels_Deterministic(t *testing.T) {
 			first = names
 			continue
 		}
+		if !equalStrings(first, names) {
+			t.Fatalf("non-deterministic ordering: got %v, want %v", names, first)
+		}
+	}
+}
+
+// TestBuildModelSummaries_MultiEndpointPicksNewestTimestamp confirms that
+// when a model appears on several endpoints, the summary reports the newest
+// last-seen timestamp across those endpoints regardless of map iteration
+// order, by exercising both possible insertion orders.
+func TestBuildModelSummaries_MultiEndpointPicksNewestTimestamp(t *testing.T) {
+	t.Parallel()
+
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now().Add(-1 * time.Minute)
+
+	endpointNames := map[string]string{
+		"http://endpoint-a:11434": "endpoint-a",
+		"http://endpoint-b:11434": "endpoint-b",
+	}
+
+	// Go map iteration order is randomised per run, so running this fixture
+	// as-is across repeated test invocations already exercises both orders
+	// over time; assert the invariant directly rather than trying to force
+	// a specific visitation order.
+	app := &Application{}
+	modelMap := map[string]*domain.EndpointModels{
+		"http://endpoint-a:11434": {
+			Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: older}},
+		},
+		"http://endpoint-b:11434": {
+			Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: newer}},
+		},
+	}
+
+	summaries := app.buildModelSummaries(modelMap, endpointNames, nil, nil)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+
+	got := summaries[0]
+	if got.LastSeenAt == nil {
+		t.Fatal("expected LastSeenAt to be set")
+	}
+	if !got.LastSeenAt.Equal(newer) {
+		t.Errorf("LastSeenAt = %v, want the newer timestamp %v", got.LastSeenAt, newer)
+	}
+}
+
+// namesOf extracts model names in order, for compact assertion messages.
+func namesOf(models []ModelSummary) []string {
+	names := make([]string, len(models))
+	for i, m := range models {
+		names[i] = m.Name
+	}
+	return names
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mockAliasModelRegistry wraps mockStatusModelRegistry with an injectable
+// GetUnifiedModels implementation so the alias-resolution path can be
+// exercised. mockStatusModelRegistry alone does NOT satisfy
+// unifiedModelsGetter, which is itself useful for the graceful-absence test.
+type mockAliasModelRegistry struct {
+	mockStatusModelRegistry
+	unified []*domain.UnifiedModel
+	err     error
+}
+
+func (m *mockAliasModelRegistry) GetUnifiedModels(ctx context.Context) ([]*domain.UnifiedModel, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.unified, nil
+}
+
+// TestBuildModelSummaries_EndpointIDsFollowNamesAfterSort pins the paired-sort
+// contract: after sorting Endpoints alphabetically, the i-th EndpointID must
+// still correspond to the i-th name. Two independent sorts would desync them.
+// This uses distinct names so the sort has a deterministic answer.
+func TestBuildModelSummaries_EndpointIDsFollowNamesAfterSort(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	now := time.Now()
+
+	modelMap := map[string]*domain.EndpointModels{
+		"http://node-a:11434": {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: now}}},
+		"http://node-b:11434": {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: now}}},
+	}
+	endpointNames := map[string]string{
+		"http://node-a:11434": "zeta-cluster",
+		"http://node-b:11434": "alpha-cluster",
+	}
+	endpointIDs := map[string]string{
+		"http://node-a:11434": "id-zeta",
+		"http://node-b:11434": "id-alpha",
+	}
+
+	summaries := app.buildModelSummaries(modelMap, endpointNames, endpointIDs, nil)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	s := summaries[0]
+
+	wantNames := []string{"alpha-cluster", "zeta-cluster"}
+	wantIDs := []string{"id-alpha", "id-zeta"}
+
+	if !equalStrings(s.Endpoints, wantNames) {
+		t.Errorf("Endpoints = %v, want %v", s.Endpoints, wantNames)
+	}
+	if !equalStrings(s.EndpointIDs, wantIDs) {
+		t.Errorf("EndpointIDs = %v, want %v (must follow name order after paired sort)", s.EndpointIDs, wantIDs)
+	}
+}
+
+// TestBuildModelSummaries_EndpointIDsDistinctForCollidingNames is the core
+// regression for the dashboard click-through: when two distinct endpoints
+// share the SAME display name (a legitimate config), their stable IDs must
+// still be distinct. The dashboard routes by ID precisely because names are
+// not guaranteed unique.
+func TestBuildModelSummaries_EndpointIDsDistinctForCollidingNames(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	now := time.Now()
+
+	urlA := "http://node-a:11434"
+	urlB := "http://node-b:11434"
+
+	modelMap := map[string]*domain.EndpointModels{
+		urlA: {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: now}}},
+		urlB: {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: now}}},
+	}
+	endpointNames := map[string]string{
+		urlA: "ollama-cluster",
+		urlB: "ollama-cluster",
+	}
+	endpointIDs := map[string]string{
+		urlA: stableEndpointID(urlA),
+		urlB: stableEndpointID(urlB),
+	}
+
+	summaries := app.buildModelSummaries(modelMap, endpointNames, endpointIDs, nil)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	s := summaries[0]
+
+	if len(s.Endpoints) != 2 || len(s.EndpointIDs) != 2 {
+		t.Fatalf("expected 2 endpoints and 2 ids, got %d / %d", len(s.Endpoints), len(s.EndpointIDs))
+	}
+	if s.Endpoints[0] != s.Endpoints[1] {
+		t.Errorf("expected identical display names (collision fixture), got %q and %q", s.Endpoints[0], s.Endpoints[1])
+	}
+	if s.EndpointIDs[0] == s.EndpointIDs[1] {
+		t.Errorf("expected distinct IDs for distinct URLs, both = %q", s.EndpointIDs[0])
+	}
+	gotIDSet := map[string]struct{}{s.EndpointIDs[0]: {}, s.EndpointIDs[1]: {}}
+	for _, want := range []string{stableEndpointID(urlA), stableEndpointID(urlB)} {
+		if _, ok := gotIDSet[want]; !ok {
+			t.Errorf("missing expected ID %q in %v", want, gotIDSet)
+		}
+	}
+}
+
+// TestSortModelSummaryEndpoints_DesyncedLengthsDoNotPanic is the house-rule
+// guard (production code must not panic): a ModelSummary whose Endpoints and
+// EndpointIDs slices have desynced lengths - which should never happen given
+// buildModelSummaries' lockstep appends, but the invariant is only assumed,
+// not enforced by the type system - must not crash the paired sort. Rather
+// than skip the sort entirely (which would leave order at the mercy of
+// randomised map iteration, churning the ETag every poll for no real reason),
+// the sort runs over the common (shorter) prefix.
+func TestSortModelSummaryEndpoints_DesyncedLengthsDoNotPanic(t *testing.T) {
+	t.Parallel()
+
+	summary := &ModelSummary{
+		Name:        "desynced",
+		Endpoints:   []string{"zeta", "alpha", "mid"},
+		EndpointIDs: []string{"id-zeta", "id-alpha"}, // deliberately shorter than Endpoints
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("sortModelSummaryEndpoints panicked on desynced slice lengths: %v", r)
+		}
+	}()
+
+	sortModelSummaryEndpoints(summary)
+
+	// Only the common prefix (length 2) is sorted: "alpha" before "zeta",
+	// with EndpointIDs following the same swap. The out-of-range tail element
+	// ("mid") is left untouched.
+	wantEndpoints := []string{"alpha", "zeta", "mid"}
+	if !equalStrings(summary.Endpoints, wantEndpoints) {
+		t.Errorf("expected the common prefix sorted and the tail left as-built, got %v", summary.Endpoints)
+	}
+	wantIDs := []string{"id-alpha", "id-zeta"}
+	if !equalStrings(summary.EndpointIDs, wantIDs) {
+		t.Errorf("expected EndpointIDs sorted in step with the common prefix, got %v", summary.EndpointIDs)
+	}
+}
+
+// TestBuildAliasLookup_IncludesCanonicalAndExcludesSelf verifies that for a
+// model with sibling aliases and a distinct canonical ID, looking up by an
+// alias name returns the other aliases plus the canonical ID, sorted, with
+// the queried name excluded from its own result.
+func TestBuildAliasLookup_IncludesCanonicalAndExcludesSelf(t *testing.T) {
+	t.Parallel()
+
+	reg := &mockAliasModelRegistry{
+		unified: []*domain.UnifiedModel{
+			{
+				ID: "llama/3",
+				Aliases: []domain.AliasEntry{
+					{Name: "llama3"},
+					{Name: "llama-3"},
+				},
+			},
+		},
+	}
+	app := &Application{modelRegistry: reg}
+
+	lookup := app.buildAliasLookup(context.Background())
+	if lookup == nil {
+		t.Fatal("expected non-nil lookup")
+	}
+
+	// Querying by an alias name returns the sibling alias plus the canonical
+	// ID, sorted, with the queried name excluded.
+	want := []string{"llama-3", "llama/3"}
+	if got := lookup["llama3"]; !equalStrings(got, want) {
+		t.Errorf("lookup[llama3] = %v, want %v", got, want)
+	}
+
+	// The canonical ID is also a valid key, returning the alias names.
+	wantCanonical := []string{"llama-3", "llama3"}
+	if got := lookup["llama/3"]; !equalStrings(got, wantCanonical) {
+		t.Errorf("lookup[llama/3] = %v, want %v", got, wantCanonical)
+	}
+
+	// Self exclusion: no result contains its own query key.
+	for query, siblings := range lookup {
+		for _, s := range siblings {
+			if s == query {
+				t.Errorf("lookup[%q] contains itself: %v", query, siblings)
+			}
+		}
+	}
+}
+
+// TestBuildAliasLookup_AbsentWhenRegistryLacksInterface confirms the
+// graceful-degradation path: a registry that does NOT satisfy
+// unifiedModelsGetter (mockStatusModelRegistry alone) yields a nil lookup,
+// not an error or panic.
+func TestBuildAliasLookup_AbsentWhenRegistryLacksInterface(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{modelRegistry: &mockStatusModelRegistry{}}
+	if lookup := app.buildAliasLookup(context.Background()); lookup != nil {
+		t.Errorf("expected nil lookup when registry lacks GetUnifiedModels, got %v", lookup)
+	}
+}
+
+// TestBuildModelSummaries_AliasesAttached verifies that an alias set from the
+// lookup is attached to the matching ModelSummary, sorted, with the model's
+// own raw name excluded.
+func TestBuildModelSummaries_AliasesAttached(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	now := time.Now()
+
+	modelMap := map[string]*domain.EndpointModels{
+		"http://localhost:11434": {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: now}}},
+	}
+	endpointNames := map[string]string{
+		"http://localhost:11434": "ollama-local",
+	}
+	endpointIDs := map[string]string{
+		"http://localhost:11434": stableEndpointID("http://localhost:11434"),
+	}
+	aliases := map[string][]string{
+		// Pre-built lookup: querying by "llama3" returns its siblings.
+		"llama3": {"llama-3", "llama/3"},
+	}
+
+	summaries := app.buildModelSummaries(modelMap, endpointNames, endpointIDs, aliases)
+	if len(summaries) != 1 {
+		t.Fatalf("expected 1 summary, got %d", len(summaries))
+	}
+	s := summaries[0]
+
+	want := []string{"llama-3", "llama/3"}
+	if !equalStrings(s.Aliases, want) {
+		t.Errorf("Aliases = %v, want %v", s.Aliases, want)
+	}
+	// The model's own name must not appear in its alias set.
+	for _, a := range s.Aliases {
+		if a == s.Name {
+			t.Errorf("own name %q must not appear in aliases %v", s.Name, s.Aliases)
+		}
+	}
+}
+
+// TestModelsStatusHandler_AliasesAbsentGraceful drives the full handler with a
+// registry that does not satisfy unifiedModelsGetter. The response must still
+// be 200 with the model present, and aliases omitted entirely, never an
+// error or empty body.
+func TestModelsStatusHandler_AliasesAbsentGraceful(t *testing.T) {
+	t.Parallel()
+
+	reg := &mockStatusModelRegistry{
+		endpointModels: map[string]*domain.EndpointModels{
+			"http://localhost:11434": {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: time.Now()}}},
+		},
+	}
+	ep := []*domain.Endpoint{
+		{Name: "ollama-local", Type: "ollama", URLString: "http://localhost:11434", Status: domain.StatusHealthy},
+	}
+	app := &Application{
+		repository:     &mockStatusEndpointRepository{endpoints: ep},
+		statsCollector: &mockStatusStatsCollector{},
+		modelRegistry:  reg,
+		StartTime:      time.Now(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/status/models", nil)
+	w := httptest.NewRecorder()
+	app.modelsStatusHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 even without alias support, got %d (body=%s)", w.Code, w.Body.String())
+	}
+
+	var resp ModelStatusResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(resp.RecentModels) != 1 {
+		t.Fatalf("expected 1 model in response, got %d", len(resp.RecentModels))
+	}
+	if len(resp.RecentModels[0].Aliases) != 0 {
+		t.Errorf("expected no aliases when registry lacks GetUnifiedModels, got %v", resp.RecentModels[0].Aliases)
+	}
+}
+
+// TestModelsStatusHandler_ETagStableAndAliasAware locks the model ETag
+// semantics: two identical requests yield the same ETag, and a change to the
+// alias set changes the ETag (because aliases are part of the model hash).
+func TestModelsStatusHandler_ETagStableAndAliasAware(t *testing.T) {
+	t.Parallel()
+
+	seen := time.Now()
+	reg := &mockAliasModelRegistry{
+		mockStatusModelRegistry: mockStatusModelRegistry{
+			endpointModels: map[string]*domain.EndpointModels{
+				"http://localhost:11434": {Models: []*domain.ModelInfo{{Name: "llama3", LastSeen: seen}}},
+			},
+		},
+		unified: []*domain.UnifiedModel{
+			{
+				ID: "llama/3",
+				Aliases: []domain.AliasEntry{
+					{Name: "llama3"},
+					{Name: "llama-3"},
+				},
+			},
+		},
+	}
+	ep := []*domain.Endpoint{
+		{Name: "ollama-local", Type: "ollama", URLString: "http://localhost:11434", Status: domain.StatusHealthy},
+	}
+	app := &Application{
+		repository:     &mockStatusEndpointRepository{endpoints: ep},
+		statsCollector: &mockStatusStatsCollector{},
+		modelRegistry:  reg,
+		StartTime:      time.Now(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/internal/status/models", nil)
+
+	w1 := httptest.NewRecorder()
+	app.modelsStatusHandler(w1, req)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w1.Code)
+	}
+	etag1 := w1.Header().Get("ETag")
+	if etag1 == "" {
+		t.Fatal("missing ETag on first response")
+	}
+
+	// Identical second request: ETag must be stable across polls. The
+	// relative LastSeen rendering churns every poll but is excluded from
+	// the hash; the absolute LastSeenAt is fixed by the fixture.
+	w2 := httptest.NewRecorder()
+	app.modelsStatusHandler(w2, req)
+	if got := w2.Header().Get("ETag"); got != etag1 {
+		t.Errorf("ETag not stable across identical requests: %q vs %q", got, etag1)
+	}
+
+	// Mutate the alias set: an added alias must surface in the hash, so the
+	// ETag changes. This is the regression guard for aliases being part of
+	// hashModelSummary.
+	reg.unified = []*domain.UnifiedModel{
+		{
+			ID: "llama/3",
+			Aliases: []domain.AliasEntry{
+				{Name: "llama3"},
+				{Name: "llama-3"},
+				{Name: "llama_3"},
+			},
+		},
+	}
+	w3 := httptest.NewRecorder()
+	app.modelsStatusHandler(w3, req)
+	if got := w3.Header().Get("ETag"); got == etag1 {
+		t.Errorf("ETag must change when alias set changes, both = %q", etag1)
+	}
+}
+
+// richModelDetails is the rich half of the asymmetric fixture used by the
+// determinism and prefer-non-empty regression tests below: a model with full
+// scalar metadata. Returning a fresh copy each call keeps tests independent.
+func richModelDetails() *domain.ModelDetails {
+	family := "llama"
+	params := "8B"
+	quant := "Q4_0"
+	mtype := modelTypeLLM
+	return &domain.ModelDetails{
+		Family:            &family,
+		ParameterSize:     &params,
+		QuantizationLevel: &quant,
+		Type:              &mtype,
+	}
+}
+
+const (
+	richModelSize   int64 = 4 * 1024 * 1024 * 1024 // 4 GiB
+	richModelQuant        = "Q4_0"
+	richModelFamily       = "llama"
+	richModelParams       = "8B"
+	richModelType         = "llm"
+)
+
+// wantRichModelSummary is the single source of truth for what the merged
+// summary must equal after prefer-non-empty merging, regardless of map
+// iteration order. Both endpoints host the same model name; the rich one
+// supplies Family/Params/Quant/Type/Size/Capabilities, the minimal one
+// supplies none and must never overwrite a non-empty value.
+func wantRichModelSummary() ModelSummary {
+	return ModelSummary{
+		Name:         "shared-model",
+		Type:         richModelType,
+		Family:       richModelFamily,
+		Params:       richModelParams,
+		Quant:        richModelQuant,
+		Size:         "4.00 GB",
+		Capabilities: []string{"text_generation", "chat"},
+	}
+}
+
+// assertSummaryEqualsRich verifies the merged metadata equals the rich
+// endpoint's values, not the minimal endpoint's empty ones. Field-by-field
+// so a failure pinpoints exactly which scalar flipped.
+func assertSummaryEqualsRich(t *testing.T, s ModelSummary) {
+	t.Helper()
+	want := wantRichModelSummary()
+	if s.Family != want.Family {
+		t.Errorf("Family = %q, want rich %q (prefer-non-empty)", s.Family, want.Family)
+	}
+	if s.Params != want.Params {
+		t.Errorf("Params = %q, want rich %q (prefer-non-empty)", s.Params, want.Params)
+	}
+	if s.Quant != want.Quant {
+		t.Errorf("Quant = %q, want rich %q (prefer-non-empty)", s.Quant, want.Quant)
+	}
+	if s.Type != want.Type {
+		t.Errorf("Type = %q, want rich %q (prefer-non-empty)", s.Type, want.Type)
+	}
+	if s.Size != want.Size {
+		t.Errorf("Size = %q, want rich %q (prefer-non-empty)", s.Size, want.Size)
+	}
+	if !equalStrings(s.Capabilities, want.Capabilities) {
+		t.Errorf("Capabilities = %v, want rich %v (prefer-non-empty)", s.Capabilities, want.Capabilities)
+	}
+}
+
+// TestBuildModelSummaries_DeterministicAsymmetricFixture is the regression
+// for the flapping-metadata bug: a static asymmetric two-endpoint fleet
+// (the same model hosted once with rich metadata, once with minimal/empty
+// metadata) must produce byte-identical summaries - same Family, Params,
+// Quant, Type, Size, Capabilities, same endpoint order, same ETag - across
+// at least 50 builds. Before the fix, Go map iteration randomisation picked
+// whichever endpoint was visited first to supply the scalar metadata, so the
+// summary and its ETag flipped on roughly 3 in every 20 polls despite no real
+// state change. This test would have caught the original regression that
+// silently undid commit c709d5c.
+func TestBuildModelSummaries_DeterministicAsymmetricFixture(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	now := time.Now()
+
+	richURL := "http://node-rich:11434"
+	minimalURL := "http://node-minimal:11434"
+
+	modelMap := map[string]*domain.EndpointModels{
+		richURL: {
+			Models: []*domain.ModelInfo{{
+				Name:     "shared-model",
+				Type:     richModelType,
+				Size:     richModelSize,
+				LastSeen: now,
+				Details:  richModelDetails(),
+			}},
+		},
+		minimalURL: {
+			Models: []*domain.ModelInfo{{
+				// Minimal endpoint: no Details, no Type, no Size. Before the
+				// merge fix, reaching this endpoint first left the summary
+				// with empty scalar metadata for the whole fleet.
+				Name:     "shared-model",
+				LastSeen: now.Add(-time.Minute),
+			}},
+		},
+	}
+	endpointNames := map[string]string{
+		richURL:    "node-rich",
+		minimalURL: "node-minimal",
+	}
+	endpointIDs := map[string]string{
+		richURL:    stableEndpointID(richURL),
+		minimalURL: stableEndpointID(minimalURL),
+	}
+
+	var first *ModelSummary
+	var firstETag string
+	const iterations = 60
+
+	for range iterations {
+		summaries := app.buildModelSummaries(modelMap, endpointNames, endpointIDs, nil)
+		if len(summaries) != 1 {
+			t.Fatalf("expected 1 summary, got %d", len(summaries))
+		}
+		s := summaries[0]
+
+		// Prefer-non-empty: the merged metadata must equal the rich endpoint's
+		// values every iteration, regardless of which endpoint map iteration
+		// happened to visit first (which the sort now makes deterministic, but
+		// the assertion stands as the behavioural contract).
+		assertSummaryEqualsRich(t, s)
+
+		// Endpoint order must be stable (sorted by name, then ID).
+		wantEndpoints := []string{"node-minimal", "node-rich"}
+		if !equalStrings(s.Endpoints, wantEndpoints) {
+			t.Errorf("Endpoints = %v, want %v", s.Endpoints, wantEndpoints)
+		}
+		wantIDs := []string{stableEndpointID(minimalURL), stableEndpointID(richURL)}
+		if !equalStrings(s.EndpointIDs, wantIDs) {
+			t.Errorf("EndpointIDs = %v, want %v", s.EndpointIDs, wantIDs)
+		}
+
+		// ETag must be byte-identical across iterations. Build the same
+		// response projection the handler hashes and compare directly.
+		resp := &ModelStatusResponse{
+			TotalModels:    1,
+			TotalEndpoints: 2,
+			ModelsByFamily: app.groupModelsByFamily(summaries),
+			RecentModels:   app.getRecentModels(append([]ModelSummary(nil), summaries...)),
+		}
+		resp.TotalFamilies = len(resp.ModelsByFamily)
+		etag := hashModelStatusResponse(resp)
+
+		if first == nil {
+			cp := s
+			first = &cp
+			firstETag = etag
+			continue
+		}
+		if s.Family != first.Family || s.Params != first.Params || s.Quant != first.Quant ||
+			s.Type != first.Type || s.Size != first.Size ||
+			!equalStrings(s.Capabilities, first.Capabilities) ||
+			!equalStrings(s.Endpoints, first.Endpoints) ||
+			!equalStrings(s.EndpointIDs, first.EndpointIDs) {
+			t.Fatalf("non-deterministic summary at iteration %d:\n got=%+v\nwant=%+v", iterations, s, *first)
+		}
+		if etag != firstETag {
+			t.Fatalf("ETag churned across iterations: got %q, want %q", etag, firstETag)
+		}
+	}
+}
+
+// TestBuildModelSummaries_PrefersNonEmptyRegardlessOfSortedOrder proves the
+// prefer-non-empty merge holds in BOTH sorted visitation orders: the rich
+// endpoint can be alphabetically first (its summary seeds the map directly)
+// or alphabetically second (the minimal endpoint seeds first and the merge
+// backfills from the rich one). Both orders must yield the rich metadata.
+// This pins the contract independent of the URL-sort tie-breaker.
+func TestBuildModelSummaries_PrefersNonEmptyRegardlessOfSortedOrder(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	now := time.Now()
+
+	// Two parallel fixtures: rich URL sorts AFTER minimal in fixture A
+	// (minimal seeds, merge backfills) and BEFORE minimal in fixture B
+	// (rich seeds directly). Both must converge to rich metadata.
+	cases := []struct {
+		name       string
+		richURL    string
+		minimalURL string
+	}{
+		{"rich_sorts_after_minimal", "http://z-rich:11434", "http://a-minimal:11434"},
+		{"rich_sorts_before_minimal", "http://a-rich:11434", "http://z-minimal:11434"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			modelMap := map[string]*domain.EndpointModels{
+				tc.richURL: {
+					Models: []*domain.ModelInfo{{
+						Name:     "shared-model",
+						Type:     richModelType,
+						Size:     richModelSize,
+						LastSeen: now,
+						Details:  richModelDetails(),
+					}},
+				},
+				tc.minimalURL: {
+					Models: []*domain.ModelInfo{{
+						Name:     "shared-model",
+						LastSeen: now.Add(-time.Minute),
+					}},
+				},
+			}
+			endpointNames := map[string]string{
+				tc.richURL:    "rich-node",
+				tc.minimalURL: "minimal-node",
+			}
+			endpointIDs := map[string]string{
+				tc.richURL:    stableEndpointID(tc.richURL),
+				tc.minimalURL: stableEndpointID(tc.minimalURL),
+			}
+
+			summaries := app.buildModelSummaries(modelMap, endpointNames, endpointIDs, nil)
+			if len(summaries) != 1 {
+				t.Fatalf("expected 1 summary, got %d", len(summaries))
+			}
+			assertSummaryEqualsRich(t, summaries[0])
+		})
+	}
+}
+
+// TestSortModelSummaryEndpoints_DuplicateNameStableByID is the regression for
+// the ETag churn caused by duplicate display names: when two endpoints share
+// a Name, sorting by Name alone leaves their relative order at the mercy of
+// the input slice (which comes from randomised map iteration). The ID
+// tie-break makes the order deterministic across polls. Repeated sorts of a
+// shuffled input must converge to the same order every time.
+func TestSortModelSummaryEndpoints_DuplicateNameStableByID(t *testing.T) {
+	t.Parallel()
+
+	// Two endpoints with identical Names but distinct IDs. Whatever order
+	// they start in, the sorted output must always place the lexicographically
+	// smaller ID first.
+	name := "ollama-cluster"
+	idA := "aaaaaaaa"
+	idB := "zzzzzzzz"
+
+	inputs := [][]endpointNameID{
+		{{Name: name, ID: idB}, {Name: name, ID: idA}},
+		{{Name: name, ID: idA}, {Name: name, ID: idB}},
+	}
+
+	wantNames := []string{name, name}
+	wantIDs := []string{idA, idB}
+
+	for i, in := range inputs {
+		summary := &ModelSummary{
+			Name:        "model",
+			Endpoints:   []string{in[0].Name, in[1].Name},
+			EndpointIDs: []string{in[0].ID, in[1].ID},
+		}
+		sortModelSummaryEndpoints(summary)
+
+		if !equalStrings(summary.Endpoints, wantNames) {
+			t.Errorf("input %d: Endpoints = %v, want %v", i, summary.Endpoints, wantNames)
+		}
+		if !equalStrings(summary.EndpointIDs, wantIDs) {
+			t.Errorf("input %d: EndpointIDs = %v, want %v (ID tie-break on duplicate Name)", i, summary.EndpointIDs, wantIDs)
+		}
+	}
+}
+
+// TestHashModelStatusResponse_StableAcrossCalls is the direct regression for
+// ETag determinism: repeated hashes of the same ModelStatusResponse must
+// produce the same value. Maps inside the response (ModelsByFamily) have
+// randomised iteration order, so the hash must sort family keys before
+// hashing - exactly as encoding/json does on the wire.
+func TestHashModelStatusResponse_StableAcrossCalls(t *testing.T) {
+	t.Parallel()
+
+	seen := time.Now()
+	resp := &ModelStatusResponse{
+		TotalModels:    2,
+		TotalEndpoints: 2,
+		TotalFamilies:  2,
+		ModelsByFamily: map[string][]string{
+			"llama":   {"llama3", "llama2"},
+			"mistral": {"mistral"},
+			"unknown": {"phi3"},
+		},
+		RecentModels: []ModelSummary{
+			{Name: "llama3", Family: "llama", LastSeenAt: &seen},
+			{Name: "phi3", LastSeenAt: &seen},
+		},
+	}
+
+	first := hashModelStatusResponse(resp)
+	if first == "" {
+		t.Fatal("expected non-empty ETag")
+	}
+	for range 50 {
+		if got := hashModelStatusResponse(resp); got != first {
+			t.Fatalf("hashModelStatusResponse not stable: got %q, want %q", got, first)
+		}
+	}
+}
+
+func TestInferCapabilities_NonGenerativeKinds(t *testing.T) {
+	t.Parallel()
+
+	app := &Application{}
+	kind := func(k string) *domain.ModelDetails { return &domain.ModelDetails{Type: &k} }
+
+	assert.Equal(t, []string{"embeddings", "vector_search"}, app.inferCapabilities(kind("embeddings")))
+	assert.Equal(t, []string{"rerank", "classification"}, app.inferCapabilities(kind("reranker")))
+	assert.Equal(t, []string{"classification"}, app.inferCapabilities(kind("classifier")))
+}
+
+func TestModelInfoKind(t *testing.T) {
+	t.Parallel()
+	reranker := "reranker"
+	tests := []struct {
+		name  string
+		model *domain.ModelInfo
+		want  string
+	}{
+		{"top-level type", &domain.ModelInfo{Type: "vlm"}, "vlm"},
+		{"details type wins over the generic one", &domain.ModelInfo{Type: "llm", Details: &domain.ModelDetails{Type: &reranker}}, "reranker"},
+		{"details type alone", &domain.ModelInfo{Details: &domain.ModelDetails{Type: &reranker}}, "reranker"},
+		{"generic model marker is not a kind", &domain.ModelInfo{Type: "model"}, ""},
+		{"nothing reported", &domain.ModelInfo{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, modelInfoKind(tt.model))
+		})
+	}
+}
