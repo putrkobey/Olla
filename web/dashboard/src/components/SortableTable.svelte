@@ -73,3 +73,155 @@
           ]
         >
       | null;
+    showScrollHint?: boolean;
+  }
+
+  let {
+    columns = [],
+    rows = [],
+    initialSort = null,
+    rowId = (_r: Row, i: number): string => `r-${i}`,
+    rowDomId = null,
+    rowSnippet = null,
+    groupSnippet = null,
+    showScrollHint = true,
+  }: Props = $props();
+
+  // Initial sort seeds local state once; later prop changes are deliberately
+  // ignored: the user owns sort state after mount.
+  let sort: SortState | null = $state(untrack(() => initialSort));
+
+  function toggle(key: string): void {
+    if (!sort || sort.key !== key) {
+      sort = { key, dir: 'desc' };
+      return;
+    }
+    sort = { key, dir: sort.dir === 'asc' ? 'desc' : 'asc' };
+  }
+
+  // Column-key-driven comparator. Runtime behaviour is unchanged: string
+  // branch lowercases both; otherwise null/undefined coalesces to 0; then a
+  // plain `<`/`>` compare. The narrowing just lets `unknown` from `Row[key]`
+  // type-check at the comparison point without changing what runs.
+  function compare(a: Row, b: Row): number {
+    if (!sort) return 0;
+    const key = sort.key;
+    let va: unknown = a[key];
+    let vb: unknown = b[key];
+    if (typeof va === 'string') {
+      va = va.toLowerCase();
+      vb = String(vb ?? '').toLowerCase();
+    } else if (vb === null || vb === undefined) {
+      vb = 0;
+    } else if (va === null || va === undefined) {
+      va = 0;
+    }
+    // Both operands are now strings or numbers; cast to satisfy TS without
+    // altering the relational compare semantics.
+    const cmp = (va as string | number) < (vb as string | number)
+      ? -1
+      : (va as string | number) > (vb as string | number)
+        ? 1
+        : 0;
+    return sort.dir === 'asc' ? cmp : -cmp;
+  }
+
+  const sorted: Row[] = $derived(sort ? [...rows].sort(compare) : rows);
+
+  // Defence in depth against each_key_duplicate: Svelte throws (and, with no
+  // error boundary, blanks the whole table body) the moment two rows share a
+  // key. Callers must key on a truly unique field, but if they don't - or if
+  // the data genuinely carries duplicates (two endpoints with the same name) -
+  // we suffix collisions with an ordinal so the table keeps rendering. The
+  // raw rowId is preserved for the non-colliding majority.
+  const uniqueKeyed = $derived(dedupeKeys(sorted, rowId));
+
+  function dedupeKeys(
+    list: Row[],
+    keyFor: (row: Row, i: number) => string
+  ): { row: Row; key: string }[] {
+    const totals = new Map<string, number>();
+    for (const r of list) {
+      const k = keyFor(r, 0);
+      totals.set(k, (totals.get(k) ?? 0) + 1);
+    }
+    const issued = new Map<string, number>();
+    return list.map((row, i) => {
+      const k = keyFor(row, i);
+      if ((totals.get(k) ?? 0) === 1) return { row, key: k };
+      const n = issued.get(k) ?? 0;
+      issued.set(k, n + 1);
+      return { row, key: `${k}#${n}` };
+    });
+  }
+
+  // Exposed to groupSnippet so a grouped view (Models panel) can sort each
+  // family's own row list against the same comparator/sort state the header
+  // click updates. Without this the group snippet has no way to see `sort`,
+  // so clicking a header flipped the indicator/aria-sort but never touched
+  // row order.
+  function sortRows(list: Row[]): Row[] {
+    return sort ? [...list].sort(compare) : list;
+  }
+
+  function ariaSort(c: Column): 'none' | 'ascending' | 'descending' {
+    if (!sort || sort.key !== c.key) return 'none';
+    return sort.dir === 'asc' ? 'ascending' : 'descending';
+  }
+  function indicator(c: Column): string {
+    if (!sort || sort.key !== c.key) return '↕';
+    return sort.dir === 'asc' ? '▲' : '▼';
+  }
+
+  // The single source of truth for a cell's classes, driven entirely by the
+  // column definition. Handed to rowSnippet/groupSnippet so callers stop
+  // hand-authoring "num align-right" literals on each <td> - the class a row
+  // renders can no longer drift from what its column declares.
+  function cellClass(key: string): string {
+    const c = columns.find((col) => col.key === key);
+    if (!c) return '';
+    return [c.num ? 'num' : '', c.align === 'right' ? 'align-right' : ''].filter(Boolean).join(' ');
+  }
+
+  function headerClass(c: Column): string {
+    return [c.align === 'right' ? 'align-right' : '', c.sticky ? 'col-sticky' : '']
+      .filter(Boolean)
+      .join(' ');
+  }
+</script>
+
+<div class="table-scroll">
+  {#if showScrollHint}<div class="scroll-hint">→ scroll for more columns</div>{/if}
+  <table>
+    <thead>
+      <tr>
+        {#each columns as c}
+          <th
+            class={headerClass(c)}
+            aria-sort={c.sortable ? ariaSort(c) : undefined}
+            title={c.title}
+          >
+            {#if c.sortable}
+              <button class="sort-btn" type="button" onclick={() => toggle(c.key)}>
+                {c.label}<span class="sort-ind" aria-hidden="true">{indicator(c)}</span>
+              </button>
+            {:else}
+              <span class="sort-btn" style="cursor:default">{c.label}</span>
+            {/if}
+          </th>
+        {/each}
+      </tr>
+    </thead>
+    <tbody>
+      {#if groupSnippet}
+        {@render groupSnippet({ rows: sorted, sort, sortRows, cellClass })}
+      {:else}
+        {#each uniqueKeyed as kr, i (kr.key)}
+          <tr id={rowDomId ? rowDomId(kr.row, i) : undefined} tabindex={rowDomId ? -1 : undefined}>
+            {@render rowSnippet?.({ row: kr.row, cellClass })}
+          </tr>
+        {/each}
+      {/if}
+    </tbody>
+  </table>
+</div>
