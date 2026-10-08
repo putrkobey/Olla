@@ -51,3 +51,57 @@ afterEach(() => {
   if (component) unmount(component);
   document.body.innerHTML = '';
 });
+
+function rowIdsFor(group: string): string[] {
+  return Array.from(
+    document.querySelectorAll<HTMLTableRowElement>(`tr[data-testid="row"][data-group="${group}"]`)
+  ).map((el) => el.dataset.id as string);
+}
+
+describe('SortableTable grouped sorting', () => {
+  it('clicking the numeric column header reorders rows within every group, numerically', () => {
+    component = mount(Fixture, { target: document.body, props: { columns, groups } });
+    flushSync();
+
+    // Unsorted: fixture order as given.
+    expect(rowIdsFor('alpha')).toEqual(['a-100', 'a-9', 'a-2']);
+
+    const header = Array.from(document.querySelectorAll<HTMLButtonElement>('button.sort-btn')).find(
+      (b) => b.textContent?.includes('Count')
+    );
+    header!.click();
+    flushSync();
+
+    // First click sorts descending (SortableTable's toggle() default).
+    expect(rowIdsFor('alpha')).toEqual(['a-100', 'a-9', 'a-2']);
+    expect(rowIdsFor('beta')).toEqual(['b-50', 'b-1']);
+
+    header!.click();
+    flushSync();
+
+    // Second click flips to ascending - numerically, not lexicographically
+    // (a lexicographic sort would put "100" before "2" and "9").
+    expect(rowIdsFor('alpha')).toEqual(['a-2', 'a-9', 'a-100']);
+    expect(rowIdsFor('beta')).toEqual(['b-1', 'b-50']);
+  });
+
+  it('aria-sort on the header matches the order actually rendered', () => {
+    component = mount(Fixture, { target: document.body, props: { columns, groups } });
+    flushSync();
+
+    const th = Array.from(document.querySelectorAll<HTMLTableHeaderCellElement>('th[aria-sort]')).find(
+      (t) => t.textContent?.includes('Count')
+    );
+    const header = th!.querySelector<HTMLButtonElement>('button.sort-btn')!;
+
+    header.click();
+    flushSync();
+    expect(th!.getAttribute('aria-sort')).toBe('descending');
+    expect(rowIdsFor('beta')).toEqual(['b-50', 'b-1']); // descending
+
+    header.click();
+    flushSync();
+    expect(th!.getAttribute('aria-sort')).toBe('ascending');
+    expect(rowIdsFor('beta')).toEqual(['b-1', 'b-50']); // ascending
+  });
+});
