@@ -28,3 +28,34 @@ func ParseTrustedCIDRs(cidrStrings []string) ([]*net.IPNet, error) {
 		if cidrStr == "" {
 			continue
 		}
+
+		_, network, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", cidrStr, err)
+		}
+		cidrs = append(cidrs, network)
+	}
+
+	return cidrs, nil
+}
+
+// NormaliseBaseURL ensures the base URL ends without a trailing slash
+func NormaliseBaseURL(baseURL string) string {
+	if baseURL == "" {
+		return ""
+	}
+	if len(baseURL) > 1 && baseURL[len(baseURL)-1] == '/' {
+		return baseURL[:len(baseURL)-1]
+	}
+	return baseURL
+}
+
+// IsPortAvailable checks if a port is available by attempting to bind to it
+func IsPortAvailable(host string, port int) bool {
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	defer listener.Close()
+	return true
+}
