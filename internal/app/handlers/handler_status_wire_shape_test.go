@@ -159,3 +159,165 @@ func TestWireShape_EndpointsStatusResponse(t *testing.T) {
 	endpoints, _ := shape["endpoints"].([]interface{})
 	require.NotEmpty(t, endpoints)
 	// Find the endpoint with traffic so request_count / health_check are
+	// non-omitempty and present. Other endpoint entries pin the always-on keys.
+	var withTraffic map[string]interface{}
+	for _, e := range endpoints {
+		em, _ := e.(map[string]interface{})
+		require.NotNil(t, em)
+		if _, ok := em["request_count"]; ok {
+			if rc, _ := em["request_count"].(float64); rc > 0 {
+				withTraffic = em
+			}
+		}
+		if withTraffic == nil {
+			withTraffic = em
+		}
+	}
+	require.NotNil(t, withTraffic, "no endpoint found")
+	assertKeysTyped(t, withTraffic, map[string]string{
+		"name":            "string",
+		"type":            "string",
+		"status":          "string",
+		"priority":        "number",
+		"model_count":     "number",
+		"request_count":   "number",
+		"success_rate":    "string",
+		"last_model_sync": "string",
+		"health_check":    "string",
+		"response_time":   "string",
+		"issues":          "string",
+	})
+}
+
+func TestWireShape_ModelsStatusResponse(t *testing.T) {
+	app := seedWireShapeApp(t)
+	shape := jsonShape(t, doStatus(t, app, "/internal/status/models"))
+
+	assertKeysTyped(t, shape, map[string]string{
+		"timestamp":        "string",
+		"models_by_family": "object",
+		"recent_models":    "array",
+		"total_models":     "number",
+		"total_families":   "number",
+		"total_endpoints":  "number",
+	})
+
+	modelsByFamily, _ := shape["models_by_family"].(map[string]interface{})
+	require.NotNil(t, modelsByFamily)
+	for family, vals := range modelsByFamily {
+		arr, ok := vals.([]interface{})
+		assert.True(t, ok, "models_by_family[%q] should be array", family)
+		for _, v := range arr {
+			_, ok := v.(string)
+			assert.True(t, ok, "models_by_family[%q] entries should be strings", family)
+		}
+	}
+
+	recent, _ := shape["recent_models"].([]interface{})
+	require.NotEmpty(t, recent)
+	first, _ := recent[0].(map[string]interface{})
+	require.NotNil(t, first)
+	assertKeysTyped(t, first, map[string]string{
+		"name":         "string",
+		"endpoints":    "array",
+		"last_seen":    "string",
+		"type":         "string",
+		"family":       "string",
+		"size":         "string",
+		"params":       "string",
+		"quant":        "string",
+		"capabilities": "array",
+	})
+}
+
+// seedWireShapeApp builds a minimal Application with a healthy and an
+// unhealthy endpoint, real stats and a discovered model, sufficient to
+// exercise every non-omitempty field the three handlers emit.
+func seedWireShapeApp(t *testing.T) *Application {
+	t.Helper()
+	const healthyURL = "http://localhost:11434"
+	const unhealthyURL = "http://localhost:8080"
+
+	endpoints := []*domain.Endpoint{
+		{
+			Name:          "ollama-1",
+			Type:          "ollama",
+			URLString:     healthyURL,
+			Status:        domain.StatusHealthy,
+			Priority:      1,
+			LastChecked:   time.Now().Add(-30 * time.Second),
+			NextCheckTime: time.Now().Add(30 * time.Second),
+			LastLatency:   14 * time.Millisecond,
+			// Non-zero but still healthy: this is the endpoint the wire-shape
+			// tests pin optional fields against, and "issues" is omitempty, so
+			// it needs a non-empty value to appear in the response at all.
+			ConsecutiveFailures: 4,
+		},
+		{
+			Name:          "openai-1",
+			Type:          "openai",
+			URLString:     unhealthyURL,
+			Status:        domain.StatusUnhealthy,
+			Priority:      2,
+			LastChecked:   time.Now().Add(-2 * time.Minute),
+			NextCheckTime: time.Now().Add(30 * time.Second),
+		},
+	}
+
+	family := "llama"
+	paramSize := "7B"
+	quant := "q4_0"
+	mtype := modelTypeLLM
+
+	modelMap := map[string]*domain.EndpointModels{
+		healthyURL: {
+			Models: []*domain.ModelInfo{
+				{
+					Name:     "llama2:7b",
+					Type:     mtype,
+					LastSeen: time.Now().Add(-1 * time.Minute),
+					Size:     4_000_000_000,
+					Details: &domain.ModelDetails{
+						Family:            &family,
+						ParameterSize:     &paramSize,
+						QuantizationLevel: &quant,
+						Type:              &mtype,
+					},
+				},
+			},
+			LastUpdated: time.Now().Add(-90 * time.Second),
+		},
+	}
+
+	endpointStats := map[string]ports.EndpointStats{
+		healthyURL: {
+			Name:               "ollama-1",
+			URL:                healthyURL,
+			TotalRequests:      100,
+			SuccessfulRequests: 95,
+			FailedRequests:     5,
+			TotalBytes:         1_000_000,
+			AverageLatency:     120,
+			MinLatency:         40,
+			MaxLatency:         800,
+		},
+	}
+
+	repo := &mockStatusEndpointRepository{endpoints: endpoints}
+	stats := &mockStatusStatsCollector{
+		endpointStats: endpointStats,
+		connectionStats: map[string]int64{
+			healthyURL:   3,
+			unhealthyURL: 0,
+		},
+	}
+	registry := &mockStatusModelRegistry{endpointModels: modelMap}
+
+	return &Application{
+		repository:     repo,
+		statsCollector: stats,
+		modelRegistry:  registry,
+		StartTime:      time.Now().Add(-10 * time.Minute),
+		Config:         &config.Config{Proxy: config.ProxyConfig{Engine: "olla", Profile: "balanced", LoadBalancer: "round_robin"}},
+	}
+}
