@@ -152,3 +152,311 @@ func TestProxyRouting_MixedFleetMatrix(t *testing.T) {
 		{"model-less embeddings steered to a real lm studio embedding model beside vllm", embeddingsPath, embedBody(""), "lmstudio-1", []fleetEndpoint{lmStudio, vllmChat}},
 		{"model-less embeddings steered to tagged embedding host", embeddingsPath, embedBody(""), "ollama-1", []fleetEndpoint{ollamaEmbed, vllmChat}},
 		// vLLM reports no model kind, so these hosts are tagged from the model name alone
+		{"model-less embeddings steered to a name-tagged vllm embedder beside vllm chat", embeddingsPath, embedBody(""), "vllm-embed", []fleetEndpoint{vllmChat, vllmBGEHost}},
+		{"model-less embeddings steered to a name-tagged vllm embedder beside an untagged ollama chat host", embeddingsPath, embedBody(""), "vllm-embed", []fleetEndpoint{{name: "ollama-1", typ: domain.ProfileOllama, modelsJSON: `{"models":[{"name":"llama3.1:8b"}]}`}, vllmBGEHost}},
+		{"model-less v1 rerank steered to the vllm reranker beside a vllm embedder", "/olla/proxy/v1/rerank", rerankBody, "vllm-rerank", []fleetEndpoint{vllmBGEHost, vllmRerank}},
+		{"model-less vision steered to vision-tagged host", chatPath, visionBody(""), "ollama-1", []fleetEndpoint{ollamaEmbed, vllmVision}},
+		// Ollama reports vision and tools in /api/tags, so those models carry the tags
+		{"model-less vision steered to an ollama vision model beside an untagged vllm chat host", chatPath, visionBody(""), "ollama-1", []fleetEndpoint{ollamaVision, vllmChatHost}},
+		{"model-less vision keeps every host when no model anywhere has vision", chatPath, visionBody(""), "", []fleetEndpoint{ollamaPlain, vllmChatHost}},
+		{"model-less tools steered to an ollama tools model beside an untagged vllm chat host", chatPath, toolsBody(""), "ollama-1", []fleetEndpoint{ollamaVision, vllmChatHost}},
+		{"model-less tools keeps every host when no model anywhere declares tools", chatPath, toolsBody(""), "", []fleetEndpoint{ollamaPlain, vllmChatHost}},
+		{"named vllm model with tools is not evicted by ollama tools models", chatPath, toolsBody("Qwen/Qwen3-32B"), "vllm-chat", []fleetEndpoint{ollamaVision, vllmChatHost}},
+		// provider routes confine candidates with ProviderScope before the capability stage
+		{"model-less tools on the ollama provider route reaches the ollama tools host", "/olla/ollama/v1/chat/completions", toolsBody(""), "ollama-1", []fleetEndpoint{ollamaVision, ollamaPlain2, vllmChatHost}},
+		{"named tools model on the ollama provider route reaches its host", "/olla/ollama/v1/chat/completions", toolsBody("gpt-oss:20b"), "ollama-1", []fleetEndpoint{ollamaVision, vllmChatHost}},
+		{"named vision request for a vllm model is not evicted by ollama vision models", chatPath, visionBody("Qwen/Qwen3-32B"), "vllm-chat", []fleetEndpoint{ollamaVision, vllmChatHost}},
+	}
+
+	strategies := []struct {
+		name string
+		cfg  config.ModelRoutingStrategy
+	}{
+		{"strict", config.ModelRoutingStrategy{Type: "strict"}},
+		{"optimistic-compatible-only", config.ModelRoutingStrategy{Type: "optimistic", Options: config.ModelRoutingStrategyOptions{FallbackBehavior: constants.FallbackBehaviorCompatibleOnly}}},
+		{"optimistic-all", config.ModelRoutingStrategy{Type: "optimistic", Options: config.ModelRoutingStrategyOptions{FallbackBehavior: constants.FallbackBehaviorAll}}},
+	}
+
+	for _, tt := range tests {
+		for _, strategy := range strategies {
+			t.Run(tt.name+"/"+strategy.name, func(t *testing.T) {
+				t.Parallel()
+
+				w, selected := runMixedFleet(t, profileFactory, chain, styledLog, strategy.cfg, tt.fleet, tt.path, tt.body)
+
+				require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+				require.NotEmpty(t, selected, "proxy engine must receive candidate endpoints")
+				if tt.wantEndpoint == "" {
+					var got, want []string
+					for _, ep := range selected {
+						got = append(got, ep.Name)
+					}
+					for _, fe := range tt.fleet {
+						want = append(want, fe.name)
+					}
+					assert.ElementsMatch(t, want, got)
+					return
+				}
+				for _, ep := range selected {
+					assert.Equal(t, tt.wantEndpoint, ep.Name)
+				}
+			})
+		}
+	}
+}
+
+// runMixedFleet registers fleet in a real unified registry through the shipped profile
+// parsers, sends one request through the proxy handler and returns the response and the
+// endpoints the proxy engine was handed. Offline hosts keep their discovered models.
+func runMixedFleet(t *testing.T, profileFactory profile.ProfileFactory, chain *inspector.Chain, styledLog logger.StyledLogger,
+	strategyCfg config.ModelRoutingStrategy, fleet []fleetEndpoint, path, body string) (*httptest.ResponseRecorder, []*domain.Endpoint) {
+	t.Helper()
+
+	ctx := context.Background()
+	cfg := strategyCfg
+	unified := registry.NewUnifiedMemoryModelRegistry(styledLog, nil, &cfg, nil)
+
+	healthy := make([]*domain.Endpoint, 0, len(fleet))
+	all := make([]*domain.Endpoint, 0, len(fleet))
+	wantModels := 0
+	for _, fe := range fleet {
+		u, perr := url.Parse("http://" + fe.name + ":8080")
+		require.NoError(t, perr)
+		ep := &domain.Endpoint{Name: fe.name, URL: u, URLString: u.String(), Type: fe.typ, Status: domain.StatusHealthy}
+		all = append(all, ep)
+		switch {
+		case fe.offline:
+			ep.Status = domain.StatusOffline
+		case fe.busy:
+			ep.Status = domain.StatusBusy
+		default:
+			healthy = append(healthy, ep)
+		}
+
+		prof, perr := profileFactory.GetProfile(fe.typ)
+		require.NoError(t, perr)
+		models, perr := prof.ParseModelsResponse([]byte(fe.modelsJSON))
+		require.NoError(t, perr)
+		wantModels += len(models)
+
+		unified.RegisterEndpoint(ep)
+		require.NoError(t, unified.RegisterModelsWithEndpoint(ctx, ep, models))
+	}
+	require.Eventually(t, func() bool {
+		models, gerr := unified.GetUnifiedModels(ctx)
+		return gerr == nil && len(models) >= wantModels
+	}, 5*time.Second, 10*time.Millisecond, "async unification did not complete")
+
+	var selected []*domain.Endpoint
+	app := &Application{
+		Config:         &config.Config{Server: config.ServerConfig{RateLimits: config.ServerRateLimits{}}},
+		logger:         styledLog,
+		profileFactory: profileFactory,
+		inspectorChain: chain,
+		discoveryService: &mockDiscoveryServiceWithFunc{getHealthyEndpointsFunc: func(context.Context) ([]*domain.Endpoint, error) { return healthy, nil },
+			getEndpointsFunc: func(context.Context) ([]*domain.Endpoint, error) { return all, nil },
+		},
+		modelRegistry: unified,
+		proxyService: &mockProxyService{
+			proxyFunc: func(_ context.Context, w http.ResponseWriter, _ *http.Request, eps []*domain.Endpoint, _ *ports.RequestStats, _ logger.StyledLogger) error {
+				selected = eps
+				w.WriteHeader(http.StatusOK)
+				return nil
+			},
+		},
+		StartTime: time.Now(),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	if strings.HasPrefix(path, "/olla/proxy/") {
+		req = req.WithContext(context.WithValue(req.Context(), constants.ContextRoutePrefixKey, "/olla/proxy/"))
+	}
+	w := httptest.NewRecorder()
+
+	if !strings.HasPrefix(path, "/olla/proxy/") {
+		app.providerProxyHandler(w, req)
+	} else {
+		app.proxyHandler(w, req)
+	}
+
+	return w, selected
+}
+
+// mixedFleetDeps builds the shipped profiles and the path/body inspector chain the
+// fleet tests route through.
+func mixedFleetDeps(t *testing.T) (profile.ProfileFactory, *inspector.Chain, *mockStyledLogger) {
+	t.Helper()
+	styledLog := &mockStyledLogger{}
+
+	profileFactory, err := profile.NewFactory("../../../config/profiles")
+	require.NoError(t, err)
+
+	inspectorFactory := inspector.NewFactory(profileFactory, styledLog)
+	bodyInspector, err := inspectorFactory.CreateBodyInspector()
+	require.NoError(t, err)
+	chain := inspectorFactory.CreateChain()
+	chain.AddInspector(inspectorFactory.CreatePathInspector())
+	chain.AddInspector(bodyInspector)
+	return profileFactory, chain, styledLog
+}
+
+// When a capability exists in the fleet but every host with it is down, a model-less
+// request is refused with a clear 503. Falling back to "everything" sprayed it at hosts
+// that serve a different kind: with the only embedder stopped, /embed went to the
+// reranker and classifier and TEI answered 424 for most of 1500 requests.
+func TestProxyRouting_CapabilityUnavailable(t *testing.T) {
+	t.Parallel()
+
+	profileFactory, chain, styledLog := mixedFleetDeps(t)
+
+	const (
+		embeddingsPath = "/olla/proxy/v1/embeddings"
+		chatPath       = "/olla/proxy/v1/chat/completions"
+		inputsBody     = `{"inputs":"hello"}`
+		embedBody      = `{"input":"hello"}`
+		visionBody     = `{"messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`
+		toolsBody      = `{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`
+		plainChatBody  = `{"messages":[{"role":"user","content":"hi"}]}`
+		unreadableBody = "input=hello"
+	)
+	tei := func(name, info string, offline bool) fleetEndpoint {
+		return fleetEndpoint{name: name, typ: constants.ProviderTypeTextEmbeddingsInference, modelsJSON: info, offline: offline}
+	}
+	ollama := func(models string, offline bool) fleetEndpoint {
+		return fleetEndpoint{name: "ollama-1", typ: domain.ProfileOllama, modelsJSON: models, offline: offline}
+	}
+	teiBusy := fleetEndpoint{name: "tei-embed", typ: constants.ProviderTypeTextEmbeddingsInference, modelsJSON: teiInfoSnowflake, busy: true}
+	vllmChat := fleetEndpoint{name: "vllm-chat", typ: domain.ProfileVLLM, modelsJSON: vllmChatModel}
+
+	tests := []struct {
+		name        string
+		path        string
+		body        string
+		wantReason  string   // set when the request must be refused with a 503
+		wantOffered []string // otherwise the hosts the proxy engine is handed
+		fleet       []fleetEndpoint
+	}{
+		{"model-less embed with the only embedder down", "/olla/proxy/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false)}},
+		{"model-less embed on the tei provider route with the only embedder down", "/olla/tei/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false)}},
+		{"model-less embeddings with the only embedding host down", embeddingsPath, embedBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, true), vllmChat}},
+		{"model-less vision with the only vision host down", chatPath, visionBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, true), vllmChat}},
+		{"model-less vision with the only ollama vision model down, declared by capability not name", chatPath, visionBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{ollama(ollamaTagsVisionAndTools, true), vllmChat}},
+		{"model-less tools with the only tools host down", chatPath, toolsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{ollama(ollamaTagsVisionAndTools, true), vllmChat}},
+		{"model-less tools on the ollama provider route with the only tools host down", "/olla/ollama/v1/chat/completions", toolsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{ollama(ollamaTagsVisionAndTools, true), vllmChat}},
+		{"named model is unaffected when the only ollama vision host is down", chatPath, `{"model":"Qwen/Qwen3-32B","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]}`, "", []string{"vllm-chat"},
+			[]fleetEndpoint{ollama(ollamaTagsVisionAndTools, true), vllmChat}},
+		{"model-less embed on the tei provider route with every tei host offline", "/olla/tei/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, true), vllmChat}},
+		// GetHealthyEndpoints excludes Busy hosts, so they never receive proxied traffic and count as down
+		{"model-less embed with the only embedder busy", "/olla/proxy/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{teiBusy, tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false)}},
+		{"model-less embed on the tei provider route with the only embedder busy", "/olla/tei/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{teiBusy, tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false)}},
+		// a healthy embedder of a type the path can't use (Ollama for TEI's /embed) must not veto the refusal
+		{"model-less embed with the tei embedder down and a healthy ollama embedder", "/olla/proxy/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false), ollama(ollamaTagsEmbedAndVision, false)}},
+		{"model-less embed on the tei provider route with the tei embedder down and a healthy ollama embedder", "/olla/tei/embed", inputsBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false), ollama(ollamaTagsEmbedAndVision, false)}},
+		// /v1/embeddings is shared with Ollama, but the tei provider route confines candidates to TEI
+		{"model-less v1 embeddings on the tei provider route with a healthy ollama embedder", "/olla/tei/v1/embeddings", embedBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false), ollama(ollamaTagsEmbedAndVision, false)}},
+		{"model-less v1 embeddings on the unified route reaches the ollama embedder", embeddingsPath, embedBody, "", []string{"ollama-1"},
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false), ollama(ollamaTagsEmbedAndVision, false)}},
+		// the body is unreadable (not JSON), so only the path says this is an embeddings request
+		{"unreadable-body embeddings with the only embedding host down", embeddingsPath, unreadableBody, constants.RoutingReasonCapabilityUnavailable, nil,
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, true), vllmChat}},
+		{"unreadable-body embeddings stay off chat-only hosts", embeddingsPath, unreadableBody, "", []string{"ollama-1"},
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, false), vllmChat}},
+		{"unreadable-body embeddings behind a mount prefix stay off chat-only hosts", "/olla/ollama/v1/embeddings", unreadableBody, "", []string{"ollama-1"},
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, false), vllmChat}},
+		{"model-less embed on the tei provider route whose only embedder is a healthy ollama keeps the fallback", "/olla/tei/embed", inputsBody, "", []string{"tei-classify", "tei-rerank"},
+			[]fleetEndpoint{tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false), ollama(ollamaTagsEmbedAndVision, false)}},
+		{"model-less embed routes to a second embedder that is up", "/olla/proxy/embed", inputsBody, "", []string{"tei-embed-2"},
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), tei("tei-embed-2", teiInfoBGESmall, false), tei("tei-rerank", teiInfoReranker, false)}},
+		{"model-less embed with no embedder model anywhere keeps the fallback", "/olla/proxy/embed", inputsBody, "", []string{"tei-classify", "tei-rerank"},
+			[]fleetEndpoint{tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false)}},
+		{"model-less embed whose embedder is up but not a candidate keeps the fallback", "/olla/proxy/embed", inputsBody, "", []string{"tei-classify", "tei-rerank"},
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, false), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false)}},
+		{"model-less chat on an untagged fleet is untouched", chatPath, plainChatBody, "", []string{"ollama-1", "vllm-chat"},
+			[]fleetEndpoint{ollama(ollamaTagsPlainChat, false), vllmChat}},
+		{"a down host without the capability changes nothing", chatPath, plainChatBody, "", []string{"vllm-chat"},
+			[]fleetEndpoint{ollama(ollamaTagsEmbedAndVision, true), vllmChat}},
+		{"a named request skips the capability check when the embedder is down", embeddingsPath, `{"model":"Qwen/Qwen3-32B","input":"hello"}`, "", []string{"vllm-chat"},
+			[]fleetEndpoint{tei("tei-embed", teiInfoSnowflake, true), vllmChat}},
+	}
+
+	strategies := []struct {
+		name string
+		cfg  config.ModelRoutingStrategy
+	}{
+		{"strict", config.ModelRoutingStrategy{Type: "strict"}},
+		{"optimistic-compatible-only", config.ModelRoutingStrategy{Type: "optimistic", Options: config.ModelRoutingStrategyOptions{FallbackBehavior: constants.FallbackBehaviorCompatibleOnly}}},
+		{"optimistic-all", config.ModelRoutingStrategy{Type: "optimistic", Options: config.ModelRoutingStrategyOptions{FallbackBehavior: constants.FallbackBehaviorAll}}},
+	}
+
+	for _, tt := range tests {
+		for _, strategy := range strategies {
+			t.Run(tt.name+"/"+strategy.name, func(t *testing.T) {
+				t.Parallel()
+
+				w, selected := runMixedFleet(t, profileFactory, chain, styledLog, strategy.cfg, tt.fleet, tt.path, tt.body)
+
+				if tt.wantReason != "" {
+					require.Equal(t, http.StatusServiceUnavailable, w.Code, "body: %s", w.Body.String())
+					assert.Empty(t, selected, "a refused request never reaches the proxy engine")
+					assert.Equal(t, tt.wantReason, w.Header().Get(constants.HeaderXOllaRoutingReason))
+					assert.Equal(t, constants.RoutingStrategyCapability, w.Header().Get(constants.HeaderXOllaRoutingStrategy))
+					assert.Equal(t, ports.RoutingActionRejected, w.Header().Get(constants.HeaderXOllaRoutingDecision))
+					assert.Contains(t, w.Body.String(), tt.wantReason)
+					return
+				}
+
+				require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+				got := make([]string, 0, len(selected))
+				for _, ep := range selected {
+					got = append(got, ep.Name)
+				}
+				assert.ElementsMatch(t, tt.wantOffered, got)
+			})
+		}
+	}
+}
+
+// A refusal reaches the client through the final "Request rejected" line alone. The
+// "using unfiltered" fallback warning describes a decision Olla did not make here, and
+// repeating any other Warn per request floods the log while a backend stays down.
+func TestProxyRouting_CapabilityRefusalWritesOnlyTheRejectionWarn(t *testing.T) {
+	t.Parallel()
+
+	profileFactory, chain, _ := mixedFleetDeps(t)
+	rec := newWarnRecorder()
+	tei := func(name, info string, offline bool) fleetEndpoint {
+		return fleetEndpoint{name: name, typ: constants.ProviderTypeTextEmbeddingsInference, modelsJSON: info, offline: offline}
+	}
+	fleet := []fleetEndpoint{
+		tei("tei-embed", teiInfoSnowflake, true), tei("tei-rerank", teiInfoReranker, false), tei("tei-classify", teiInfoClassify, false),
+		{name: "ollama-1", typ: domain.ProfileOllama, modelsJSON: ollamaTagsEmbedAndVision},
+	}
+
+	for _, path := range []string{"/olla/proxy/embed", "/olla/tei/embed"} {
+		const refusals = 100
+		for range refusals {
+			w, selected := runMixedFleet(t, profileFactory, chain, rec, config.ModelRoutingStrategy{Type: "strict"}, fleet, path, `{"inputs":"hello"}`)
+			require.Equal(t, http.StatusServiceUnavailable, w.Code, "path %s", path)
+			require.Empty(t, selected)
+		}
+		warns := rec.snapshot()
+		assert.Equal(t, refusals, warns["Request rejected"], "path %s", path)
+		delete(warns, "Request rejected")
+		assert.Empty(t, warns, "path %s: only the final rejection line may warn", path)
+		rec.reset()
+	}
+}
