@@ -51,3 +51,109 @@ func BenchmarkRepository_GetRoutable(b *testing.B) {
 	statuses := []domain.EndpointStatus{
 		domain.StatusHealthy,
 		domain.StatusBusy,
+		domain.StatusWarming,
+		domain.StatusOffline,
+		domain.StatusUnhealthy,
+	}
+
+	for i := range 100 {
+		port := 11434 + i
+		configs[i] = config.EndpointConfig{
+			Name:           fmt.Sprintf("bench-%d", i),
+			URL:            fmt.Sprintf("http://localhost:%d", port),
+			HealthCheckURL: "/health",
+			ModelURL:       "/api/tags",
+			Priority:       ptrInt(100),
+			CheckInterval:  5 * time.Second,
+			CheckTimeout:   2 * time.Second,
+		}
+	}
+
+	repo.LoadFromConfig(ctx, configs)
+
+	// Set mixed statuses after loading
+	endpoints, _ := repo.GetAll(ctx)
+	for i, endpoint := range endpoints {
+		endpoint.Status = statuses[i%len(statuses)]
+		repo.UpdateEndpoint(ctx, endpoint)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		_, err := repo.GetRoutable(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRepository_UpdateEndpoint(b *testing.B) {
+	repo := NewStaticEndpointRepository()
+	ctx := context.Background()
+
+	cfg := config.EndpointConfig{
+		Name:           "bench-update",
+		URL:            "http://localhost:11434",
+		HealthCheckURL: "/health",
+		ModelURL:       "/api/tags",
+		Priority:       ptrInt(100),
+		CheckInterval:  5 * time.Second,
+		CheckTimeout:   2 * time.Second,
+	}
+
+	repo.LoadFromConfig(ctx, []config.EndpointConfig{cfg})
+	endpoints, _ := repo.GetAll(ctx)
+	endpoint := endpoints[0]
+
+	statuses := []domain.EndpointStatus{
+		domain.StatusHealthy,
+		domain.StatusBusy,
+		domain.StatusOffline,
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		endpoint.Status = statuses[i%len(statuses)]
+		endpoint.LastChecked = time.Now()
+		endpoint.LastLatency = time.Duration(i%100) * time.Millisecond
+
+		err := repo.UpdateEndpoint(ctx, endpoint)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRepository_LoadFromConfig(b *testing.B) {
+	repo := NewStaticEndpointRepository()
+	ctx := context.Background()
+
+	// Create realistic config with 10 endpoints
+	configs := make([]config.EndpointConfig, 10)
+	for i := range 10 {
+		port := 11434 + i
+		configs[i] = config.EndpointConfig{
+			Name:           fmt.Sprintf("load-bench-%d", i),
+			URL:            fmt.Sprintf("http://localhost:%d", port),
+			HealthCheckURL: "/health",
+			ModelURL:       "/api/tags",
+			Priority:       ptrInt(100 + i*10),
+			CheckInterval:  5 * time.Second,
+			CheckTimeout:   2 * time.Second,
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		err := repo.LoadFromConfig(ctx, configs)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
