@@ -156,3 +156,162 @@ func createFileHandler(cfg *Config, level slog.Level) (slog.Handler, func(), err
 
 	return handler, cleanup, nil
 }
+
+// replaceTimeAttr formats timestamps consistently
+func replaceTimeAttr(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey {
+		return slog.Attr{
+			Key:   "timestamp",
+			Value: slog.StringValue(a.Value.Time().Format("2006-01-02 15:04:05")),
+		}
+	}
+	return a
+}
+
+// multiHandler sends logs to multiple handlers
+type multiHandler struct {
+	handlers []slog.Handler
+}
+
+func (h *multiHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	for _, handler := range h.handlers {
+		if handler.Enabled(ctx, level) {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *multiHandler) Handle(ctx context.Context, record slog.Record) error {
+	for _, handler := range h.handlers {
+		if handler.Enabled(ctx, record.Level) {
+			if err := handler.Handle(ctx, record); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (h *multiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	newHandlers := make([]slog.Handler, len(h.handlers))
+	for i, handler := range h.handlers {
+		newHandlers[i] = handler.WithAttrs(attrs)
+	}
+	return &multiHandler{handlers: newHandlers}
+}
+
+func (h *multiHandler) WithGroup(name string) slog.Handler {
+	newHandlers := make([]slog.Handler, len(h.handlers))
+	for i, handler := range h.handlers {
+		newHandlers[i] = handler.WithGroup(name)
+	}
+	return &multiHandler{handlers: newHandlers}
+}
+
+// terminalFilterHandler filters out detailed context logs from terminal output
+type terminalFilterHandler struct {
+	handler slog.Handler
+}
+
+func (h *terminalFilterHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	if isDetailedLog(ctx) {
+		return false
+	}
+	return h.handler.Enabled(ctx, level)
+}
+
+func (h *terminalFilterHandler) Handle(ctx context.Context, record slog.Record) error {
+	if isDetailedLog(ctx) {
+		return nil
+	}
+	return h.handler.Handle(ctx, record)
+}
+
+func (h *terminalFilterHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &terminalFilterHandler{handler: h.handler.WithAttrs(attrs)}
+}
+
+func (h *terminalFilterHandler) WithGroup(name string) slog.Handler {
+	return &terminalFilterHandler{handler: h.handler.WithGroup(name)}
+}
+
+// isDetailedLog checks if a log should only go to files (not terminal)
+func isDetailedLog(ctx context.Context) bool {
+	if detailed := ctx.Value(DefaultDetailedCookie); detailed != nil {
+		if d, ok := detailed.(bool); ok && d {
+			return true
+		}
+	}
+	return false
+}
+
+// ansiStripHandler wraps a handler to strip ANSI escape codes from log messages
+// to ensure JSON file output is clean and parseable
+type ansiStripHandler struct {
+	handler slog.Handler
+}
+
+func (h *ansiStripHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.handler.Enabled(ctx, level)
+}
+
+func (h *ansiStripHandler) Handle(ctx context.Context, record slog.Record) error {
+	// we strip ANSI codes from the message for clean JSON output
+	// this cleans most of the pterm styles and other ANSI codes
+	record.Message = ansiRegex.ReplaceAllString(record.Message, "")
+	return h.handler.Handle(ctx, record)
+}
+
+func (h *ansiStripHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &ansiStripHandler{handler: h.handler.WithAttrs(attrs)}
+}
+
+func (h *ansiStripHandler) WithGroup(name string) slog.Handler {
+	return &ansiStripHandler{handler: h.handler.WithGroup(name)}
+}
+
+// parseLevel converts string log level to slog.Level
+func parseLevel(level string) slog.Level {
+	switch strings.ToLower(level) {
+	case LogLevelDebug:
+		return slog.LevelDebug
+	case LogLevelInfo:
+		return slog.LevelInfo
+	case LogLevelWarn, LogLevelWarning:
+		return slog.LevelWarn
+	case LogLevelError:
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// IsValidLevel reports whether level is a recognised log level string
+// (case-insensitive). Callers that source a level from config or an env var
+// use this to warn and fall back rather than silently defaulting to info,
+// which is what parseLevel does for any unrecognised value.
+func IsValidLevel(level string) bool {
+	switch strings.ToLower(level) {
+	case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelWarning, LogLevelError:
+		return true
+	default:
+		return false
+	}
+}
+
+// convertToPTermLevel converts slog level to pterm level
+func convertToPTermLevel(level slog.Level) pterm.LogLevel {
+	switch level {
+	case slog.LevelDebug:
+		return pterm.LogLevelTrace
+	case slog.LevelInfo:
+		return pterm.LogLevelInfo
+	case slog.LevelWarn:
+		return pterm.LogLevelWarn
+	case slog.LevelError:
+		return pterm.LogLevelError
+	default:
+		return pterm.LogLevelInfo
+	}
+}

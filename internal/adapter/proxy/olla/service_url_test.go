@@ -104,3 +104,109 @@ func TestBuildTargetURL(t *testing.T) {
 			description:   "Edge case: empty path after prefix strip",
 		},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			endpointURL, err := url.Parse(tt.endpointURL)
+			if err != nil {
+				t.Fatalf("invalid endpoint URL: %v", err)
+			}
+
+			endpoint := &domain.Endpoint{
+				Name: "test",
+				URL:  endpointURL,
+			}
+
+			requestURL := tt.requestPath
+			if tt.requestQuery != "" {
+				requestURL += "?" + tt.requestQuery
+			}
+
+			req, err := http.NewRequest("POST", requestURL, nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+
+			targetURL := common.BuildTargetURL(req, endpoint, service.configuration.Load().GetProxyPrefix())
+
+			// Verify path
+			if targetURL.Path != tt.expectedPath {
+				t.Errorf("%s: expected path %q, got %q", tt.description, tt.expectedPath, targetURL.Path)
+			}
+
+			// Verify query string
+			if targetURL.RawQuery != tt.expectedQuery {
+				t.Errorf("%s: expected query %q, got %q", tt.description, tt.expectedQuery, targetURL.RawQuery)
+			}
+
+			// Verify host
+			if targetURL.Host != tt.expectedHost {
+				t.Errorf("%s: expected host %q, got %q", tt.description, tt.expectedHost, targetURL.Host)
+			}
+
+			// Verify scheme preserved
+			if targetURL.Scheme != endpointURL.Scheme {
+				t.Errorf("%s: expected scheme %q, got %q", tt.description, endpointURL.Scheme, targetURL.Scheme)
+			}
+
+			// Log which path was used
+			fastPath := endpoint.URL.Path == "" || endpoint.URL.Path == "/"
+			if fastPath != tt.useFastPath {
+				t.Logf("Note: %s used %s (expected %s)",
+					tt.description,
+					map[bool]string{true: "fast path", false: "slow path"}[fastPath],
+					map[bool]string{true: "fast path", false: "slow path"}[tt.useFastPath])
+			}
+		})
+	}
+}
+
+// TestBuildTargetURL_PathHandling tests specific path edge cases
+func TestBuildTargetURL_PathHandling(t *testing.T) {
+	config := &Configuration{}
+	config.ProxyPrefix = "/olla/"
+	config.ResponseTimeout = 30 * time.Second
+	config.ReadTimeout = 10 * time.Second
+	config.StreamBufferSize = 8192
+	config.MaxIdleConns = 200
+	config.IdleConnTimeout = 90 * time.Second
+	config.MaxConnsPerHost = 50
+
+	service, err := NewService(&mockDiscoveryService{}, &mockEndpointSelector{}, config, &mockStatsCollector{}, nil, createTestLogger())
+	if err != nil {
+		t.Fatalf("failed to create service: %v", err)
+	}
+
+	// Test that fast path and slow path produce same results for simple endpoints
+	endpointURL, _ := url.Parse("http://localhost:11434")
+	endpoint := &domain.Endpoint{
+		Name: "test",
+		URL:  endpointURL,
+	}
+
+	testPaths := []string{
+		"/olla/v1/chat/completions",
+		"/olla/api/tags",
+		"/olla/v1/models",
+		"/olla/",
+		"/olla/a/b/c/d",
+	}
+
+	for _, path := range testPaths {
+		req, _ := http.NewRequest("GET", path+"?test=true", nil)
+		targetURL := common.BuildTargetURL(req, endpoint, service.configuration.Load().GetProxyPrefix())
+
+		// Verify URL is valid
+		if targetURL.Host == "" {
+			t.Errorf("empty host for path %s", path)
+		}
+		if targetURL.Scheme == "" {
+			t.Errorf("empty scheme for path %s", path)
+		}
+
+		// Verify query string preserved
+		if targetURL.RawQuery != "test=true" {
+			t.Errorf("query string not preserved for path %s: got %q", path, targetURL.RawQuery)
+		}
+	}
+}
