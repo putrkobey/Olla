@@ -43,3 +43,48 @@ func TestProfileRoutingPrefixes(t *testing.T) {
 		{"OLLAMA uppercase", "OLLAMA", false},
 		{"LmStudio mixed", "LmStudio", false},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := profileFactory.ValidateProfileType(tt.provider)
+			assert.Equal(t, tt.expected, result,
+				"ValidateProfileType(%q) = %v, want %v", tt.provider, result, tt.expected)
+		})
+	}
+}
+
+func TestProfileFactoryIntegration(t *testing.T) {
+	// Test that the factory correctly validates all expected provider variations
+	profileFactory, err := profile.NewFactoryWithDefaults()
+	require.NoError(t, err)
+
+	validProviders := []string{
+		"ollama",
+		"lm-studio",
+		"lmstudio",
+		"lm_studio",
+		"openai",
+		"openai-compatible",
+		"auto",
+	}
+
+	for _, provider := range validProviders {
+		t.Run(provider, func(t *testing.T) {
+			assert.True(t, profileFactory.ValidateProfileType(provider),
+				"Provider %s should be valid", provider)
+		})
+	}
+
+	invalidProviders := []string{
+		"unknown",
+		"",
+		"not-a-provider",
+	}
+
+	for _, provider := range invalidProviders {
+		t.Run(provider, func(t *testing.T) {
+			assert.False(t, profileFactory.ValidateProfileType(provider),
+				"Provider %s should be invalid", provider)
+		})
+	}
+}
