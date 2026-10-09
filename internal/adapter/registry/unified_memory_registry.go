@@ -171,3 +171,523 @@ func (r *UnifiedMemoryModelRegistry) unifyModelsAsync(ctx context.Context, endpo
 
 	// Get or create endpoint object
 	endpoint, exists := r.endpoints.Load(endpointURL)
+	if !exists {
+		// Create a minimal endpoint object for backward compatibility
+		endpoint = &domain.Endpoint{
+			URLString: endpointURL,
+			Name:      endpointURL, // Use URL as name if not provided
+		}
+	}
+
+	// Unify all models for this endpoint
+	unifiedModels, err := r.unifier.UnifyModels(ctx, models, endpoint)
+	if err != nil {
+		r.logger.ErrorWithEndpoint(endpoint.Name, "Failed to unify models", err)
+		return
+	}
+
+	// Group unified models by ID for merging
+	modelGroups := make(map[string][]*domain.UnifiedModel)
+	for _, unified := range unifiedModels {
+		modelGroups[unified.ID] = append(modelGroups[unified.ID], unified)
+	}
+
+	// Merge models across endpoints
+	for id, group := range modelGroups {
+		// Check if we already have this model globally
+		existing, exists := r.globalUnified.Load(id)
+		if exists {
+			// Merge with existing
+			group = append(group, existing)
+		}
+
+		merged, err := r.unifier.MergeUnifiedModels(ctx, group)
+		if err != nil {
+			r.logger.Error("Failed to merge unified models", err)
+			continue
+		}
+
+		r.globalUnified.Store(id, merged)
+
+		// update cached endpoint set for this model
+		var endpointURLs []string
+		for _, sourceEndpoint := range merged.SourceEndpoints {
+			endpointURLs = append(endpointURLs, sourceEndpoint.EndpointURL)
+		}
+
+		// we cache under the unified ID
+		r.updateEndpointSet(id, endpointURLs)
+
+		// and also cache under all native names and aliases for fast lookup
+		for _, sourceEndpoint := range merged.SourceEndpoints {
+			r.updateEndpointSet(sourceEndpoint.NativeName, endpointURLs)
+		}
+		for _, alias := range merged.Aliases {
+			r.updateEndpointSet(alias.Name, endpointURLs)
+		}
+	}
+
+	// r.logger.InfoWithEndpoint(" ", endpointUrl, "models", len(unifiedModels))
+}
+
+// updateEndpointSet updates the cached endpoint set for a given model
+// trying to avoid repeated list-to-set conversions in GetHealthyEndpointsForModel
+func (r *UnifiedMemoryModelRegistry) updateEndpointSet(modelID string, endpoints []string) {
+	endpointSet := xsync.NewMap[string, struct{}]()
+	for _, url := range endpoints {
+		endpointSet.Store(url, struct{}{})
+	}
+	r.modelEndpointSets.Store(modelID, endpointSet)
+}
+
+// GetEndpointSet returns the cached endpoint set for a given model
+func (r *UnifiedMemoryModelRegistry) GetEndpointSet(modelID string) (*xsync.Map[string, struct{}], bool) {
+	return r.modelEndpointSets.Load(modelID)
+}
+
+// GetUnifiedModels returns all unified models
+func (r *UnifiedMemoryModelRegistry) GetUnifiedModels(ctx context.Context) ([]*domain.UnifiedModel, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	var models []*domain.UnifiedModel
+	r.globalUnified.Range(func(id string, model *domain.UnifiedModel) bool {
+		models = append(models, model)
+		return true
+	})
+
+	return models, nil
+}
+
+// GetUnifiedModel returns a specific unified model by ID or alias
+func (r *UnifiedMemoryModelRegistry) GetUnifiedModel(ctx context.Context, idOrAlias string) (*domain.UnifiedModel, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Try direct ID lookup first
+	if model, exists := r.globalUnified.Load(idOrAlias); exists {
+		return model, nil
+	}
+
+	// Try alias resolution
+	unified, err := r.unifier.ResolveAlias(ctx, idOrAlias)
+	if err != nil {
+		return nil, fmt.Errorf("model not found: %s", idOrAlias)
+	}
+
+	// globalUnified is where RemoveEndpoint and MarkEndpointOffline publish
+	// their replacements, so prefer it over the unifier's catalogue copy
+	if current, exists := r.globalUnified.Load(unified.ID); exists {
+		return current, nil
+	}
+
+	return unified, nil
+}
+
+// IsModelAvailable overrides to check by unified ID or alias
+func (r *UnifiedMemoryModelRegistry) IsModelAvailable(ctx context.Context, modelName string) bool {
+	// First check the original registry
+	if r.MemoryModelRegistry.IsModelAvailable(ctx, modelName) {
+		return true
+	}
+
+	// Then check unified models
+	_, err := r.GetUnifiedModel(ctx, modelName)
+	return err == nil
+}
+
+// GetEndpointsForModel overrides to support unified model lookup. Every exact match
+// (the base index, then the catalogue's case-insensitive one) is tried before the
+// Ollama default-tag fallback, so a bare name never shadows a model that really has it.
+func (r *UnifiedMemoryModelRegistry) GetEndpointsForModel(ctx context.Context, modelName string) ([]string, error) {
+	if modelName == "" {
+		return r.MemoryModelRegistry.GetEndpointsForModel(ctx, modelName)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	if endpoints := r.MemoryModelRegistry.exactEndpoints(modelName); len(endpoints) > 0 {
+		return endpoints, nil
+	}
+
+	unified, _ := r.GetUnifiedModel(ctx, modelName)
+	if unified != nil && namesModel(unified, modelName) {
+		return sourceURLs(unified, nil), nil
+	}
+
+	// Only now may a name without a tag mean "<name>:latest". The fallback is one-way
+	// on purpose: Ollama always lists models tagged, so a native bare "foo" never comes
+	// from Ollama and "foo:latest" needs no toggle to it.
+	if tagged, bare := domain.OllamaDefaultTagName(modelName); bare {
+		if endpoints := r.MemoryModelRegistry.defaultTagEndpoints(modelName); len(endpoints) > 0 {
+			return endpoints, nil
+		}
+		if unified != nil {
+			// The merged model can also be served elsewhere (the catalogue merges names
+			// case-insensitively), and those hosts do not know the bare name.
+			return sourceURLs(unified, ollamaSource(tagged)), nil
+		}
+	}
+	if unified == nil {
+		return []string{}, nil
+	}
+	return sourceURLs(unified, nil), nil
+}
+
+// CanonicalModelName follows the same exact-first resolution as routing and takes the
+// native name from the Ollama source that matched, so stats and sticky keys agree
+// whatever case or tag the client (or an alias target) used.
+func (r *UnifiedMemoryModelRegistry) CanonicalModelName(name string) string {
+	tagged, bare := domain.OllamaDefaultTagName(name)
+	if !bare || len(r.MemoryModelRegistry.exactEndpoints(name)) > 0 {
+		return name
+	}
+	unified, _ := r.GetUnifiedModel(context.Background(), name)
+	if unified != nil {
+		if namesModel(unified, name) {
+			return name
+		}
+		match := ollamaSource(tagged)
+		for i := range unified.SourceEndpoints {
+			if match(&unified.SourceEndpoints[i]) {
+				return unified.SourceEndpoints[i].NativeName
+			}
+		}
+	}
+	return r.MemoryModelRegistry.CanonicalModelName(name)
+}
+
+func ollamaSource(tagged string) func(*domain.SourceEndpoint) bool {
+	return func(src *domain.SourceEndpoint) bool {
+		return src.Platform == domain.ProfileOllama && strings.EqualFold(src.NativeName, tagged)
+	}
+}
+
+func sourceURLs(m *domain.UnifiedModel, keep func(*domain.SourceEndpoint) bool) []string {
+	var urls []string
+	for i := range m.SourceEndpoints {
+		if keep == nil || keep(&m.SourceEndpoints[i]) {
+			urls = append(urls, m.SourceEndpoints[i].EndpointURL)
+		}
+	}
+	return urls
+}
+
+// namesModel reports whether name is the model's ID or one of its aliases, ignoring case.
+func namesModel(m *domain.UnifiedModel, name string) bool {
+	if strings.EqualFold(m.ID, name) {
+		return true
+	}
+	for i := range m.Aliases {
+		if strings.EqualFold(m.Aliases[i].Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetUnifiedStats returns statistics including unification metrics
+func (r *UnifiedMemoryModelRegistry) GetUnifiedStats(ctx context.Context) (UnifiedRegistryStats, error) {
+	baseStats, err := r.MemoryModelRegistry.GetStats(ctx)
+	if err != nil {
+		return UnifiedRegistryStats{}, err
+	}
+
+	unifierStats := r.unifier.GetStats()
+
+	var totalUnifiedModels int
+	r.globalUnified.Range(func(_ string, _ *domain.UnifiedModel) bool {
+		totalUnifiedModels++
+		return true
+	})
+
+	return UnifiedRegistryStats{
+		RegistryStats:      baseStats,
+		UnificationStats:   unifierStats,
+		TotalUnifiedModels: totalUnifiedModels,
+	}, nil
+}
+
+// RemoveEndpoint overrides to clean up unified models
+func (r *UnifiedMemoryModelRegistry) RemoveEndpoint(ctx context.Context, endpointURL string) error {
+	// First remove from base registry
+	if err := r.MemoryModelRegistry.RemoveEndpoint(ctx, endpointURL); err != nil {
+		return err
+	}
+
+	// Clean up unified models
+	r.unificationMutex.Lock()
+	defer r.unificationMutex.Unlock()
+
+	// The unifier keeps its own catalogue, which GetUnifiedModel falls back to for
+	// aliases. Leaving the endpoint in it would keep offering a host that is gone.
+	r.removeEndpointFromUnifier(ctx, endpointURL)
+
+	// Remove endpoint from all unified models
+	r.globalUnified.Range(func(id string, live *domain.UnifiedModel) bool {
+		// Copy-on-write: lock-free readers hold the published pointer, and
+		// RemoveEndpoint shifts elements inside the SourceEndpoints backing array.
+		if live.GetEndpointByURL(endpointURL) == nil {
+			return true
+		}
+		model := live.Clone()
+		// we're capturing model metadata BEFORE mutation to avoid accessing empty slices
+		// when the last endpoint is removed (model.RemoveEndpoint empties SourceEndpoints)
+		sourceEndpoints := make([]domain.SourceEndpoint, len(live.SourceEndpoints))
+		copy(sourceEndpoints, live.SourceEndpoints)
+		aliases := make([]domain.AliasEntry, len(live.Aliases))
+		copy(aliases, live.Aliases)
+
+		if model.RemoveEndpoint(endpointURL) {
+			r.dropBareNameSets(sourceEndpoints)
+			// If no endpoints left, remove the unified model and its cached sets
+			if !model.IsAvailable() {
+				r.globalUnified.Delete(id)
+				// delete cache entries for all model names using captured snapshots
+				r.modelEndpointSets.Delete(id)
+				for _, sourceEndpoint := range sourceEndpoints {
+					r.modelEndpointSets.Delete(sourceEndpoint.NativeName)
+				}
+				for _, alias := range aliases {
+					r.modelEndpointSets.Delete(alias.Name)
+				}
+			} else {
+				// Update the model
+				model.DiskSize = model.GetTotalDiskSize()
+				model.LastSeen = time.Now()
+				r.globalUnified.Store(id, model)
+
+				// update cached endpoint set to reflect the removed endpoint
+				var endpointURLs []string
+				for _, sourceEndpoint := range model.SourceEndpoints {
+					endpointURLs = append(endpointURLs, sourceEndpoint.EndpointURL)
+				}
+
+				// update cache for all model names
+				r.updateEndpointSet(id, endpointURLs)
+				for _, sourceEndpoint := range model.SourceEndpoints {
+					r.updateEndpointSet(sourceEndpoint.NativeName, endpointURLs)
+				}
+				for _, alias := range model.Aliases {
+					r.updateEndpointSet(alias.Name, endpointURLs)
+				}
+			}
+		}
+		return true
+	})
+
+	return nil
+}
+
+// dropBareNameSet forgets the cached endpoint set of the bare name "name:latest"
+// answers to. It resolves through the tagged entry, so it goes stale with it.
+func (r *UnifiedMemoryModelRegistry) dropBareNameSet(nativeName string) {
+	if bare, ok := strings.CutSuffix(nativeName, ":"+domain.OllamaDefaultTag); ok {
+		r.modelEndpointSets.Delete(bare)
+	}
+}
+
+func (r *UnifiedMemoryModelRegistry) dropBareNameSets(sources []domain.SourceEndpoint) {
+	for i := range sources {
+		r.dropBareNameSet(sources[i].NativeName)
+	}
+}
+
+// endpointRemover is implemented by unifiers that track per-endpoint state of their own
+// (the lifecycle unifier also drops the endpoint's circuit breaker and health record).
+type endpointRemover interface {
+	RemoveEndpoint(ctx context.Context, endpointURL string) error
+}
+
+// removeEndpointFromUnifier drops endpointURL's models from the unifier's catalogue.
+// Callers hold unificationMutex.
+func (r *UnifiedMemoryModelRegistry) removeEndpointFromUnifier(ctx context.Context, endpointURL string) {
+	if remover, ok := r.unifier.(endpointRemover); ok {
+		if err := remover.RemoveEndpoint(ctx, endpointURL); err != nil {
+			r.logger.Warn("Error removing endpoint from unifier", "url", endpointURL, "error", err)
+		}
+		return
+	}
+
+	// An empty model list is how a unifier is told an endpoint has none left.
+	endpoint, ok := r.endpoints.Load(endpointURL)
+	if !ok {
+		endpoint = &domain.Endpoint{URLString: endpointURL, Name: endpointURL}
+	}
+	if _, err := r.unifier.UnifyModels(ctx, []*domain.ModelInfo{}, endpoint); err != nil {
+		r.logger.Warn("Error removing endpoint from unifier", "url", endpointURL, "error", err)
+	}
+}
+
+// GetHealthyEndpointsForModel returns healthy endpoints that have a specific model
+func (r *UnifiedMemoryModelRegistry) GetHealthyEndpointsForModel(ctx context.Context, modelName string, endpointRepo domain.EndpointRepository) ([]*domain.Endpoint, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	endpointSet, found := r.GetEndpointSet(modelName)
+	if !found {
+		// Fallback: build set on demand and cache it
+		endpointURLs, err := r.GetEndpointsForModel(ctx, modelName)
+		if err != nil {
+			// Error handling is a bit more nuanced, we want to propagate context errors
+			// but treat model-not-found as empty result
+
+			// If there's a better way to do this, we should improve the unifier's ResolveAlias method
+			// and also apply the same fix in Scout, Sherpa and Scoot.
+
+			// context errors should propagate - these indicate interrupted operations
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("failed to get endpoints for model: %w", err)
+			}
+
+			// model-not-found is treated as empty result (intentional design pattern)
+			return []*domain.Endpoint{}, nil
+		}
+
+		if len(endpointURLs) == 0 {
+			return []*domain.Endpoint{}, nil
+		}
+
+		// we create and cache the set for future lookups
+		endpointSet = xsync.NewMap[string, struct{}]()
+		for _, url := range endpointURLs {
+			endpointSet.Store(url, struct{}{})
+		}
+		r.modelEndpointSets.Store(modelName, endpointSet)
+	}
+
+	// Get all healthy endpoints from the repository
+	healthyEndpoints, err := endpointRepo.GetHealthy(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get healthy endpoints: %w", err)
+	}
+
+	// Filter to only include endpoints that have the model using cached set
+	var result []*domain.Endpoint
+	for _, endpoint := range healthyEndpoints {
+		if _, ok := endpointSet.Load(endpoint.GetURLString()); ok {
+			result = append(result, endpoint)
+		}
+	}
+
+	return result, nil
+}
+
+const (
+	capabilityCode = "code"
+)
+
+// capabilityMatches checks if a model capability matches the requested capability
+func capabilityMatches(modelCap, requestedCap string) bool {
+	// Direct match
+	if modelCap == requestedCap {
+		return true
+	}
+
+	// Check aliases based on requested capability
+	switch requestedCap {
+	case "chat", "chat_completion":
+		return modelCap == "chat" || modelCap == "chat_completion"
+	case "text", "text_generation":
+		return modelCap == "text" || modelCap == "text_generation" || modelCap == "completion"
+	case "embeddings", "embedding":
+		return modelCap == "embeddings" || modelCap == "embedding"
+	case "vision", "vision_understanding":
+		return modelCap == "vision" || modelCap == "vision_understanding" || modelCap == "image"
+	case capabilityCode, "code_generation":
+		return modelCap == capabilityCode || modelCap == "code_generation"
+	case "function", "function_calling", "tools":
+		return modelCap == "function" || modelCap == "function_calling" || modelCap == "tools"
+	case "streaming", "stream":
+		return modelCap == "streaming" || modelCap == "stream"
+	}
+
+	return false
+}
+
+// GetModelsByCapability returns models that support a specific capability
+func (r *UnifiedMemoryModelRegistry) GetModelsByCapability(ctx context.Context, capability string) ([]*domain.UnifiedModel, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	var models []*domain.UnifiedModel
+
+	r.globalUnified.Range(func(id string, model *domain.UnifiedModel) bool {
+		// Check if model has the requested capability
+		for _, cap := range model.Capabilities {
+			if capabilityMatches(cap, capability) {
+				models = append(models, model)
+				return true
+			}
+		}
+		return true
+	})
+
+	return models, nil
+}
+
+// UnifiedRegistryStats combines registry and unification statistics
+type UnifiedRegistryStats struct {
+	domain.RegistryStats
+	domain.UnificationStats
+	TotalUnifiedModels int `json:"total_unified_models"`
+}
+
+// GetRoutableEndpointsForModel implements model routing strategy
+func (r *UnifiedMemoryModelRegistry) GetRoutableEndpointsForModel(ctx context.Context, modelName string, healthyEndpoints []*domain.Endpoint) ([]*domain.Endpoint, *domain.ModelRoutingDecision, error) {
+	// get endpoints that have this model
+	modelEndpoints, err := r.GetEndpointsForModel(ctx, modelName)
+	if err != nil {
+		r.logger.Error("Failed to get endpoints for model", "model", modelName, "error", err)
+		modelEndpoints = []string{} // treat error as model not found
+	}
+
+	// delegate to routing strategy
+	return r.routingStrategy.GetRoutableEndpoints(ctx, modelName, healthyEndpoints, modelEndpoints)
+}
+
+// discoveryServiceAdapter adapts our DiscoveryService to ports.DiscoveryService
+type discoveryServiceAdapter struct {
+	discovery DiscoveryService
+}
+
+func (a *discoveryServiceAdapter) RefreshEndpoints(ctx context.Context) error {
+	return a.discovery.RefreshEndpoints(ctx)
+}
+
+func (a *discoveryServiceAdapter) GetEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	// Try to get all endpoints first
+	endpoints, err := a.discovery.GetEndpoints(ctx)
+	if err != nil {
+		// Fallback to healthy endpoints for implementations that may fail
+		// when retrieving all endpoints or only provide healthy endpoints
+		return a.discovery.GetHealthyEndpoints(ctx)
+	}
+	return endpoints, nil
+}
+
+func (a *discoveryServiceAdapter) GetHealthyEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	return a.discovery.GetHealthyEndpoints(ctx)
+}
+
+func (a *discoveryServiceAdapter) UpdateEndpointStatus(ctx context.Context, endpoint *domain.Endpoint) error {
+	if updater, ok := a.discovery.(interface {
+		UpdateEndpointStatus(context.Context, *domain.Endpoint) error
+	}); ok {
+		return updater.UpdateEndpointStatus(ctx, endpoint)
+	}
+	return nil
+}
