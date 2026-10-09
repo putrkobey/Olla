@@ -108,3 +108,113 @@ func TestLMDeployParser_Parse(t *testing.T) {
 				}
 			]
 		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+		assert.Equal(t, "valid-model", models[0].Name)
+	})
+
+	t.Run("handles empty response bytes", func(t *testing.T) {
+		t.Parallel()
+
+		models, err := parser.Parse([]byte{})
+		require.NoError(t, err)
+		assert.Empty(t, models)
+	})
+
+	t.Run("handles empty data array", func(t *testing.T) {
+		t.Parallel()
+
+		response := `{"object": "list", "data": []}`
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		assert.Empty(t, models)
+	})
+
+	t.Run("returns error for malformed JSON", func(t *testing.T) {
+		t.Parallel()
+
+		invalidJSON := `{"object": "list", "data": [{"id": "m", invalid}]}`
+		models, err := parser.Parse([]byte(invalidJSON))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse LMDeploy response")
+		assert.Nil(t, models)
+	})
+
+	t.Run("details nil when no metadata beyond default owned_by", func(t *testing.T) {
+		t.Parallel()
+
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "simple-model",
+					"object": "model",
+					"created": 0,
+					"owned_by": "lmdeploy"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+		assert.Equal(t, "simple-model", models[0].Name)
+		// No created timestamp and owned_by is the default — details should be nil
+		assert.Nil(t, models[0].Details)
+	})
+
+	t.Run("no max_model_len field — LMDeploy differs from vLLM here", func(t *testing.T) {
+		t.Parallel()
+
+		// LMDeploy /v1/models does not include max_model_len; verify we tolerate
+		// the field being absent (and don't panic or error if it somehow appears).
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "qwen/Qwen2-7B-Instruct",
+					"object": "model",
+					"created": 1754535990,
+					"owned_by": "lmdeploy"
+				}
+			]
+		}`
+
+		models, err := parser.Parse([]byte(response))
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+		model := models[0]
+		assert.Equal(t, "qwen/Qwen2-7B-Instruct", model.Name)
+		// MaxContextLength is never populated from the wire response for LMDeploy
+		if model.Details != nil {
+			assert.Nil(t, model.Details.MaxContextLength)
+		}
+	})
+
+	t.Run("preserves LastSeen timestamp", func(t *testing.T) {
+		t.Parallel()
+
+		response := `{
+			"object": "list",
+			"data": [
+				{
+					"id": "test-model",
+					"object": "model",
+					"created": 1754535991,
+					"owned_by": "lmdeploy"
+				}
+			]
+		}`
+
+		before := time.Now()
+		models, err := parser.Parse([]byte(response))
+		after := time.Now()
+
+		require.NoError(t, err)
+		require.Len(t, models, 1)
+		assert.True(t, !models[0].LastSeen.Before(before))
+		assert.True(t, !models[0].LastSeen.After(after))
+	})
+}
