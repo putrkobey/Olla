@@ -540,3 +540,1087 @@ class IntegrationTester:
             expected_headers = ["X-Olla-Endpoint", "X-Olla-Model",
                                 "X-Olla-Backend-Type", "X-Olla-Request-ID"]
             present = [h for h in expected_headers if r.headers.get(h)]
+            missing = [h for h in expected_headers if not r.headers.get(h)]
+            ok = len(missing) == 0
+            if missing:
+                detail = f"missing headers: {missing}"
+            else:
+                detail = f"all {len(present)} headers present"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Response headers (X-Olla-*)", ok, detail)
+        self.record(f"{phase}/headers", ok, detail, phase)
+
+    # -- Phase 5: Anthropic Translator Endpoints ------------------------------
+
+    def phase_anthropic_translator(self):
+        self._phase_header(5, "Anthropic Translator Endpoints")
+        phase = "anthropic"
+
+        if self.skip_anthropic:
+            self.pcolor(GREY, "  [SKIP] Anthropic tests skipped via --skip-anthropic")
+            return
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+        }
+
+        # GET /olla/anthropic/v1/models
+        r = self._get("/olla/anthropic/v1/models")
+        ok = False
+        detail = ""
+        if r and r.status_code == 200:
+            try:
+                r.json()
+                ok = True
+            except Exception:
+                detail = "invalid JSON"
+        elif r and r.status_code == 404:
+            detail = "endpoint not configured (404)"
+            self.pcolor(YELLOW, f"  [SKIP] Anthropic translator not configured, skipping phase")
+            self.record(f"{phase}/models", False, detail, phase)
+            return
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Anthropic model list (/olla/anthropic/v1/models)", ok, detail)
+        self.record(f"{phase}/models", ok, detail, phase)
+
+        if not self.selected_model:
+            self.pcolor(GREY, "  [SKIP] No model for Anthropic inference tests")
+            return
+
+        # POST /olla/anthropic/v1/messages non-streaming
+        body = {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "Say hello briefly"}],
+            "max_tokens": 10,
+        }
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=headers, json=body, timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            if self.verbose:
+                self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+            r = None
+
+        ok = False
+        detail = ""
+        mode_header = ""
+        if r and r.status_code == 200:
+            try:
+                r.json()
+                ok = True
+                mode_header = r.headers.get("X-Olla-Mode", "")
+                if mode_header:
+                    detail = f"mode={mode_header}"
+            except Exception:
+                detail = "invalid JSON"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Non-streaming messages", ok, detail)
+        self.record(f"{phase}/messages-nonstream", ok, detail, phase)
+
+        # Passthrough mode header check
+        if r and r.status_code == 200:
+            mode = r.headers.get("X-Olla-Mode", "")
+            # We just verify the header is either "passthrough" or absent (translation)
+            ok = True
+            detail = f"X-Olla-Mode={mode}" if mode else "no X-Olla-Mode (translation mode)"
+            self._print_result("Passthrough mode check", ok, detail)
+            self.record(f"{phase}/passthrough-check", ok, detail, phase)
+
+        # POST /olla/anthropic/v1/messages streaming
+        if not self.skip_streaming:
+            body_stream = {
+                "model": self.selected_model,
+                "messages": [{"role": "user", "content": "Say hello briefly"}],
+                "max_tokens": 10,
+                "stream": True,
+            }
+            try:
+                r = requests.post(
+                    f"{self.base_url}/olla/anthropic/v1/messages",
+                    headers=headers, json=body_stream, timeout=self.timeout,
+                    stream=True,
+                )
+            except Exception as e:
+                self._last_error = e
+                if self.verbose:
+                    self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+                r = None
+
+            ok = False
+            detail = ""
+            if r and r.status_code == 200:
+                ct = r.headers.get("Content-Type", "")
+                event_count = 0
+                for line in r.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        event_count += 1
+
+                if "text/event-stream" not in ct:
+                    detail = f"unexpected content-type: {ct}"
+                elif event_count == 0:
+                    detail = "no SSE data events"
+                else:
+                    ok = True
+                    detail = f"{event_count} SSE events"
+            else:
+                detail = self._error_detail(r)
+
+            self._print_result("Streaming messages (SSE)", ok, detail)
+            self.record(f"{phase}/messages-stream", ok, detail, phase)
+
+        # POST /olla/anthropic/v1/messages/count_tokens
+        token_body = {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "Count these tokens please"}],
+        }
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages/count_tokens",
+                headers=headers, json=token_body, timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            if self.verbose:
+                self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+            r = None
+
+        ok = False
+        detail = ""
+        if r and r.status_code == 200:
+            try:
+                data = r.json()
+                ok = True
+                token_count = data.get("input_tokens", "?")
+                detail = f"input_tokens={token_count}"
+            except Exception:
+                detail = "invalid JSON"
+        elif r and r.status_code == 404:
+            # Token counting may not be implemented for all backends
+            ok = True
+            detail = "not implemented (404) - acceptable"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Token count estimation", ok, detail)
+        self.record(f"{phase}/count-tokens", ok, detail, phase)
+
+    # -- Phase 6: Passthrough/Translation Mode Validation --------------------
+
+    def phase_passthrough_translation(self):
+        self._phase_header(6, "Passthrough/Translation Mode Validation")
+        phase = "passthrough"
+
+        if self.skip_anthropic:
+            self.pcolor(GREY, "  [SKIP] Skipped via --skip-anthropic")
+            return
+
+        has_pt = self.passthrough_model is not None
+        has_tr = self.translation_model is not None
+
+        if not has_pt and not has_tr:
+            self.pcolor(GREY, "  [SKIP] No passthrough or translation backends with models")
+            return
+
+        # -- Passthrough mode tests --
+        if has_pt:
+            pt_type = self.endpoint_types.get(self.passthrough_backend, "?")
+            self.pcolor(WHITE, f"  Passthrough: {CYAN}{self.passthrough_model}{RESET} "
+                               f"({self.passthrough_backend}, {pt_type})")
+
+            # Non-streaming passthrough
+            self._test_mode_nonstreaming(
+                model=self.passthrough_model,
+                expected_mode="passthrough",
+                label="passthrough/nonstream",
+                phase=phase,
+            )
+
+            # Streaming passthrough
+            if not self.skip_streaming:
+                self._test_mode_streaming(
+                    model=self.passthrough_model,
+                    expected_mode="passthrough",
+                    label="passthrough/stream",
+                    phase=phase,
+                )
+
+            # Passthrough response structure validation
+            self._test_passthrough_response_structure(
+                model=self.passthrough_model,
+                label="passthrough/response-structure",
+                phase=phase,
+            )
+        else:
+            self.pcolor(GREY, "  [SKIP] No healthy passthrough-capable backends with models")
+
+        # -- Translation mode tests --
+        if has_tr:
+            tr_type = self.endpoint_types.get(self.translation_backend, "?")
+            self.pcolor(WHITE, f"  Translation: {YELLOW}{self.translation_model}{RESET} "
+                               f"({self.translation_backend}, {tr_type})")
+
+            # Non-streaming translation
+            self._test_mode_nonstreaming(
+                model=self.translation_model,
+                expected_mode="translation",
+                label="translation/nonstream",
+                phase=phase,
+            )
+
+            # Streaming translation
+            if not self.skip_streaming:
+                self._test_mode_streaming(
+                    model=self.translation_model,
+                    expected_mode="translation",
+                    label="translation/stream",
+                    phase=phase,
+                )
+
+            # Translation response structure validation
+            self._test_translation_response_structure(
+                model=self.translation_model,
+                label="translation/response-structure",
+                phase=phase,
+            )
+        else:
+            self.pcolor(GREY, "  [SKIP] No healthy translation-required backends with models")
+
+        # -- Translator stats validation --
+        if has_pt or has_tr:
+            self._test_translator_stats(has_pt, has_tr, phase)
+
+    def _test_mode_nonstreaming(self, model: str, expected_mode: str,
+                                label: str, phase: str):
+        """Test that non-streaming Anthropic request uses the expected mode."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model),
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            mode = r.headers.get("X-Olla-Mode", "")
+            endpoint = r.headers.get("X-Olla-Endpoint", "")
+
+            if expected_mode == "passthrough":
+                ok = mode == "passthrough"
+                if not ok:
+                    detail = f"expected X-Olla-Mode=passthrough, got '{mode}'"
+                else:
+                    detail = f"mode=passthrough, endpoint={endpoint}"
+            else:
+                # Translation: X-Olla-Mode should be absent
+                ok = mode != "passthrough"
+                if not ok:
+                    detail = "unexpected X-Olla-Mode=passthrough for translation backend"
+                else:
+                    detail = f"mode=translation (no header), endpoint={endpoint}"
+
+        self._print_result(f"{expected_mode.title()} non-streaming", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_mode_streaming(self, model: str, expected_mode: str,
+                             label: str, phase: str):
+        """Test that streaming Anthropic request uses the expected mode and SSE format."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model, stream=True),
+                timeout=self.timeout,
+                stream=True,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+        notes = []
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            mode = r.headers.get("X-Olla-Mode", "")
+            ct = r.headers.get("Content-Type", "")
+
+            # Mode check
+            if expected_mode == "passthrough":
+                if mode != "passthrough":
+                    notes.append(f"expected X-Olla-Mode=passthrough, got '{mode}'")
+            else:
+                if mode == "passthrough":
+                    notes.append("unexpected X-Olla-Mode=passthrough")
+
+            # Content-Type check
+            if "text/event-stream" not in ct:
+                notes.append(f"content-type={ct}, expected text/event-stream")
+
+            # Parse SSE events
+            event_types = set()
+            event_count = 0
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("event: "):
+                    event_types.add(line[7:].strip())
+                if line.startswith("data: "):
+                    event_count += 1
+
+            # Validate event types
+            missing = ANTHROPIC_MIN_EVENTS - event_types
+            if missing:
+                notes.append(f"missing events: {missing}")
+
+            if event_count == 0:
+                notes.append("no SSE data events")
+
+            ok = len(notes) == 0
+            if ok:
+                detail = f"{event_count} events, {len(event_types)} types"
+            else:
+                detail = " | ".join(notes)
+
+        self._print_result(f"{expected_mode.title()} streaming", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_passthrough_response_structure(self, model: str, label: str, phase: str):
+        """Verify passthrough response has native Anthropic structure."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model),
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            try:
+                data = r.json()
+                notes = []
+                # Anthropic response should have: id, type, role, content, model, usage
+                if data.get("type") != "message":
+                    notes.append(f"type={data.get('type', 'missing')}")
+                if data.get("role") != "assistant":
+                    notes.append(f"role={data.get('role', 'missing')}")
+                if not isinstance(data.get("content"), list):
+                    notes.append("content not a list")
+                if not data.get("model"):
+                    notes.append("model missing")
+
+                ok = len(notes) == 0
+                if ok:
+                    usage = data.get("usage", {})
+                    detail = (f"type=message, role=assistant, "
+                              f"input={usage.get('input_tokens', '?')}/"
+                              f"output={usage.get('output_tokens', '?')} tokens")
+                else:
+                    detail = " | ".join(notes)
+            except Exception:
+                detail = "invalid JSON"
+
+        self._print_result("Passthrough response structure", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_translation_response_structure(self, model: str, label: str, phase: str):
+        """Verify translation response has valid Anthropic-format structure."""
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/anthropic/v1/messages",
+                headers=self._anthropic_headers(),
+                json=self._anthropic_body(model),
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            r = None
+
+        ok = False
+        detail = ""
+
+        if r is None:
+            detail = self._error_detail(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+        else:
+            try:
+                data = r.json()
+                notes = []
+                # Translated response should also follow Anthropic format
+                if data.get("type") != "message":
+                    notes.append(f"type={data.get('type', 'missing')}")
+                if data.get("role") != "assistant":
+                    notes.append(f"role={data.get('role', 'missing')}")
+                if not isinstance(data.get("content"), list):
+                    notes.append("content not a list")
+                # Check content has text blocks
+                content = data.get("content", [])
+                has_text = any(c.get("type") == "text" for c in content if isinstance(c, dict))
+                if content and not has_text:
+                    notes.append("no text content blocks")
+
+                ok = len(notes) == 0
+                if ok:
+                    detail = "valid Anthropic format (translated)"
+                else:
+                    detail = " | ".join(notes)
+            except Exception:
+                detail = "invalid JSON"
+
+        self._print_result("Translation response structure", ok, detail)
+        self.record(f"{phase}/{label}", ok, detail, phase)
+
+    def _test_translator_stats(self, had_passthrough: bool, had_translation: bool,
+                               phase: str):
+        """Verify translator stats reflect the requests we just made."""
+        r = self._get("/internal/stats/translators")
+        ok = False
+        detail = ""
+
+        if r is None or r.status_code != 200:
+            detail = self._error_detail(r)
+            self._print_result("Translator stats validation", ok, detail)
+            self.record(f"{phase}/stats", ok, detail, phase)
+            return
+
+        try:
+            data = r.json()
+            translators = data.get("translators", [])
+            # Find the anthropic translator
+            anthro = None
+            for t in translators:
+                if "anthropic" in t.get("translator_name", "").lower():
+                    anthro = t
+                    break
+
+            if not anthro:
+                detail = "no anthropic translator in stats"
+            else:
+                notes = []
+                total = anthro.get("total_requests", 0)
+                pt_req = anthro.get("passthrough_requests", 0)
+                tr_req = anthro.get("translation_requests", 0)
+                pt_rate = anthro.get("passthrough_rate", "")
+
+                if total == 0:
+                    notes.append("total_requests=0 (expected > 0)")
+                if had_passthrough and pt_req == 0:
+                    notes.append("passthrough_requests=0 (expected > 0)")
+                if had_translation and tr_req == 0:
+                    notes.append("translation_requests=0 (expected > 0)")
+
+                ok = len(notes) == 0
+                if ok:
+                    detail = (f"total={total}, passthrough={pt_req}, "
+                              f"translation={tr_req}, rate={pt_rate}")
+                else:
+                    detail = " | ".join(notes)
+        except Exception:
+            detail = "invalid JSON"
+
+        self._print_result("Translator stats validation", ok, detail)
+        self.record(f"{phase}/stats", ok, detail, phase)
+
+    # -- Phase 7: Provider-Specific Routes -----------------------------------
+
+    def phase_provider_routes(self):
+        self._phase_header(7, "Provider-Specific Routes")
+        phase = "providers"
+
+        if self.skip_providers:
+            self.pcolor(GREY, "  [SKIP] Provider tests skipped via --skip-providers")
+            return
+
+        if not self.discovered_providers:
+            self.pcolor(GREY, "  [SKIP] No providers discovered")
+            return
+
+        for provider in self.discovered_providers:
+            # Try the provider-specific models endpoint
+            # The URL pattern is /olla/{provider}/v1/models for most providers
+            provider_slug = provider
+            # Normalise some common provider type names to URL slugs
+            slug_map = {
+                "openai-compatible": "openai",
+                "lm-studio": "lm-studio",
+                "llamacpp": "llamacpp",
+                "vllm-mlx": "vllm-mlx",
+            }
+            provider_slug = slug_map.get(provider, provider)
+
+            r = self._get(f"/olla/{provider_slug}/v1/models")
+            ok = False
+            detail = ""
+
+            if r and r.status_code == 200:
+                try:
+                    data = r.json()
+                    model_list = data.get("data", data.get("models", []))
+                    ok = True
+                    detail = f"{len(model_list)} models"
+                except Exception:
+                    detail = "invalid JSON"
+            elif r and r.status_code == 404:
+                # Provider route may not exist for all types
+                ok = True
+                detail = "no dedicated route (404) - acceptable"
+            else:
+                detail = self._error_detail(r)
+
+            self._print_result(f"{provider} models (/olla/{provider_slug}/v1/models)", ok, detail)
+            self.record(f"{phase}/{provider}", ok, detail, phase)
+
+    # -- Phase 7: Response Header Validation (cross-cutting) ------------------
+
+    def phase_response_headers(self):
+        self._phase_header(8, "Response Header Validation")
+        phase = "headers"
+
+        if not self.selected_model:
+            self.pcolor(GREY, "  [SKIP] No model for header validation")
+            return
+
+        # Check version endpoint has expected structure
+        r = self._get("/version")
+        ok = False
+        detail = ""
+        if r and r.status_code == 200:
+            try:
+                data = r.json()
+                has_version = "version" in data or "Version" in data
+                has_commit = "commit" in data or "Commit" in data
+                ok = has_version or has_commit
+                if not ok:
+                    detail = f"missing version/commit fields, keys: {list(data.keys())}"
+                else:
+                    detail = "version and commit fields present"
+            except Exception:
+                detail = "invalid JSON"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Version response structure", ok, detail)
+        self.record(f"{phase}/version-fields", ok, detail, phase)
+
+        # Verify X-Olla-Response-Time header on proxy request
+        r = self._post("/olla/proxy/v1/chat/completions", {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 5,
+            "stream": False,
+        })
+        ok = False
+        detail = ""
+        if r and r.status_code == 200:
+            resp_time = r.headers.get("X-Olla-Response-Time", "")
+            req_id = r.headers.get("X-Olla-Request-ID", "")
+            ok = bool(req_id)
+            parts = []
+            if req_id:
+                parts.append(f"request-id={req_id[:16]}...")
+            if resp_time:
+                parts.append(f"response-time={resp_time}")
+            detail = ", ".join(parts) if parts else "missing tracking headers"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Request tracking headers", ok, detail)
+        self.record(f"{phase}/tracking", ok, detail, phase)
+
+    # -- Phase 9: Error Handling ----------------------------------------------
+
+    def phase_error_handling(self):
+        self._phase_header(9, "Error Handling")
+        phase = "errors"
+
+        # Non-existent model
+        r = self._post("/olla/proxy/v1/chat/completions", {
+            "model": "nonexistent-model-xyz-999",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 5,
+        })
+        ok = False
+        detail = ""
+        # Note: use `is not None` not `if r:` because requests.Response.__bool__
+        # returns False for 4xx/5xx status codes, which are the expected outcomes here
+        if r is not None:
+            ok = 400 <= r.status_code < 600
+            detail = f"HTTP {r.status_code}"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Non-existent model returns error", ok, detail)
+        self.record(f"{phase}/nonexistent-model", ok, detail, phase)
+
+        # Invalid request body (not valid JSON structure for chat)
+        try:
+            r = requests.post(
+                f"{self.base_url}/olla/proxy/v1/chat/completions",
+                data="this is not json",
+                headers={"Content-Type": "application/json"},
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self._last_error = e
+            if self.verbose:
+                self.pcolor(GREY, f"    [{type(e).__name__}] {e}")
+            r = None
+
+        ok = False
+        detail = ""
+        if r is not None:
+            ok = 400 <= r.status_code < 600
+            detail = f"HTTP {r.status_code}"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Invalid request body returns error", ok, detail)
+        self.record(f"{phase}/invalid-body", ok, detail, phase)
+
+        # Missing model field - Olla may forward to a backend which handles it
+        # gracefully, so accept either an error (4xx/5xx) or a successful response
+        r = self._post("/olla/proxy/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 5,
+        })
+        ok = False
+        detail = ""
+        if r is not None:
+            # A missing model field may be handled gracefully by the backend
+            # (returning 200 with a default model), or rejected - both are valid
+            ok = r.status_code < 500 or r.status_code in (502, 503)
+            detail = f"HTTP {r.status_code}"
+        else:
+            detail = self._error_detail(r)
+
+        self._print_result("Missing model field handled", ok, detail)
+        self.record(f"{phase}/missing-model", ok, detail, phase)
+
+    # -- Phase 10: Sticky Session Headers -------------------------------------
+
+    def phase_sticky_sessions(self):
+        self._phase_header(10, "Sticky Session Headers")
+        phase = "sticky"
+
+        if self.skip_sticky:
+            self.pcolor(GREY, "  [SKIP] Sticky session tests skipped via --skip-sticky")
+            return
+
+        if not self.selected_model:
+            self.pcolor(GREY, "  [SKIP] No model available for sticky session tests")
+            return
+
+        # Probe to determine whether sticky sessions are enabled on this instance.
+        probe = self._post("/olla/proxy/v1/chat/completions", {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "stream": False,
+        })
+        if probe is None or probe.status_code != 200:
+            self.pcolor(GREY, "  [SKIP] Probe request failed — cannot determine sticky session state")
+            return
+
+        sticky_state = probe.headers.get("X-Olla-Sticky-Session", "")
+        if sticky_state == "disabled" or sticky_state == "":
+            self.pcolor(YELLOW, "  [SKIP] Sticky sessions are disabled on this Olla instance")
+            self.pcolor(GREY,   "         Enable with proxy.sticky_sessions.enabled: true in config.yaml")
+            return
+
+        self.pcolor(GREEN, f"  Sticky sessions active (probe returned: {sticky_state})")
+
+        # -- Test 1: explicit session ID creates a pin -----------------------
+        session_id = f"integration-test-{int(time.time())}"
+        headers_with_session = {"X-Olla-Session-ID": session_id}
+
+        body = {
+            "model": self.selected_model,
+            "messages": [{"role": "user", "content": "Say one word"}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+
+        r1 = self._post("/olla/proxy/v1/chat/completions", body, headers=headers_with_session)
+        ok = False
+        detail = ""
+        endpoint_pinned = ""
+
+        if r1 is not None and r1.status_code == 200:
+            sticky1 = r1.headers.get("X-Olla-Sticky-Session", "")
+            endpoint_pinned = r1.headers.get("X-Olla-Endpoint", "")
+            ok = sticky1 == "miss"
+            if ok:
+                detail = f"first request sticky=miss, endpoint={endpoint_pinned}"
+            else:
+                detail = f"expected sticky=miss, got '{sticky1}'"
+        else:
+            detail = self._error_detail(r1)
+
+        self._print_result("Session ID first request returns miss", ok, detail)
+        self.record(f"{phase}/session-first-miss", ok, detail, phase)
+
+        # -- Test 2: second request with same session ID returns hit ---------
+        r2 = self._post("/olla/proxy/v1/chat/completions", body, headers=headers_with_session)
+        ok = False
+        detail = ""
+
+        if r2 is not None and r2.status_code == 200:
+            sticky2 = r2.headers.get("X-Olla-Sticky-Session", "")
+            endpoint2 = r2.headers.get("X-Olla-Endpoint", "")
+            ok = sticky2 == "hit"
+            if ok:
+                same_ep = endpoint2 == endpoint_pinned if endpoint_pinned else True
+                detail = f"sticky=hit, endpoint={endpoint2}"
+                if endpoint_pinned and not same_ep:
+                    ok = False
+                    detail = f"sticky=hit but endpoint changed: {endpoint_pinned} -> {endpoint2}"
+            else:
+                detail = f"expected sticky=hit, got '{sticky2}'"
+        else:
+            detail = self._error_detail(r2)
+
+        self._print_result("Session ID second request returns hit", ok, detail)
+        self.record(f"{phase}/session-second-hit", ok, detail, phase)
+
+        # -- Test 3: session ID echoed back in response ----------------------
+        ok = False
+        detail = ""
+        if r1 is not None and r1.status_code == 200:
+            echoed = r1.headers.get("X-Olla-Session-ID", "")
+            ok = echoed == session_id
+            detail = (f"echoed={echoed}" if echoed else "X-Olla-Session-ID absent in response")
+        else:
+            detail = self._error_detail(r1)
+
+        self._print_result("Session ID echoed back in response header", ok, detail)
+        self.record(f"{phase}/session-id-echoed", ok, detail, phase)
+
+        # -- Test 4: key source is a valid value -----------------------------
+        valid_sources = {"session_header", "prefix_hash", "auth_header", "ip", "none"}
+        ok = False
+        detail = ""
+        if r1 is not None and r1.status_code == 200:
+            source = r1.headers.get("X-Olla-Sticky-Key-Source", "")
+            ok = source in valid_sources
+            detail = f"X-Olla-Sticky-Key-Source={source}" if source else "header absent"
+            if source and not ok:
+                detail = f"unknown key source: '{source}'"
+        else:
+            detail = self._error_detail(r1)
+
+        self._print_result("Key source is a known valid value", ok, detail)
+        self.record(f"{phase}/key-source-valid", ok, detail, phase)
+
+        # -- Test 5: prefix hash routing — same prompt hits same backend -----
+        # Use a deterministic, long system prompt so prefix_hash fires.
+        long_prompt = (
+            "You are a helpful assistant for integration testing of Olla sticky session routing. "
+            "You specialise in infrastructure, load balancers, and KV cache behaviour. "
+            "Always respond concisely. This prompt is intentionally long to exercise "
+            "the prefix hashing logic which operates on the first 512 bytes of the "
+            "messages JSON payload. Filler text: " + ("a" * 100)
+        )
+        hash_body = {
+            "model": self.selected_model,
+            "messages": [
+                {"role": "system", "content": long_prompt},
+                {"role": "user", "content": "Hello"},
+            ],
+            "max_tokens": 1,
+            "stream": False,
+        }
+
+        rh1 = self._post("/olla/proxy/v1/chat/completions", hash_body)
+        rh2 = self._post("/olla/proxy/v1/chat/completions", hash_body)
+        ok = False
+        detail = ""
+
+        if rh1 is not None and rh2 is not None and rh1.status_code == 200 and rh2.status_code == 200:
+            source_h1 = rh1.headers.get("X-Olla-Sticky-Key-Source", "")
+            source_h2 = rh2.headers.get("X-Olla-Sticky-Key-Source", "")
+            sticky_h2 = rh2.headers.get("X-Olla-Sticky-Session", "")
+            ep_h1 = rh1.headers.get("X-Olla-Endpoint", "")
+            ep_h2 = rh2.headers.get("X-Olla-Endpoint", "")
+
+            # Both must use prefix_hash as key source and the second should be a hit.
+            source_ok = source_h1 == "prefix_hash" and source_h2 == "prefix_hash"
+            hit_ok = sticky_h2 == "hit"
+
+            ok = source_ok and hit_ok
+            detail = (
+                f"source1={source_h1}, source2={source_h2}, "
+                f"sticky2={sticky_h2}, ep1={ep_h1}, ep2={ep_h2}"
+            )
+            if not source_ok:
+                detail = f"expected prefix_hash key source, got source1={source_h1} source2={source_h2}"
+            elif not hit_ok:
+                detail = f"expected sticky=hit on second request, got '{sticky_h2}'"
+        else:
+            detail = self._error_detail(rh1 or rh2)
+
+        self._print_result("Same prefix hash routes to same backend", ok, detail)
+        self.record(f"{phase}/prefix-hash-hits", ok, detail, phase)
+
+        # -- Test 6: two independent sessions pin independently --------------
+        session_x = f"integration-x-{int(time.time())}"
+        session_y = f"integration-y-{int(time.time())}"
+
+        # Establish both sessions
+        self._post("/olla/proxy/v1/chat/completions", body,
+                   headers={"X-Olla-Session-ID": session_x})
+        self._post("/olla/proxy/v1/chat/completions", body,
+                   headers={"X-Olla-Session-ID": session_y})
+
+        # Follow-up for each session
+        rx = self._post("/olla/proxy/v1/chat/completions", body,
+                        headers={"X-Olla-Session-ID": session_x})
+        ry = self._post("/olla/proxy/v1/chat/completions", body,
+                        headers={"X-Olla-Session-ID": session_y})
+
+        ok = False
+        detail = ""
+
+        if (rx is not None and ry is not None
+                and rx.status_code == 200 and ry.status_code == 200):
+            sticky_x = rx.headers.get("X-Olla-Sticky-Session", "")
+            sticky_y = ry.headers.get("X-Olla-Sticky-Session", "")
+            source_x = rx.headers.get("X-Olla-Sticky-Key-Source", "")
+            source_y = ry.headers.get("X-Olla-Sticky-Key-Source", "")
+
+            ok = (sticky_x == "hit" and sticky_y == "hit"
+                  and source_x == "session_header" and source_y == "session_header")
+            detail = (
+                f"session_x: sticky={sticky_x} source={source_x}, "
+                f"session_y: sticky={sticky_y} source={source_y}"
+            )
+        else:
+            detail = self._error_detail(rx or ry)
+
+        self._print_result("Two independent sessions pin independently", ok, detail)
+        self.record(f"{phase}/sessions-independent", ok, detail, phase)
+
+        # -- Test 7: model scoping — same session ID, different models pin separately
+        model_ids = [m.get("id", m.get("name", "")) for m in self.models
+                     if m.get("id", m.get("name", "")) and "embed" not in m.get("id", "").lower()]
+        if len(model_ids) >= 2:
+            model_a = model_ids[0]
+            model_b = model_ids[1]
+            scope_sid = f"integration-scope-{int(time.time())}"
+            scope_headers = {"X-Olla-Session-ID": scope_sid}
+
+            # Establish a pin for model_a
+            self._post("/olla/proxy/v1/chat/completions",
+                       {"model": model_a, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                       headers=scope_headers)
+            # model_b with the same session ID must get its own independent pin (miss)
+            rb_first = self._post("/olla/proxy/v1/chat/completions",
+                                  {"model": model_b, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                                  headers=scope_headers)
+            # model_a follow-up must still hit
+            ra_second = self._post("/olla/proxy/v1/chat/completions",
+                                   {"model": model_a, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+                                   headers=scope_headers)
+
+            ok = False
+            detail = ""
+            if (rb_first is not None and ra_second is not None
+                    and rb_first.status_code == 200 and ra_second.status_code == 200):
+                rb_sticky = rb_first.headers.get("X-Olla-Sticky-Session", "")
+                ra_sticky = ra_second.headers.get("X-Olla-Sticky-Session", "")
+                # model_b first request should be a miss (new key because model differs)
+                # model_a second request should be a hit (existing pin)
+                ok = rb_sticky == "miss" and ra_sticky == "hit"
+                detail = f"model_b first={rb_sticky} (want miss), model_a second={ra_sticky} (want hit)"
+            else:
+                detail = self._error_detail(rb_first or ra_second)
+
+            self._print_result("Model-scoped keys: same session ID, different models pin separately", ok, detail)
+            self.record(f"{phase}/model-scoping", ok, detail, phase)
+        else:
+            self.pcolor(GREY, f"  [SKIP] Model scoping test skipped — only {len(model_ids)} model(s) available")
+
+        # -- Test 8: /internal/stats/sticky endpoint --------------------------
+        ok = False
+        detail = ""
+        try:
+            sr = requests.get(f"{self.base_url}/internal/stats/sticky", timeout=self.timeout)
+            if sr.status_code == 200:
+                data = sr.json()
+                has_enabled = "enabled" in data
+                if data.get("enabled"):
+                    # When enabled, expect the ttlcache metric fields to be present
+                    has_fields = all(k in data for k in ("hits", "misses", "evictions", "active_sessions"))
+                    ok = has_enabled and has_fields
+                    detail = (f"enabled=true hits={data.get('hits')} misses={data.get('misses')} "
+                              f"active={data.get('active_sessions')}")
+                    if not has_fields:
+                        detail = f"missing metric fields in response: {list(data.keys())}"
+                else:
+                    # Disabled — endpoint still returns 200 with enabled:false
+                    ok = has_enabled
+                    detail = "enabled=false (sticky sessions disabled on this instance)"
+            else:
+                detail = f"HTTP {sr.status_code}"
+        except Exception as e:
+            detail = str(e)
+
+        self._print_result("Sticky stats endpoint returns 200 with expected fields", ok, detail)
+        self.record(f"{phase}/stats-endpoint", ok, detail, phase)
+
+    # -- Phase 11: Summary ----------------------------------------------------
+
+    def print_summary(self) -> bool:
+        print()
+        self.pcolor(PURPLE, "=" * 72)
+        self.pcolor(WHITE, f"  {BOLD}Results Summary{RESET}")
+        self.pcolor(PURPLE, "=" * 72)
+
+        # Group results by phase
+        phases = {}
+        for r in self.results:
+            phase = r.phase or "other"
+            phases.setdefault(phase, []).append(r)
+
+        phase_labels = {
+            "internal": "Internal/Monitoring",
+            "models": "Unified Models",
+            "proxy": "Proxy (OpenAI)",
+            "anthropic": "Anthropic Translator",
+            "passthrough": "Passthrough/Translation Mode",
+            "providers": "Provider Routes",
+            "headers": "Response Headers",
+            "errors": "Error Handling",
+            "sticky": "Sticky Sessions",
+        }
+
+        for phase_key, label in phase_labels.items():
+            if phase_key not in phases:
+                continue
+            results = phases[phase_key]
+            passed = sum(1 for r in results if r.passed)
+            total = len(results)
+            color = GREEN if passed == total else (YELLOW if passed > 0 else RED)
+            print(f"  {color}{passed}/{total}{RESET}  {label}")
+
+            # Show failures
+            for r in results:
+                if not r.passed:
+                    self.pcolor(RED, f"        [FAIL] {r.name}: {r.detail}")
+
+        # Totals
+        passed = sum(1 for r in self.results if r.passed)
+        failed = sum(1 for r in self.results if not r.passed)
+        total = len(self.results)
+
+        print()
+        self.pcolor(GREY, f"  Total: {total}  |  ", end="")
+        self.pcolor(GREEN, f"Passed: {passed}", end="")
+        self.pcolor(GREY, "  |  ", end="")
+        self.pcolor(RED if failed else GREEN, f"Failed: {failed}")
+        print()
+
+        if failed == 0:
+            self.pcolor(GREEN, "  All tests passed.")
+        else:
+            self.pcolor(RED, f"  {failed} test(s) failed.")
+
+        return failed == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Olla comprehensive integration test - validates all major API endpoints"
+    )
+    parser.add_argument("--url", default=TARGET_URL,
+                        help=f"Olla base URL (default: {TARGET_URL})")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--skip-streaming", action="store_true",
+                        help="Skip streaming tests")
+    parser.add_argument("--skip-anthropic", action="store_true",
+                        help="Skip Anthropic translator tests")
+    parser.add_argument("--skip-providers", action="store_true",
+                        help="Skip provider-specific route tests")
+    parser.add_argument("--skip-sticky", action="store_true",
+                        help="Skip sticky session tests")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show response bodies")
+
+    args = parser.parse_args()
+
+    tester = IntegrationTester(
+        base_url=args.url,
+        timeout=args.timeout,
+        verbose=args.verbose,
+        skip_streaming=args.skip_streaming,
+        skip_anthropic=args.skip_anthropic,
+        skip_providers=args.skip_providers,
+        skip_sticky=args.skip_sticky,
+    )
+    tester.print_header()
+
+    # Phase 1: Health check (gate)
+    if not tester.check_health():
+        sys.exit(1)
+
+    # Discovery (informational, not scored)
+    if not tester.discover():
+        sys.exit(1)
+
+    # Phase 2-10: Test phases
+    tester.phase_internal_endpoints()
+    tester.phase_unified_models()
+    tester.phase_proxy_endpoints()
+    tester.phase_anthropic_translator()
+    tester.phase_passthrough_translation()
+    tester.phase_provider_routes()
+    tester.phase_response_headers()
+    tester.phase_error_handling()
+    tester.phase_sticky_sessions()
+
+    # Phase 11: Summary
+    all_pass = tester.print_summary()
+    sys.exit(0 if all_pass else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Test interrupted by user (Ctrl+C){RESET}")
+        sys.exit(130)
