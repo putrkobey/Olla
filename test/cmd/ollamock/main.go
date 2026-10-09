@@ -38,3 +38,85 @@ func main() {
 	streamChunks := flag.Int("stream-chunks", 5, "number of content chunks per streamed response")
 	tagsCapabilities := flag.Bool("tags-capabilities", false, "emit per-model capabilities in /api/tags, as Ollama 0.30+ does; off by default so the main fleet's listing is unchanged")
 	loaded := flag.String("loaded", "", "comma-separated models /api/ps reports as resident (empty = none)")
+	teiKind := flag.String("tei-kind", teiKindEmbedding, "kind of model a TEI instance reports in /info and serves: embedding, reranker or classifier")
+	flag.Parse()
+
+	if !slices.Contains([]string{teiKindEmbedding, teiKindReranker, teiKindClassifier}, *teiKind) {
+		slog.Error("invalid --tei-kind", "value", *teiKind, "want", "embedding, reranker or classifier")
+		os.Exit(2)
+	}
+
+	modelList := parseModels(*models)
+
+	cfg := serverConfig{
+		name:             *name,
+		models:           modelList,
+		ttftMS:           *ttftMS,
+		tps:              *tps,
+		streamChunks:     *streamChunks,
+		tagsCapabilities: *tagsCapabilities,
+		loaded:           parseLoaded(*loaded),
+		teiKind:          *teiKind,
+	}
+
+	srv := newServer(cfg)
+
+	httpSrv := &http.Server{
+		Addr:              *addr,
+		Handler:           srv.handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	slog.Info("ollamock started",
+		"addr", *addr,
+		"name", *name,
+		"models", modelList,
+	)
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("ollamock listen error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<-quit
+	slog.Info("ollamock shutting down")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpSrv.Shutdown(ctx); err != nil {
+		slog.Error("ollamock shutdown error", "err", err)
+	}
+}
+
+func parseModels(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"test-model"}
+	}
+	return out
+}
+
+// parseLoaded splits the --loaded list. Unlike --models it has no default: an
+// empty value means nothing is resident.
+func parseLoaded(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
