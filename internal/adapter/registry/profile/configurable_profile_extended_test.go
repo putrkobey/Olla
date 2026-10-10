@@ -140,3 +140,145 @@ func TestConfigurableProfile_TimeoutScaling(t *testing.T) {
 		{"7B model with load buffer", "mistral-7b", 30*time.Second + 30*time.Second},
 		{"unknown model uses default", "some-model", 30*time.Second + 5*time.Second},
 	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeout := profile.GetRequestTimeout(tt.modelName)
+			assert.Equal(t, tt.expectedTimeout, timeout)
+		})
+	}
+
+	// Test without load time buffer
+	config.Resources.TimeoutScaling.LoadTimeBuffer = false
+	profileNoBuffer := NewConfigurableProfile(config)
+
+	timeout := profileNoBuffer.GetRequestTimeout("llama3-70b")
+	assert.Equal(t, 30*time.Second, timeout, "should not add load time when buffer is false")
+
+	// Test without timeout scaling configured
+	configNoScaling := &domain.ProfileConfig{
+		Name:    "test-profile",
+		Version: "1.0",
+	}
+	configNoScaling.Characteristics.Timeout = 3 * time.Minute
+	profileNoScaling := NewConfigurableProfile(configNoScaling)
+
+	timeout = profileNoScaling.GetRequestTimeout("any-model")
+	assert.Equal(t, 3*time.Minute, timeout, "should use base timeout when scaling not configured")
+}
+
+func TestConfigurableProfile_IntegratedResourceManagement(t *testing.T) {
+	// Test that all resource management features work together correctly
+	config := &domain.ProfileConfig{
+		Name:    "ollama",
+		Version: "1.0",
+	}
+
+	// Model patterns
+	config.Models.ContextPatterns = []domain.ContextPattern{
+		{Pattern: "*:32k*", Context: 32768},
+		{Pattern: "llama3*", Context: 8192},
+	}
+
+	// Resource patterns
+	config.Resources.ModelSizes = []domain.ModelSizePattern{
+		{
+			Patterns:            []string{"70b"},
+			MinMemoryGB:         40,
+			RecommendedMemoryGB: 48,
+			EstimatedLoadTimeMS: 300000,
+		},
+		{
+			Patterns:            []string{"7b"},
+			MinMemoryGB:         6,
+			RecommendedMemoryGB: 8,
+			EstimatedLoadTimeMS: 30000,
+		},
+	}
+
+	// Concurrency limits
+	config.Resources.ConcurrencyLimits = []domain.ConcurrencyLimitPattern{
+		{MinMemoryGB: 30, MaxConcurrent: 1},
+		{MinMemoryGB: 0, MaxConcurrent: 8},
+	}
+
+	// Timeout scaling
+	config.Resources.TimeoutScaling = domain.TimeoutScaling{
+		BaseTimeoutSeconds: 30,
+		LoadTimeBuffer:     true,
+	}
+
+	config.Characteristics.MaxConcurrentRequests = 10
+
+	profile := NewConfigurableProfile(config)
+
+	t.Run("70B model with 32k context", func(t *testing.T) {
+		modelName := "llama3-70b:32k"
+
+		// Should get 32k context from pattern
+		caps := profile.GetModelCapabilities(modelName, nil)
+		assert.Equal(t, int64(32768), caps.MaxContextLength)
+
+		// Should get 1 concurrent request limit
+		concurrent := profile.GetOptimalConcurrency(modelName)
+		assert.Equal(t, 1, concurrent)
+
+		// Should get 30s base + 5min load time
+		timeout := profile.GetRequestTimeout(modelName)
+		assert.Equal(t, 30*time.Second+5*time.Minute, timeout)
+	})
+
+	t.Run("7B model defaults", func(t *testing.T) {
+		modelName := "mistral-7b"
+
+		// Should get default context
+		caps := profile.GetModelCapabilities(modelName, nil)
+		assert.Equal(t, int64(4096), caps.MaxContextLength)
+
+		// Should get 8 concurrent requests
+		concurrent := profile.GetOptimalConcurrency(modelName)
+		assert.Equal(t, 8, concurrent)
+
+		// Should get 30s base + 30s load time
+		timeout := profile.GetRequestTimeout(modelName)
+		assert.Equal(t, 30*time.Second+30*time.Second, timeout)
+	})
+}
+
+func TestConfigurableProfile_QuantizationWithNewFeatures(t *testing.T) {
+	config := &domain.ProfileConfig{
+		Name:    "test-profile",
+		Version: "1.0",
+	}
+
+	config.Resources.ModelSizes = []domain.ModelSizePattern{
+		{
+			Patterns:            []string{"70b"},
+			MinMemoryGB:         40,
+			EstimatedLoadTimeMS: 300000,
+		},
+	}
+
+	config.Resources.Quantization.Multipliers = map[string]float64{
+		"q4": 0.5,
+		"q5": 0.625,
+	}
+
+	config.Resources.ConcurrencyLimits = []domain.ConcurrencyLimitPattern{
+		{MinMemoryGB: 30, MaxConcurrent: 1},
+		{MinMemoryGB: 15, MaxConcurrent: 2},
+		{MinMemoryGB: 0, MaxConcurrent: 4},
+	}
+
+	profile := NewConfigurableProfile(config)
+
+	t.Run("quantized 70B model", func(t *testing.T) {
+		// Q4 quantized 70B model should use 20GB (40 * 0.5)
+		concurrent := profile.GetOptimalConcurrency("llama3-70b-q4")
+		assert.Equal(t, 2, concurrent, "20GB model should get 2 concurrent requests")
+
+		// Q5 quantized 70B model should use 25GB (40 * 0.625)
+		concurrent = profile.GetOptimalConcurrency("llama3-70b-q5")
+		assert.Equal(t, 2, concurrent, "25GB model should get 2 concurrent requests")
+	})
+}

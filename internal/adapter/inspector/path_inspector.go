@@ -95,3 +95,198 @@ func NewPathInspector(profileFactory *profile.Factory, logger logger.StyledLogge
 // buildPathMap builds a map of paths to profiles for fast lookups.
 func (pi *PathInspector) buildPathMap() {
 	if pi.profileFactory == nil {
+		pi.logger.Debug("Profile factory is nil, skipping path map building")
+		return
+	}
+
+	availableProfiles := pi.profileFactory.GetAvailableProfiles()
+
+	for _, profileName := range availableProfiles {
+		platformProfile, err := pi.profileFactory.GetProfile(profileName)
+		if err != nil {
+			pi.logger.Debug("Failed to get profile", "profile", profileName, "error", err)
+			continue
+		}
+
+		paths := platformProfile.GetPaths()
+		pi.profilePaths[profileName] = paths
+		for _, path := range paths {
+			if path == "" {
+				continue
+			}
+
+			if _, exists := pi.pathToProfiles[path]; !exists {
+				pi.pathToProfiles[path] = make([]string, 0, 3) // Most paths will be supported by 1-3 profiles
+			}
+			pi.pathToProfiles[path] = append(pi.pathToProfiles[path], profileName)
+		}
+	}
+
+	// Also add OpenAI compatible profile paths
+	openaiProfile, err := pi.profileFactory.GetProfile(domain.ProfileOpenAICompatible)
+	if err == nil {
+		paths := openaiProfile.GetPaths()
+		pi.profilePaths[domain.ProfileOpenAICompatible] = paths
+		for _, path := range paths {
+			if path == "" {
+				continue
+			}
+
+			if _, exists := pi.pathToProfiles[path]; !exists {
+				pi.pathToProfiles[path] = make([]string, 0, 1)
+			}
+			pi.pathToProfiles[path] = append(pi.pathToProfiles[path], domain.ProfileOpenAICompatible)
+		}
+	}
+
+	pi.logger.Info("Built path map for fast lookups",
+		"path_count", len(pi.pathToProfiles),
+		"profile_count", len(availableProfiles))
+}
+
+func (pi *PathInspector) Name() string {
+	return PathInspectorName
+}
+
+// pathMatchesRules checks if a path matches any of the rules in RequestParsingRules.
+// This method is kept for testing purposes only and is not used in the actual implementation.
+func (pi *PathInspector) pathMatchesRules(path string, rules domain.RequestParsingRules) bool {
+	if rules.ChatCompletionsPath != "" && strings.HasSuffix(path, rules.ChatCompletionsPath) {
+		return true
+	}
+	if rules.CompletionsPath != "" && strings.HasSuffix(path, rules.CompletionsPath) {
+		return true
+	}
+	if rules.GeneratePath != "" && strings.HasSuffix(path, rules.GeneratePath) {
+		return true
+	}
+	return false
+}
+
+// ResolveTargetPath returns the path a profile serves for a request to target. Translators
+// rewrite requests to one OpenAI path (/v1/chat/completions), but some backends mount that
+// API under their own prefix: Docker Model Runner serves /engines/v1/chat/completions and
+// Lemonade /api/v1/chat/completions. An exact declaration wins; otherwise the first declared
+// path that ends in target on a segment boundary is used, so a profile listing a prefixed
+// variant first (DMR's simplified /engines/v1 ahead of its engine-specific ones) resolves
+// deterministically. A profile name the factory does not know is treated as OpenAI-compatible,
+// as profile.Factory.GetProfile does.
+func (pi *PathInspector) ResolveTargetPath(profileName, target string) (string, bool) {
+	if target == "" {
+		return "", false
+	}
+	paths, ok := pi.profilePaths[profileName]
+	if !ok {
+		paths = pi.profilePaths[domain.ProfileOpenAICompatible]
+	}
+	if slices.Contains(paths, target) {
+		return target, true
+	}
+	// A single-segment target would suffix-match unrelated paths (see pathMatches).
+	if strings.Count(target, "/") < 2 {
+		return "", false
+	}
+	for _, p := range paths {
+		if strings.HasPrefix(p, "/") && strings.HasSuffix(p, target) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// MountPrefixes returns the prefixes under which a profile mounts target: for DMR and
+// /v1/chat/completions that is /engines, /engines/llama.cpp and /engines/vllm. A target served
+// at the root contributes nothing. Unknown profile names are treated as OpenAI-compatible, as
+// in ResolveTargetPath.
+func (pi *PathInspector) MountPrefixes(profileName, target string) []string {
+	paths, ok := pi.profilePaths[profileName]
+	if !ok {
+		paths = pi.profilePaths[domain.ProfileOpenAICompatible]
+	}
+	var out []string
+	for _, p := range paths {
+		if prefix, found := strings.CutSuffix(p, target); found && prefix != "" && strings.HasPrefix(prefix, "/") {
+			out = append(out, prefix)
+		}
+	}
+	return out
+}
+
+// KnowsProfile reports whether name is a profile the inspector holds paths for. Endpoint types
+// outside it (custom or "auto" types) are served as OpenAI-compatible, as ResolveTargetPath does.
+func (pi *PathInspector) KnowsProfile(name string) bool {
+	_, ok := pi.profilePaths[name]
+	return ok
+}
+
+// TranslationProfiles returns the profiles that serve target, directly or under their own
+// prefix (see ResolveTargetPath). Callers that route on a path other than the one the client
+// called (translators rewriting to a backend path) use it to ask who can take the rewritten
+// request.
+func (pi *PathInspector) TranslationProfiles(target string) []string {
+	out := make([]string, 0, len(pi.profilePaths))
+	for name := range pi.profilePaths {
+		if _, ok := pi.ResolveTargetPath(name, target); ok {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (pi *PathInspector) Inspect(_ context.Context, _ *http.Request, profile *domain.RequestProfile) error {
+	path := profile.Path
+	if path == "" {
+		return nil
+	}
+
+	if caps := capabilitiesForPath(path); caps != nil {
+		profile.ModelCapabilities = caps
+	}
+
+	// First try exact match
+	if supportedProfiles, exists := pi.pathToProfiles[path]; exists {
+		for _, supportedProfile := range supportedProfiles {
+			profile.AddSupportedProfile(supportedProfile)
+		}
+		profile.SetInspectionMeta(domain.InspectionMetaPathSupport, supportedProfiles)
+
+		pi.logger.Debug("Path inspection completed (exact match)",
+			"path", path,
+			"supported_profiles", supportedProfiles)
+
+		return nil
+	}
+
+	// No exact match: try profile paths behind a mount prefix (see pathMatches)
+	var supportedProfiles []string
+	for mapPath, profiles := range pi.pathToProfiles {
+		if pathMatches(path, mapPath) {
+			for _, profileName := range profiles {
+				// Check if this profile is already in the supported list
+				alreadySupported := false
+				for _, existing := range profile.SupportedBy {
+					if existing == profileName {
+						alreadySupported = true
+						break
+					}
+				}
+
+				if !alreadySupported {
+					profile.AddSupportedProfile(profileName)
+					supportedProfiles = append(supportedProfiles, profileName)
+				}
+			}
+		}
+	}
+
+	if len(supportedProfiles) > 0 {
+		profile.SetInspectionMeta(domain.InspectionMetaPathSupport, supportedProfiles)
+	}
+
+	pi.logger.Debug("Path inspection completed (suffix match)",
+		"path", path,
+		"supported_profiles", supportedProfiles)
+
+	return nil
+}
