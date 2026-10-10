@@ -39,3 +39,44 @@ proxy:
   profile: "auto"
   load_balancer: "priority"
   # stream_buffer_size: 8192  # Unset: the engine default applies (Olla 64KiB, Sherpa 8KiB)
+  connection_timeout: 10s
+  response_timeout: 30s
+  read_timeout: 30s
+
+discovery:
+  type: "static"
+  refresh_interval: 10s
+  static:
+    endpoints:
+      # Primary bearer-auth endpoint — token injected from AUTH_TOKEN env var.
+      # The mock backend (port 19910) enforces the value.
+      - url: "http://127.0.0.1:19910"
+        name: "mock-bearer"
+        type: "openai-compatible"
+        priority: 100
+        model_url: "/v1/models"
+        health_check_url: "/v1/models"
+        check_interval: 5s
+        check_timeout: 2s
+        auth:
+          type: bearer
+          token: "${AUTH_TOKEN}"
+
+  model_discovery:
+    enabled: false
+
+model_registry:
+  type: "memory"
+  enable_unifier: false
+  routing_strategy:
+    type: "optimistic"
+    options:
+      fallback_behavior: "all"
+
+logging:
+  level: "debug"
+  format: "text"
+  output: "stdout"
+
+engineering:
+  show_nerdstats: false
