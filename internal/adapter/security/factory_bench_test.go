@@ -16,3 +16,21 @@ func BenchmarkCreateChainMiddleware_ServeHTTP(b *testing.B) {
 	cfg.Server.RateLimits.GlobalRequestsPerMinute = 1_000_000
 	cfg.Server.RateLimits.PerIPRequestsPerMinute = 1_000_000
 	cfg.Server.RateLimits.BurstSize = 1_000_000
+	_, adapters := createNewTestSecurityServicesWithConfig(cfg)
+	defer adapters.Stop()
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := adapters.CreateChainMiddleware(nil)(next)
+
+	req := httptest.NewRequest(http.MethodPost, "/olla/proxy/test", nil)
+	req.RemoteAddr = "10.0.0.1:54321"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+	}
+}
