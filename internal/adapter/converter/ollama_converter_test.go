@@ -53,3 +53,59 @@ func TestOllamaConverter_ConvertToFormat(t *testing.T) {
 			Aliases: []domain.AliasEntry{
 				{Name: "microsoft/phi-4", Source: "lmstudio"}, // No Ollama alias
 			},
+			SourceEndpoints: []domain.SourceEndpoint{
+				{
+					EndpointURL: "http://localhost:1234",
+					NativeName:  "microsoft/phi-4",
+					State:       "loaded",
+					DiskSize:    8000000000,
+				},
+			},
+			Capabilities: []string{"chat", "code"},
+			DiskSize:     8000000000,
+			LastSeen:     now,
+		},
+	}
+
+	t.Run("Ollama format only includes Ollama models", func(t *testing.T) {
+		filters := ports.ModelFilters{}
+
+		result, err := converter.ConvertToFormat(models, filters)
+		require.NoError(t, err)
+
+		response, ok := result.(OllamaModelResponse)
+		require.True(t, ok)
+		assert.Len(t, response.Models, 1) // Only the llama model has Ollama alias
+
+		// Check the model
+		model := response.Models[0]
+		assert.Equal(t, "llama3:latest", model.Name)
+		assert.Equal(t, "llama3:latest", model.Model)
+		assert.Equal(t, now.Format(time.RFC3339), model.ModifiedAt)
+		assert.Equal(t, int64(40000000000), model.Size)
+		assert.Equal(t, "sha256:abc123def456", model.Digest)
+
+		// Check details
+		assert.NotNil(t, model.Details)
+		assert.Equal(t, "llama", model.Details.Family)
+		assert.Equal(t, "70b", model.Details.ParameterSize)
+		assert.Equal(t, "Q4_K_M", model.Details.QuantizationLevel) // Denormalized
+	})
+
+	t.Run("quantization denormalization", func(t *testing.T) {
+		testCases := []struct {
+			normalized   string
+			denormalized string
+		}{
+			{"q4km", "Q4_K_M"},
+			{"q4ks", "Q4_K_S"},
+			{"q8", "Q8_0"},
+			{"f16", "F16"},
+			{"unk", "unknown"},
+		}
+
+		for _, tc := range testCases {
+			assert.Equal(t, tc.denormalized, denormalizeQuantization(tc.normalized))
+		}
+	})
+}
