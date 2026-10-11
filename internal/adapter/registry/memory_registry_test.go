@@ -179,3 +179,728 @@ func TestRegisterModels_Success(t *testing.T) {
 	modelNames := make(map[string]bool)
 	for _, model := range retrievedModels {
 		modelNames[model.Name] = true
+	}
+
+	expectedNames := []string{DefaultModelName, DefaultModelNameA, DefaultModelNameB}
+	for _, name := range expectedNames {
+		if !modelNames[name] {
+			t.Errorf("Expected model %s not found", name)
+		}
+	}
+}
+
+func TestRegisterModels_ReplaceExisting(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+	endpointURL := DefaultOllamaEndpointUri
+
+	initialModels := []*domain.ModelInfo{
+		createTestModel(DefaultModelName),
+		createTestModel(DefaultModelNameC),
+	}
+
+	err := registry.RegisterModels(ctx, endpointURL, initialModels)
+	if err != nil {
+		t.Fatalf("Initial RegisterModels failed: %v", err)
+	}
+
+	newModels := []*domain.ModelInfo{
+		createTestModel(DefaultModelNameB),
+	}
+
+	err = registry.RegisterModels(ctx, endpointURL, newModels)
+	if err != nil {
+		t.Fatalf("Second RegisterModels failed: %v", err)
+	}
+
+	retrievedModels, err := registry.GetModelsForEndpoint(ctx, endpointURL)
+	if err != nil {
+		t.Fatalf("GetModelsForEndpoint failed: %v", err)
+	}
+
+	if len(retrievedModels) != 1 {
+		t.Fatalf("Expected 1 model after replacement, got %d", len(retrievedModels))
+	}
+
+	if retrievedModels[0].Name != DefaultModelNameB {
+		t.Errorf("Expected model 'mistral:7b', got %s", retrievedModels[0].Name)
+	}
+
+	if registry.IsModelAvailable(ctx, DefaultModelName) {
+		t.Error("Old model should no longer be available")
+	}
+
+	if !registry.IsModelAvailable(ctx, DefaultModelNameB) {
+		t.Error("New model should be available")
+	}
+}
+
+func TestRegisterModels_EmptyList(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+	endpointURL := DefaultOllamaEndpointUri
+
+	initialModels := []*domain.ModelInfo{
+		createTestModel(DefaultModelName),
+	}
+
+	err := registry.RegisterModels(ctx, endpointURL, initialModels)
+	if err != nil {
+		t.Fatalf("Initial RegisterModels failed: %v", err)
+	}
+
+	err = registry.RegisterModels(ctx, endpointURL, []*domain.ModelInfo{})
+	if err != nil {
+		t.Fatalf("RegisterModels with empty list failed: %v", err)
+	}
+
+	retrievedModels, err := registry.GetModelsForEndpoint(ctx, endpointURL)
+	if err != nil {
+		t.Fatalf("GetModelsForEndpoint failed: %v", err)
+	}
+
+	if len(retrievedModels) != 0 {
+		t.Fatalf("Expected 0 models after empty registration, got %d", len(retrievedModels))
+	}
+
+	if registry.IsModelAvailable(ctx, DefaultModelName) {
+		t.Error("Model should no longer be available")
+	}
+}
+
+func TestGetModelsForEndpoint_NonExistent(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	models, err := registry.GetModelsForEndpoint(ctx, "http://nonexistent:11434")
+	if err != nil {
+		t.Fatalf("GetModelsForEndpoint failed: %v", err)
+	}
+
+	if len(models) != 0 {
+		t.Errorf("Expected empty slice for nonexistent endpoint, got %d models", len(models))
+	}
+}
+
+func TestGetEndpointsForModel_Success(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	model := createTestModel(DefaultModelNameC)
+
+	endpoints := []string{
+		DefaultOllamaEndpointUri,
+		"http://localhost:11435",
+		"http://localhost:11436",
+	}
+
+	for _, endpoint := range endpoints {
+		err := registry.RegisterModel(ctx, endpoint, model)
+		if err != nil {
+			t.Fatalf("RegisterModel failed for %s: %v", endpoint, err)
+		}
+	}
+
+	retrievedEndpoints, err := registry.GetEndpointsForModel(ctx, DefaultModelNameC)
+	if err != nil {
+		t.Fatalf("GetEndpointsForModel failed: %v", err)
+	}
+
+	if len(retrievedEndpoints) != 3 {
+		t.Fatalf("Expected 3 endpoints, got %d", len(retrievedEndpoints))
+	}
+
+	endpointMap := make(map[string]bool)
+	for _, endpoint := range retrievedEndpoints {
+		endpointMap[endpoint] = true
+	}
+
+	for _, expected := range endpoints {
+		if !endpointMap[expected] {
+			t.Errorf("Expected endpoint %s not found", expected)
+		}
+	}
+}
+
+func TestGetEndpointsForModel_NonExistent(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	endpoints, err := registry.GetEndpointsForModel(ctx, "nonexistent-model")
+	if err != nil {
+		t.Fatalf("GetEndpointsForModel failed: %v", err)
+	}
+
+	if len(endpoints) != 0 {
+		t.Errorf("Expected empty slice for nonexistent model, got %d endpoints", len(endpoints))
+	}
+}
+
+func TestIsModelAvailable(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	if registry.IsModelAvailable(ctx, "nonexistent") {
+		t.Error("Nonexistent model should not be available")
+	}
+
+	model := createTestModel(DefaultModelNameC)
+	err := registry.RegisterModel(ctx, DefaultOllamaEndpointUri, model)
+	if err != nil {
+		t.Fatalf("RegisterModel failed: %v", err)
+	}
+
+	if !registry.IsModelAvailable(ctx, DefaultModelNameC) {
+		t.Error("Registered model should be available")
+	}
+
+	if registry.IsModelAvailable(ctx, "") {
+		t.Error("Empty model name should not be available")
+	}
+}
+
+func TestGetAllModels(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	endpoint1 := DefaultOllamaEndpointUri
+	endpoint2 := "http://localhost:11435"
+
+	models1 := []*domain.ModelInfo{
+		createTestModel(DefaultModelName),
+		createTestModel(DefaultModelNameA),
+	}
+
+	models2 := []*domain.ModelInfo{
+		createTestModel(DefaultModelNameB),
+	}
+
+	err := registry.RegisterModels(ctx, endpoint1, models1)
+	if err != nil {
+		t.Fatalf("RegisterModels failed for endpoint1: %v", err)
+	}
+
+	err = registry.RegisterModels(ctx, endpoint2, models2)
+	if err != nil {
+		t.Fatalf("RegisterModels failed for endpoint2: %v", err)
+	}
+
+	allModels, err := registry.GetAllModels(ctx)
+	if err != nil {
+		t.Fatalf("GetAllModels failed: %v", err)
+	}
+
+	if len(allModels) != 2 {
+		t.Fatalf("Expected 2 endpoints, got %d", len(allModels))
+	}
+
+	if len(allModels[endpoint1]) != 2 {
+		t.Errorf("Expected 2 models for endpoint1, got %d", len(allModels[endpoint1]))
+	}
+
+	if len(allModels[endpoint2]) != 1 {
+		t.Errorf("Expected 1 model for endpoint2, got %d", len(allModels[endpoint2]))
+	}
+}
+
+func TestRemoveEndpoint(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	endpoint1 := DefaultOllamaEndpointUri
+	endpoint2 := "http://localhost:11435"
+
+	model1 := createTestModel(DefaultModelName)
+	model2 := createTestModel(DefaultModelNameC)
+
+	err := registry.RegisterModel(ctx, endpoint1, model1)
+	if err != nil {
+		t.Fatalf("RegisterModel failed: %v", err)
+	}
+
+	err = registry.RegisterModel(ctx, endpoint2, model1)
+	if err != nil {
+		t.Fatalf("RegisterModel failed: %v", err)
+	}
+
+	err = registry.RegisterModel(ctx, endpoint1, model2)
+	if err != nil {
+		t.Fatalf("RegisterModel failed: %v", err)
+	}
+
+	err = registry.RemoveEndpoint(ctx, endpoint1)
+	if err != nil {
+		t.Fatalf("RemoveEndpoint failed: %v", err)
+	}
+
+	models, err := registry.GetModelsForEndpoint(ctx, endpoint1)
+	if err != nil {
+		t.Fatalf("GetModelsForEndpoint failed: %v", err)
+	}
+
+	if len(models) != 0 {
+		t.Errorf("Expected 0 models for removed endpoint, got %d", len(models))
+	}
+
+	endpoints, err := registry.GetEndpointsForModel(ctx, DefaultModelName)
+	if err != nil {
+		t.Fatalf("GetEndpointsForModel failed: %v", err)
+	}
+
+	if len(endpoints) != 1 || endpoints[0] != endpoint2 {
+		t.Error("Model should still be available on endpoint2")
+	}
+
+	if registry.IsModelAvailable(ctx, DefaultModelNameC) {
+		t.Error("Model should no longer be available after endpoint removal")
+	}
+}
+
+func TestGetStats(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	endpoint1 := DefaultOllamaEndpointUri
+	endpoint2 := "http://localhost:11435"
+
+	models1 := []*domain.ModelInfo{
+		createTestModel(DefaultModelName),
+		createTestModel(DefaultModelNameA),
+	}
+
+	models2 := []*domain.ModelInfo{
+		createTestModel(DefaultModelName),
+		createTestModel(DefaultModelNameB),
+	}
+
+	err := registry.RegisterModels(ctx, endpoint1, models1)
+	if err != nil {
+		t.Fatalf("RegisterModels failed: %v", err)
+	}
+
+	err = registry.RegisterModels(ctx, endpoint2, models2)
+	if err != nil {
+		t.Fatalf("RegisterModels failed: %v", err)
+	}
+
+	stats, err := registry.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+
+	if stats.TotalEndpoints != 2 {
+		t.Errorf("Expected 2 endpoints, got %d", stats.TotalEndpoints)
+	}
+
+	if stats.TotalModels != 3 {
+		t.Errorf("Expected 3 unique models, got %d", stats.TotalModels)
+	}
+
+	if stats.ModelsPerEndpoint[endpoint1] != 2 {
+		t.Errorf("Expected 2 models for endpoint1, got %d", stats.ModelsPerEndpoint[endpoint1])
+	}
+
+	if stats.ModelsPerEndpoint[endpoint2] != 2 {
+		t.Errorf("Expected 2 models for endpoint2, got %d", stats.ModelsPerEndpoint[endpoint2])
+	}
+}
+
+func TestContextCancellation(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	model := createTestModel("test")
+
+	err := registry.RegisterModel(ctx, DefaultOllamaEndpointUri, model)
+	if err == nil {
+		t.Error("Expected error due to cancelled context")
+	}
+
+	_, err = registry.GetModelsForEndpoint(ctx, DefaultOllamaEndpointUri)
+	if err == nil {
+		t.Error("Expected error due to cancelled context")
+	}
+
+	_, err = registry.GetEndpointsForModel(ctx, "test")
+	if err == nil {
+		t.Error("Expected error due to cancelled context")
+	}
+
+	available := registry.IsModelAvailable(ctx, "test")
+	if available {
+		t.Error("Expected false due to cancelled context")
+	}
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 200)
+
+	for i := range 10 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			endpoint := fmt.Sprintf("http://localhost:%d", 11434+id)
+			model := createTestModel(fmt.Sprintf("model-%d", id))
+
+			for range 10 {
+				if err := registry.RegisterModel(ctx, endpoint, model); err != nil {
+					errors <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	for i := range 20 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for range 5 {
+				_, err := registry.GetAllModels(ctx)
+				if err != nil {
+					errors <- err
+					return
+				}
+
+				_, err = registry.GetStats(ctx)
+				if err != nil {
+					errors <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	for i := range 10 {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			modelName := fmt.Sprintf("model-%d", id%5)
+			for range 5 {
+				registry.IsModelAvailable(ctx, modelName)
+				_, _ = registry.GetEndpointsForModel(ctx, modelName)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Errorf("Concurrent access error: %v", err)
+	}
+}
+
+func TestDataIsolation(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	model := createTestModel(DefaultModelName)
+	model.Size = 1000
+
+	err := registry.RegisterModel(ctx, DefaultOllamaEndpointUri, model)
+	if err != nil {
+		t.Fatalf("RegisterModel failed: %v", err)
+	}
+
+	retrievedModels, err := registry.GetModelsForEndpoint(ctx, DefaultOllamaEndpointUri)
+	if err != nil {
+		t.Fatalf("GetModelsForEndpoint failed: %v", err)
+	}
+
+	retrievedModels[0].Size = 2000
+
+	models2, err := registry.GetModelsForEndpoint(ctx, DefaultOllamaEndpointUri)
+	if err != nil {
+		t.Fatalf("Second GetModelsForEndpoint failed: %v", err)
+	}
+
+	if models2[0].Size != 1000 {
+		t.Error("External modification affected internal data")
+	}
+}
+
+func BenchmarkModelLookup(b *testing.B) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	for i := range 100 {
+		endpoint := fmt.Sprintf("http://localhost:%d", 11434+i)
+		models := make([]*domain.ModelInfo, 10)
+		for j := range 10 {
+			models[j] = createTestModel(fmt.Sprintf("model-%d-%d", i, j))
+		}
+		registry.RegisterModels(ctx, endpoint, models)
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			endpoint := fmt.Sprintf("http://localhost:%d", 11434+(b.N%100))
+			_, _ = registry.GetModelsForEndpoint(ctx, endpoint)
+		}
+	})
+}
+
+func BenchmarkModelRegistration(b *testing.B) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := range b.N {
+		endpoint := fmt.Sprintf("http://localhost:%d", 11434+(i%10))
+		model := createTestModel(fmt.Sprintf("model-%d", i))
+		registry.RegisterModel(ctx, endpoint, model)
+	}
+}
+
+func BenchmarkConcurrentAccess(b *testing.B) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+
+	for i := range 50 {
+		endpoint := fmt.Sprintf("http://localhost:%d", 11434+i)
+		models := make([]*domain.ModelInfo, 5)
+		for j := range 5 {
+			models[j] = createTestModel(fmt.Sprintf("model-%d-%d", i, j))
+		}
+		registry.RegisterModels(ctx, endpoint, models)
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			switch b.N % 4 {
+			case 0:
+				endpoint := fmt.Sprintf("http://localhost:%d", 11434+(b.N%50))
+				_, _ = registry.GetModelsForEndpoint(ctx, endpoint)
+			case 1:
+				model := fmt.Sprintf("model-%d-0", b.N%50)
+				_, _ = registry.GetEndpointsForModel(ctx, model)
+			case 2:
+				model := fmt.Sprintf("model-%d-0", b.N%50)
+				_ = registry.IsModelAvailable(ctx, model)
+			case 3:
+				_, _ = registry.GetStats(ctx)
+			}
+		}
+	})
+}
+
+func createTestModel(name string) *domain.ModelInfo {
+	return &domain.ModelInfo{
+		Name:        name,
+		Size:        1024 * 1024 * 100,
+		Type:        "chat",
+		Description: fmt.Sprintf("Test model %s", name),
+		LastSeen:    time.Now(),
+	}
+}
+
+func createTestModelWithDetails(name string) *domain.ModelInfo {
+	family := "llama"
+	paramSize := "7B"
+	quantLevel := "Q4_K_M"
+	format := "gguf"
+	publisher := "test-publisher"
+	maxContextLength := int64(4096)
+
+	return &domain.ModelInfo{
+		Name:        name,
+		Size:        1024 * 1024 * 100,
+		Type:        "chat",
+		Description: fmt.Sprintf("Test model %s", name),
+		LastSeen:    time.Now(),
+		Details: &domain.ModelDetails{
+			Family:            &family,
+			Families:          []string{family, "code"},
+			ParameterSize:     &paramSize,
+			QuantizationLevel: &quantLevel,
+			Format:            &format,
+			Publisher:         &publisher,
+			MaxContextLength:  &maxContextLength,
+		},
+	}
+}
+func TestModelDetailsPreservation(t *testing.T) {
+	registry := NewMemoryModelRegistry(createTestLogger())
+	ctx := context.Background()
+	endpointURL := DefaultOllamaEndpointUri
+
+	// Test RegisterModel preserves details
+	t.Run("RegisterModel preserves details", func(t *testing.T) {
+		model := createTestModelWithDetails(DefaultModelName)
+
+		err := registry.RegisterModel(ctx, endpointURL, model)
+		if err != nil {
+			t.Fatalf("RegisterModel failed: %v", err)
+		}
+
+		models, err := registry.GetModelsForEndpoint(ctx, endpointURL)
+		if err != nil {
+			t.Fatalf("GetModelsForEndpoint failed: %v", err)
+		}
+
+		if len(models) != 1 {
+			t.Fatalf("Expected 1 model, got %d", len(models))
+		}
+
+		retrievedModel := models[0]
+		if retrievedModel.Details == nil {
+			t.Fatal("Model details were not preserved")
+		}
+
+		// Verify details fields
+		if retrievedModel.Details.Family == nil || *retrievedModel.Details.Family != "llama" {
+			t.Errorf("Expected Family to be 'llama', got %v", retrievedModel.Details.Family)
+		}
+
+		if len(retrievedModel.Details.Families) != 2 || retrievedModel.Details.Families[0] != "llama" || retrievedModel.Details.Families[1] != "code" {
+			t.Errorf("Expected Families to be ['llama', 'code'], got %v", retrievedModel.Details.Families)
+		}
+
+		if retrievedModel.Details.ParameterSize == nil || *retrievedModel.Details.ParameterSize != "7B" {
+			t.Errorf("Expected ParameterSize to be '7B', got %v", retrievedModel.Details.ParameterSize)
+		}
+	})
+
+	// Test RegisterModels preserves details
+	t.Run("RegisterModels preserves details", func(t *testing.T) {
+		models := []*domain.ModelInfo{
+			createTestModelWithDetails(DefaultModelNameA),
+			createTestModelWithDetails(DefaultModelNameB),
+		}
+
+		err := registry.RegisterModels(ctx, endpointURL, models)
+		if err != nil {
+			t.Fatalf("RegisterModels failed: %v", err)
+		}
+
+		retrievedModels, err := registry.GetModelsForEndpoint(ctx, endpointURL)
+		if err != nil {
+			t.Fatalf("GetModelsForEndpoint failed: %v", err)
+		}
+
+		if len(retrievedModels) != 2 {
+			t.Fatalf("Expected 2 models, got %d", len(retrievedModels))
+		}
+
+		// Check that both models have their details preserved
+		for _, model := range retrievedModels {
+			if model.Details == nil {
+				t.Errorf("Model %s details were not preserved", model.Name)
+				continue
+			}
+
+			if model.Details.Family == nil || *model.Details.Family != "llama" {
+				t.Errorf("Model %s: Expected Family to be 'llama', got %v", model.Name, model.Details.Family)
+			}
+
+			if len(model.Details.Families) != 2 {
+				t.Errorf("Model %s: Expected Families to have 2 entries, got %v", model.Name, model.Details.Families)
+			}
+		}
+	})
+
+	// Test GetAllModels preserves details
+	t.Run("GetAllModels preserves details", func(t *testing.T) {
+		allModels, err := registry.GetAllModels(ctx)
+		if err != nil {
+			t.Fatalf("GetAllModels failed: %v", err)
+		}
+
+		if len(allModels) != 1 {
+			t.Fatalf("Expected 1 endpoint, got %d", len(allModels))
+		}
+
+		endpointModels, exists := allModels[endpointURL]
+		if !exists {
+			t.Fatalf("Expected models for endpoint %s, but none found", endpointURL)
+		}
+
+		if len(endpointModels) != 2 {
+			t.Fatalf("Expected 2 models, got %d", len(endpointModels))
+		}
+
+		// Check that both models have their details preserved
+		for _, model := range endpointModels {
+			if model.Details == nil {
+				t.Errorf("Model %s details were not preserved in GetAllModels", model.Name)
+				continue
+			}
+
+			if model.Details.MaxContextLength == nil || *model.Details.MaxContextLength != 4096 {
+				t.Errorf("Model %s: Expected MaxContextLength to be 4096, got %v",
+					model.Name, model.Details.MaxContextLength)
+			}
+
+			if model.Details.Format == nil || *model.Details.Format != "gguf" {
+				t.Errorf("Model %s: Expected Format to be 'gguf', got %v",
+					model.Name, model.Details.Format)
+			}
+		}
+	})
+
+	// Test updating a model preserves details
+	t.Run("Updating model preserves details", func(t *testing.T) {
+		// First register a model with details
+		model1 := createTestModelWithDetails(DefaultModelNameC)
+		err := registry.RegisterModel(ctx, endpointURL, model1)
+		if err != nil {
+			t.Fatalf("RegisterModel failed: %v", err)
+		}
+
+		// Now update the same model with different details
+		updatedFamily := "mistral"
+		model2 := createTestModelWithDetails(DefaultModelNameC)
+		model2.Details.Family = &updatedFamily
+		model2.Details.Families = []string{updatedFamily, "instruct"}
+
+		err = registry.RegisterModel(ctx, endpointURL, model2)
+		if err != nil {
+			t.Fatalf("RegisterModel update failed: %v", err)
+		}
+
+		// Retrieve and check
+		models, err := registry.GetModelsForEndpoint(ctx, endpointURL)
+		if err != nil {
+			t.Fatalf("GetModelsForEndpoint failed: %v", err)
+		}
+
+		var updatedModel *domain.ModelInfo
+		for _, m := range models {
+			if m.Name == DefaultModelNameC {
+				updatedModel = m
+				break
+			}
+		}
+
+		if updatedModel == nil {
+			t.Fatal("Updated model not found")
+		}
+
+		if updatedModel.Details == nil {
+			t.Fatal("Updated model details were not preserved")
+		}
+
+		if updatedModel.Details.Family == nil || *updatedModel.Details.Family != "mistral" {
+			t.Errorf("Expected updated Family to be 'mistral', got %v", updatedModel.Details.Family)
+		}
+
+		if len(updatedModel.Details.Families) != 2 || updatedModel.Details.Families[0] != "mistral" {
+			t.Errorf("Expected updated Families to contain 'mistral', got %v", updatedModel.Details.Families)
+		}
+	})
+}
+
+func createTestLogger() logger.StyledLogger {
+	loggerCfg := &logger.Config{Level: "error", Theme: "default"}
+	log, _, _ := logger.New(loggerCfg)
+	return logger.NewPlainStyledLogger(log)
+}
