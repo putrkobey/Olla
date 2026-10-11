@@ -96,3 +96,102 @@ func TestExtractProviderFromPath(t *testing.T) {
 		{"no trailing path", "/olla/ollama", "ollama", "/", true},
 	}
 
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider, path, ok := extractProviderFromPath(tt.path)
+			assert.Equal(t, tt.expectedOk, ok)
+			if ok {
+				assert.Equal(t, tt.expectedProvider, provider)
+				assert.Equal(t, tt.expectedPath, path)
+			}
+		})
+	}
+}
+
+func TestIsProviderSupported(t *testing.T) {
+	t.Run("fallback without profile factory", func(t *testing.T) {
+		// Create a minimal Application with no profile factory to test fallback
+		app := &Application{}
+
+		tests := []struct {
+			name      string
+			provider  string
+			supported bool
+		}{
+			{"ollama supported", "ollama", true},
+			{"lmstudio supported", "lmstudio", true},
+			{"lm-studio supported", "lm-studio", true},
+			{"lm_studio supported", "lm_studio", true},
+			{"openai supported", "openai", true},
+			{"vllm supported", "vllm", true},
+			{"omlx supported", "omlx", true},
+			{"unknown not supported", "unknown", false},
+			{"empty not supported", "", false},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				result := app.isProviderSupported(tt.provider)
+				assert.Equal(t, tt.supported, result)
+			})
+		}
+	})
+
+	t.Run("with profile factory", func(t *testing.T) {
+		// Create a mock profile factory
+		mockFactory := &mockProfileFactory{
+			validProfiles: map[string]bool{
+				"ollama":    true,
+				"lm-studio": true,
+				"openai":    true,
+				"vllm":      true,
+				"custom":    true, // this wouldn't be in the fallback
+			},
+		}
+
+		app := &Application{
+			profileFactory: mockFactory,
+		}
+
+		// Test that custom profile is supported via factory
+		assert.True(t, app.isProviderSupported("custom"))
+
+		// Test normalization still works
+		assert.True(t, app.isProviderSupported("lmstudio"))
+		assert.True(t, app.isProviderSupported("lm_studio"))
+
+		// Test unknown is not supported
+		assert.False(t, app.isProviderSupported("unknown"))
+	})
+}
+
+// TestStaticProviderListsAgree is the regression test for the three-way
+// provider-list drift: getStaticProviders (server_routes.go),
+// isProviderSupported's fallback and createProviderProfile's OpenAI-compatible
+// fallback used to each keep their own copy, and LMDeploy/SGLang/DMR/OMLX had
+// drifted out of sync between them. All three now derive from
+// staticSupportedProviders (handler_common.go); this asserts they still agree.
+func TestStaticProviderListsAgree(t *testing.T) {
+	app := &Application{}
+
+	routes := getStaticProviders(app)
+
+	for _, provider := range staticSupportedProviders {
+		t.Run(provider, func(t *testing.T) {
+			_, hasRoutes := routes[provider]
+			assert.True(t, hasRoutes, "getStaticProviders is missing an entry for %q", provider)
+
+			assert.True(t, app.isProviderSupported(provider), "isProviderSupported fallback rejects %q", provider)
+
+			openaiProfile := app.createProviderProfile(constants.ProviderTypeOpenAI)
+			assert.True(t, openaiProfile.IsCompatibleWith(provider),
+				"createProviderProfile(%q) fallback does not accept %q as OpenAI-compatible", constants.ProviderTypeOpenAI, provider)
+		})
+	}
+
+	// getStaticProviders must not carry any provider staticSupportedProviders
+	// doesn't know about either - drift can go in both directions.
+	for provider := range routes {
+		assert.Contains(t, staticSupportedProviders, provider, "getStaticProviders has an entry for %q that staticSupportedProviders doesn't list", provider)
+	}
+}
