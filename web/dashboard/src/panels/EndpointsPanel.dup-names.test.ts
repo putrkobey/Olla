@@ -56,3 +56,62 @@ describe('EndpointsPanel exact-duplicate and empty names', () => {
         status: 'healthy',
         priority: 100,
         success_rate: '99.0%',
+        request_count: 10,
+        model_count: 1,
+        avg_latency_ms: 20,
+        min_latency_ms: 5,
+        max_latency_ms: 40,
+      },
+      {
+        name: 'ollama',
+        url: 'http://node-b:11434',
+        type: 'ollama',
+        status: 'healthy',
+        priority: 90,
+        success_rate: '98.0%',
+        request_count: 8,
+        model_count: 1,
+        avg_latency_ms: 25,
+        min_latency_ms: 5,
+        max_latency_ms: 40,
+      },
+    ]);
+
+    const rows = [...document.querySelectorAll('tbody tr')];
+    expect(rows.length).toBe(2);
+    // No each_key_duplicate blanking: both URL cells are present.
+    const urls = rows.map((r) => r.querySelector('.url-cell')?.textContent?.trim());
+    expect(urls).toEqual(expect.arrayContaining(['http://node-a:11434', 'http://node-b:11434']));
+  });
+
+  it('renders every row when two endpoints both have empty names', async () => {
+    component = mount(EndpointsPanel, { target: document.body });
+    flushSync();
+
+    await refreshWith([
+      {
+        name: '',
+        url: 'http://node-a:11434',
+        type: 'ollama',
+        status: 'healthy',
+        priority: 100,
+        success_rate: '99.0%',
+        request_count: 10,
+        model_count: 1,
+      },
+      {
+        name: '',
+        url: 'http://node-b:11434',
+        type: 'ollama',
+        status: 'healthy',
+        priority: 90,
+        success_rate: '98.0%',
+        request_count: 8,
+        model_count: 1,
+      },
+    ]);
+
+    const rows = [...document.querySelectorAll('tbody tr')];
+    expect(rows.length).toBe(2);
+  });
+});
