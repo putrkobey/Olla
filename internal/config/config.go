@@ -264,3 +264,269 @@ func Load(flagConfigFile ...string) (*Config, error) {
 			// Lax decoding is kept so old configs still load; the unknown keys
 			// are surfaced to the operator instead of failing the load.
 			config.UnknownKeys = FindUnknownKeys(data)
+			// Cache any settings so we don't reparse etc
+			ApplyConfigCaches(config)
+			break
+		}
+	}
+
+	if !configLoaded {
+		if len(flagConfigFile) > 0 && flagConfigFile[0] != "" {
+			return nil, fmt.Errorf("specified config file not found: %s", flagConfigFile[0])
+		} else if configFile := os.Getenv("OLLA_CONFIG_FILE"); configFile != "" {
+			return nil, fmt.Errorf("specified config file not found: %s", configFile)
+		}
+	}
+
+	// Apply essential environment overrides only
+	applyEnvOverrides(config)
+	config.Filename = configFilename
+
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
+	return config, nil
+}
+
+func ApplyConfigCaches(config *Config) {
+	if val := config.Server.RateLimits.TrustedProxyCIDRs; len(val) > 0 {
+		if trustedCIDRs, err := util.ParseTrustedCIDRs(val); err == nil {
+			config.Server.RateLimits.TrustedProxyCIDRs = val
+			config.Server.RateLimits.TrustedProxyCIDRsParsed = trustedCIDRs
+		} else {
+			config.Server.RateLimits.TrustedProxyCIDRsParsed = nil // fallback to empty if parsing fails
+		}
+	}
+
+	CheckFallbackCIDRs(config)
+}
+
+func CheckFallbackCIDRs(config *Config) {
+	if config.Server.RateLimits.TrustedProxyCIDRsParsed == nil {
+		if localCIDRs, err := util.ParseTrustedCIDRs(DefaultLocalNetworkTrustedCIDRs); err == nil {
+			config.Server.RateLimits.TrustedProxyCIDRs = DefaultLocalNetworkTrustedCIDRs
+			config.Server.RateLimits.TrustedProxyCIDRsParsed = localCIDRs
+		} else {
+			slog.Error("BUGCHECK: Failed to parse trusted local proxy CIDRs, please file a bug report")
+		}
+	}
+}
+
+//nolint:gocognit // flat env parsing logic, intentionally verbose
+func applyEnvOverrides(config *Config) {
+	if val := os.Getenv("OLLA_SERVER_HOST"); val != "" {
+		config.Server.Host = val
+	}
+	if val := os.Getenv("OLLA_SERVER_PORT"); val != "" {
+		if port, err := strconv.Atoi(val); err == nil {
+			config.Server.Port = port
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_READ_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Server.ReadTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_WRITE_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Server.WriteTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_MAX_BODY_SIZE"); val != "" {
+		if size, err := parseByteSize(val); err == nil {
+			config.Server.RequestLimits.MaxBodySize = size
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_MAX_HEADER_SIZE"); val != "" {
+		if size, err := parseByteSize(val); err == nil {
+			config.Server.RequestLimits.MaxHeaderSize = size
+		}
+	}
+
+	if val := os.Getenv("OLLA_SERVER_GLOBAL_RATE_LIMIT"); val != "" {
+		if limit, err := strconv.Atoi(val); err == nil {
+			config.Server.RateLimits.GlobalRequestsPerMinute = limit
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_PER_IP_RATE_LIMIT"); val != "" {
+		if limit, err := strconv.Atoi(val); err == nil {
+			config.Server.RateLimits.PerIPRequestsPerMinute = limit
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_RATE_BURST_SIZE"); val != "" {
+		if burst, err := strconv.Atoi(val); err == nil {
+			config.Server.RateLimits.BurstSize = burst
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_HEALTH_RATE_LIMIT"); val != "" {
+		if limit, err := strconv.Atoi(val); err == nil {
+			config.Server.RateLimits.HealthRequestsPerMinute = limit
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_RATE_CLEANUP_INTERVAL"); val != "" {
+		if interval, err := time.ParseDuration(val); err == nil {
+			config.Server.RateLimits.CleanupInterval = interval
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_TRUST_PROXY_HEADERS"); val != "" {
+		if trust, err := strconv.ParseBool(val); err == nil {
+			config.Server.RateLimits.TrustProxyHeaders = trust
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_TRUSTED_PROXY_CIDRS"); val != "" {
+		cidrs := strings.Split(val, ",")
+		if trustedCIDRs, err := util.ParseTrustedCIDRs(cidrs); err == nil {
+			config.Server.RateLimits.TrustedProxyCIDRs = cidrs
+			config.Server.RateLimits.TrustedProxyCIDRsParsed = trustedCIDRs
+		} else {
+			CheckFallbackCIDRs(config)
+		}
+	}
+
+	if val := os.Getenv("OLLA_PROXY_ENGINE"); val != "" {
+		config.Proxy.Engine = val
+	}
+	if val := os.Getenv("OLLA_PROXY_RESPONSE_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Proxy.ResponseTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_READ_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Proxy.ReadTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_RESPONSE_HEADER_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Proxy.ResponseHeaderTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_TLS_HANDSHAKE_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Proxy.TLSHandshakeTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_CONNECTION_KEEP_ALIVE"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Proxy.ConnectionKeepAlive = duration
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_READ_HEADER_TIMEOUT"); val != "" {
+		if duration, err := time.ParseDuration(val); err == nil {
+			config.Server.ReadHeaderTimeout = duration
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_LOAD_BALANCER"); val != "" {
+		config.Proxy.LoadBalancer = val
+	}
+	if val := os.Getenv("OLLA_PROXY_PROFILE"); val != "" {
+		config.Proxy.Profile = val
+	}
+	if val := os.Getenv("OLLA_PROXY_STICKY_SESSIONS_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.Proxy.StickySessions.Enabled = enabled
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_RETRY_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.Proxy.Retry.Enabled = enabled
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_RETRY_MAX_ATTEMPTS"); val != "" {
+		if n, err := strconv.Atoi(val); err == nil {
+			config.Proxy.Retry.MaxAttempts = n
+		}
+	}
+	if val := os.Getenv("OLLA_PROXY_RETRY_NON_IDEMPOTENT"); val != "" {
+		if allowed, err := strconv.ParseBool(val); err == nil {
+			config.Proxy.Retry.NonIdempotent = allowed
+		}
+	}
+	if val := os.Getenv("OLLA_LOGGING_LEVEL"); val != "" {
+		config.Logging.Level = val
+	}
+	if val := os.Getenv("OLLA_LOGGING_FORMAT"); val != "" {
+		config.Logging.Format = val
+	}
+
+	if val := os.Getenv("OLLA_SHOW_NERD_STATS"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.Engineering.ShowNerdStats = enabled
+		}
+	}
+	if val := os.Getenv("OLLA_MODEL_REGISTRY_TYPE"); val != "" {
+		config.ModelRegistry.Type = val
+	}
+
+	// OLLA_MODEL_UNIFIER_ENABLED controls EnableUnifier, the real toggle. It
+	// used to also write into the now-deleted (dead) Unification.Enabled field.
+	if val := os.Getenv("OLLA_MODEL_UNIFIER_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.ModelRegistry.EnableUnifier = enabled
+		}
+	}
+
+	// config for request size limits + streaming
+	if val := os.Getenv("OLLA_TRANSLATORS_ANTHROPIC_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.Translators.Anthropic.Enabled = enabled
+		}
+	}
+	if val := os.Getenv("OLLA_TRANSLATORS_ANTHROPIC_MAX_MESSAGE_SIZE"); val != "" {
+		if size, err := strconv.ParseInt(val, 10, 64); err == nil {
+			config.Translators.Anthropic.MaxMessageSize = size
+		}
+	}
+	if val := os.Getenv("OLLA_TRANSLATORS_ANTHROPIC_PASSTHROUGH_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.Translators.Anthropic.PassthroughEnabled = enabled
+		}
+	}
+
+	// CORS overrides — only relevant for browser-based clients; no-op for everything else.
+	if val := os.Getenv("OLLA_SERVER_CORS_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			config.Server.Cors.Enabled = enabled
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_CORS_ALLOWED_ORIGINS"); val != "" {
+		config.Server.Cors.AllowedOrigins = strings.Split(val, ",")
+	}
+	if val := os.Getenv("OLLA_SERVER_CORS_ALLOWED_METHODS"); val != "" {
+		config.Server.Cors.AllowedMethods = strings.Split(val, ",")
+	}
+	if val := os.Getenv("OLLA_SERVER_CORS_ALLOWED_HEADERS"); val != "" {
+		config.Server.Cors.AllowedHeaders = strings.Split(val, ",")
+	}
+	if val := os.Getenv("OLLA_SERVER_CORS_EXPOSED_HEADERS"); val != "" {
+		config.Server.Cors.ExposedHeaders = strings.Split(val, ",")
+	}
+	if val := os.Getenv("OLLA_SERVER_CORS_ALLOW_CREDENTIALS"); val != "" {
+		if allow, err := strconv.ParseBool(val); err == nil {
+			config.Server.Cors.AllowCredentials = allow
+		}
+	}
+	if val := os.Getenv("OLLA_SERVER_CORS_MAX_AGE"); val != "" {
+		if age, err := strconv.Atoi(val); err == nil {
+			config.Server.Cors.MaxAge = age
+		}
+	}
+}
+
+// parseByteSize parses human-readable byte sizes like "100MB", "1GB"
+// Uses binary units (1KB = 1024 bytes) for consistency with memory/storage
+func parseByteSize(s string) (int64, error) {
+	if s == "" {
+		return 0, errors.New("empty byte size")
+	}
+
+	s = strings.TrimSpace(s)
+
+	size, err := units.RAMInBytes(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size format: %s", s)
+	}
+
+	return size, nil
+}
