@@ -232,3 +232,237 @@ class ProviderTester:
             
         if 'vllm' in providers:
             self.test_endpoint(
+                "vLLM Models (/olla/vllm/v1/models)",
+                f"{self.base_url}/olla/vllm/v1/models",
+                method="GET"
+            )
+            
+    def test_model_routing(self, providers: List[str], max_models: int = 3):
+        self.print_color(WHITE, "\nTesting Model Routing with Provider Formats:")
+        self.print_color(PURPLE, "-" * 58)
+        
+        tested_per_provider = defaultdict(int)
+        
+        for provider in providers:
+            if provider not in self.provider_models or not self.provider_models[provider]:
+                self.print_color(YELLOW, f"\nNo models available for {provider} format, skipping...")
+                continue
+                
+            print()
+            self.print_color(WHITE, f"Testing {provider.upper()} provider models:")
+            
+            for model in self.provider_models[provider]:
+                if max_models is not None and tested_per_provider[provider] >= max_models:
+                    self.print_color(GREY, f"(Limited to {max_models} models per provider for brevity)")
+                    break
+                    
+                print()
+                self.print_color(CYAN, f"Model: {model}")
+                
+                if provider == 'openai':
+                    if 'embed' not in model:
+                        self.test_endpoint(
+                            "  Chat Completions (/v1/chat/completions)",
+                            f"{self.base_url}/olla/openai/v1/chat/completions",
+                            {
+                                "model": model,
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "max_tokens": 10,
+                                "stream": False
+                            }
+                        )
+                        self.test_endpoint(
+                            "  Completions (/v1/completions)",
+                            f"{self.base_url}/olla/openai/v1/completions",
+                            {
+                                "model": model,
+                                "prompt": "Hello",
+                                "max_tokens": 10,
+                                "stream": False
+                            }
+                        )
+                    else:
+                        self.test_endpoint(
+                            "  Embeddings (/v1/embeddings)",
+                            f"{self.base_url}/olla/openai/v1/embeddings",
+                            {
+                                "model": model,
+                                "input": "Test text"
+                            }
+                        )
+                        
+                elif provider == 'ollama':
+                    if 'embed' not in model:
+                        self.test_endpoint(
+                            "  Generate (/api/generate)",
+                            f"{self.base_url}/olla/ollama/api/generate",
+                            {
+                                "model": model,
+                                "prompt": "Hello",
+                                "stream": False
+                            }
+                        )
+                        self.test_endpoint(
+                            "  Chat (/api/chat)",
+                            f"{self.base_url}/olla/ollama/api/chat",
+                            {
+                                "model": model,
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "stream": False
+                            }
+                        )
+                    else:
+                        self.test_endpoint(
+                            "  Embeddings (/api/embeddings)",
+                            f"{self.base_url}/olla/ollama/api/embeddings",
+                            {
+                                "model": model,
+                                "prompt": "Test text"
+                            }
+                        )
+                        
+                elif provider == 'lmstudio':
+                    self.test_endpoint(
+                        "  Chat Completions (/v1/chat/completions)",
+                        f"{self.base_url}/olla/lm-studio/v1/chat/completions",
+                        {
+                            "model": model,
+                            "messages": [{"role": "user", "content": "Hello"}],
+                            "max_tokens": 10,
+                            "stream": False
+                        }
+                    )
+                    self.test_endpoint(
+                        "  Chat Completions (/api/v1/chat/completions)",
+                        f"{self.base_url}/olla/lm-studio/api/v1/chat/completions",
+                        {
+                            "model": model,
+                            "messages": [{"role": "user", "content": "Hello"}],
+                            "max_tokens": 10,
+                            "stream": False
+                        }
+                    )
+                    
+                elif provider == 'vllm':
+                    if 'embed' not in model:
+                        self.test_endpoint(
+                            "  Chat Completions (/v1/chat/completions)",
+                            f"{self.base_url}/olla/vllm/v1/chat/completions",
+                            {
+                                "model": model,
+                                "messages": [{"role": "user", "content": "Hello"}],
+                                "max_tokens": 10,
+                                "stream": False
+                            }
+                        )
+                        self.test_endpoint(
+                            "  Completions (/v1/completions)",
+                            f"{self.base_url}/olla/vllm/v1/completions",
+                            {
+                                "model": model,
+                                "prompt": "Hello",
+                                "max_tokens": 10,
+                                "stream": False
+                            }
+                        )
+                    else:
+                        self.test_endpoint(
+                            "  Embeddings (/v1/embeddings)",
+                            f"{self.base_url}/olla/vllm/v1/embeddings",
+                            {
+                                "model": model,
+                                "input": "Test text"
+                            }
+                        )
+                    
+                tested_per_provider[provider] += 1
+            
+    def print_summary(self):
+        self.print_color(PURPLE, "\n" + "-" * 58)
+        self.print_color(WHITE, "Test Summary:")
+        print(f"  Total Tests:        {CYAN}{self.total_tests}{RESET}")
+        print(f"  Successful Tests:   {GREEN}{self.successful_tests}{RESET}")
+        print(f"  Failed Tests:       {RED}{self.failed_tests}{RESET}")
+        
+        if self.total_tests > 0:
+            success_rate = (self.successful_tests * 100) // self.total_tests
+            color = GREEN if success_rate >= 80 else YELLOW if success_rate >= 50 else RED
+            print(f"  Success Rate:       {color}{success_rate}%{RESET}")
+            
+        if self.endpoint_usage:
+            self.print_color(WHITE, "\nEndpoint Usage:")
+            print(f"  {'Endpoint':<20} {'Total':<8} {'Success':<8} {'Failed':<8}")
+            print(f"  {'-'*20} {'-'*8} {'-'*8} {'-'*8}")
+            
+            for endpoint in sorted(self.endpoint_usage.keys()):
+                total = self.endpoint_usage[endpoint]
+                success = self.endpoint_success.get(endpoint, 0)
+                failed = self.endpoint_failure.get(endpoint, 0)
+                
+                # Color code based on failure rate
+                if failed == 0:
+                    color = GREEN
+                elif failed > success:
+                    color = RED
+                else:
+                    color = YELLOW
+                    
+                print(f"  {color}{endpoint:<20}{RESET} {total:<8} {GREEN}{success:<8}{RESET} {RED if failed > 0 else GREY}{failed:<8}{RESET}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Test Olla provider-specific routing')
+    parser.add_argument('--openai', action='store_true', help='Test OpenAI format')
+    parser.add_argument('--ollama', action='store_true', help='Test Ollama format')
+    parser.add_argument('--lmstudio', '--lm-studio', action='store_true', help='Test LM Studio format')
+    parser.add_argument('--vllm', action='store_true', help='Test vLLM format')
+    parser.add_argument('--all', action='store_true', help='Test all models (default: 3 per provider)')
+    parser.add_argument('--url', default=TARGET_URL, help='Olla base URL')
+    
+    args = parser.parse_args()
+    
+    # If no provider specified, test all
+    providers = []
+    if args.openai:
+        providers.append('openai')
+    if args.ollama:
+        providers.append('ollama')
+    if args.lmstudio:
+        providers.append('lmstudio')
+    if args.vllm:
+        providers.append('vllm')
+        
+    if not providers:
+        providers = ['openai', 'ollama', 'lmstudio', 'vllm']
+        
+    tester = ProviderTester(args.url)
+    tester.print_header()
+    
+    if not tester.check_health():
+        sys.exit(1)
+        
+    print()
+    
+    if not tester.fetch_endpoints():
+        sys.exit(1)
+        
+    print()
+    
+    if not tester.fetch_models():
+        sys.exit(1)
+        
+    tester.display_model_summary()
+    print()
+    
+    tester.test_models_endpoints(providers)
+    
+    # Determine max models to test
+    max_models = None if args.all else 3
+    tester.test_model_routing(providers, max_models=max_models)
+    tester.print_summary()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Test interrupted by user (Ctrl+C){RESET}")
+        sys.exit(130)  # Standard exit code for SIGINT
