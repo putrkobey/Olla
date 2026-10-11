@@ -61,3 +61,66 @@ func writeStreamData(w http.ResponseWriter, data []byte, isStreaming bool, rc *h
 // shouldStopAfterDisconnect checks if we should stop streaming after client disconnect
 func shouldStopAfterDisconnect(bytesAfterDisconnect int, disconnectTime time.Time) bool {
 	return bytesAfterDisconnect > ClientDisconnectionBytesThreshold ||
+		time.Since(disconnectTime) > ClientDisconnectionTimeThreshold
+}
+
+// checkContexts checks for context cancellation and timeout.
+// readTimeout is passed in (snapshotted from config at stream start) so this
+// method has no dependency on s.configuration and stays off the atomic path.
+func (s *Service) checkContexts(clientCtx, upstreamCtx context.Context, readDeadline *time.Timer, readTimeout time.Duration, state *streamState, rlog logger.StyledLogger) error {
+	select {
+	case <-clientCtx.Done():
+		s.handleClientDisconnect(state, rlog)
+		// Don't return error - let processStreamData handle client disconnect
+		return nil
+	case <-upstreamCtx.Done():
+		return upstreamCtx.Err()
+	case <-readDeadline.C:
+		return fmt.Errorf("read timeout after %v", readTimeout)
+	default:
+		return nil
+	}
+}
+
+// processStreamData reads from upstream and writes to client
+func (s *Service) processStreamData(resp *http.Response, buffer []byte, state *streamState, w http.ResponseWriter, isStreaming bool, rc *http.ResponseController, rlog logger.StyledLogger) error {
+	n, err := resp.Body.Read(buffer)
+	if n > 0 {
+		// Only keep last chunk when we hit EOF (for metrics extraction)
+		// OLLA-221: large allocations per s tream adds GC Pressure over time
+		// using a pre-allocated buffer to avoid heap allocation on hot path
+		if errors.Is(err, io.EOF) {
+			if n <= len(state.lastChunkBuf) {
+				// most likely case is the chunk fits in pre-allocated buffer
+				copy(state.lastChunkBuf[:], buffer[:n])
+				state.lastChunk = state.lastChunkBuf[:n]
+			} else {
+				// rarer r case: chunk exceeds 8KB, fallback to allocation
+				state.lastChunk = make([]byte, n)
+				copy(state.lastChunk, buffer[:n])
+			}
+		}
+
+		// Handle data write
+		if !state.clientDisconnected {
+			written, writeErr := writeStreamData(w, buffer[:n], isStreaming, rc)
+			state.totalBytes += written
+
+			if writeErr != nil {
+				rlog.Debug("write error during streaming", "error", writeErr, "bytes_written", state.totalBytes)
+				return writeErr
+			}
+		} else {
+			state.bytesAfterDisconnect += n
+
+			if shouldStopAfterDisconnect(state.bytesAfterDisconnect, state.disconnectTime) {
+				rlog.Debug("stopping stream after client disconnect",
+					"bytes_after_disconnect", state.bytesAfterDisconnect,
+					"time_since_disconnect", time.Since(state.disconnectTime))
+				return context.Canceled
+			}
+		}
+	}
+
+	return err
+}
