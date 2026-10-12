@@ -74,3 +74,80 @@ describe('composite numeric cells carry an explicit alignment class', () => {
     const tds = [...row.querySelectorAll('td')];
 
     const respRateCell = tds.find((td) => td.querySelector('.pct-cell'))!;
+    const latencyCell = tds.find((td) => td.querySelector('.range-wrap'))!;
+    expect(respRateCell).toBeTruthy();
+    expect(latencyCell).toBeTruthy();
+
+    // Composite cells: alignment is explicit, decoupled from the `num` sort
+    // flag. The flex-child CSS rule keys off this class.
+    expect(respRateCell.classList.contains('align-right')).toBe(true);
+    expect(latencyCell.classList.contains('align-right')).toBe(true);
+    // They remain `num` for sort semantics.
+    expect(respRateCell.classList.contains('num')).toBe(true);
+
+    // The header carries the same `align-right` class, driven by the same
+    // column.align field the cell class came from - not a separately
+    // hand-maintained header class.
+    const headers = [...document.querySelectorAll('thead th')];
+    const respRateHeader = headers.find((th) => th.textContent!.includes('Resp. rate'))!;
+    const latencyHeader = headers.find((th) => th.textContent!.includes('Latency'))!;
+    expect(respRateHeader.classList.contains('align-right')).toBe(true);
+    expect(latencyHeader.classList.contains('align-right')).toBe(true);
+
+    // A genuinely numeric text column (Priority) is also driven by
+    // column.align now, not by `num` alone - proving `num` no longer does
+    // double duty as an alignment flag anywhere in the table.
+    const priorityHeader = headers.find((th) => th.textContent!.includes('Priority'))!;
+    expect(priorityHeader.classList.contains('align-right')).toBe(true);
+    const priorityCell = tds[headers.indexOf(priorityHeader)]!;
+    expect(priorityCell.classList.contains('align-right')).toBe(true);
+  });
+
+  it('marks the Endpoints (chips) cell align-right in ModelsPanel', async () => {
+    component = mount(ModelsPanel, { target: document.body });
+    flushSync();
+
+    global.fetch = vi.fn(async () =>
+      jsonResponse({
+        model_groups: [
+          {
+            family: 'qwen',
+            model_count: 1,
+            endpoints: ['ollama-1', 'vllm-1'],
+            models: [
+              {
+                name: 'qwen3:8b',
+                params: '8B',
+                quant: 'q4_k_m',
+                size: '4.5 GB',
+                endpoints: ['ollama-1', 'vllm-1'],
+                last_seen_at: new Date().toISOString(),
+              },
+            ],
+          },
+        ],
+      })
+    );
+    models.refresh();
+    await vi.waitFor(() => expect(models.data?.model_groups?.length).toBe(1));
+    flushSync();
+
+    const row = [...document.querySelectorAll('tbody tr')].find((tr) =>
+      tr.querySelector('.endpoint-pills')
+    )!;
+    expect(row).toBeTruthy();
+    const chipsCell = [...row.querySelectorAll('td')].find((td) =>
+      td.querySelector('.endpoint-pills')
+    )!;
+    expect(chipsCell.classList.contains('align-right')).toBe(true);
+
+    // Same guard as EndpointsPanel: the Endpoints column's header carries
+    // the matching align-right class, both driven by the one `align: 'right'`
+    // on the column definition rather than two things a caller must keep in
+    // sync by hand.
+    const endpointsHeader = [...document.querySelectorAll('thead th')].find((th) =>
+      th.textContent!.includes('Endpoints')
+    )!;
+    expect(endpointsHeader.classList.contains('align-right')).toBe(true);
+  });
+});
