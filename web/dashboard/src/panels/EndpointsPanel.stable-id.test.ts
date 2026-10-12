@@ -32,3 +32,73 @@ function jsonResponse(body: unknown) {
   };
 }
 
+async function refreshWithEndpoints(endpointList: Record<string, unknown>[]) {
+  global.fetch = vi.fn(async () =>
+    jsonResponse({
+      endpoints: endpointList,
+      total_count: endpointList.length,
+      healthy_count: endpointList.length,
+      routable_count: endpointList.length,
+    })
+  );
+  endpoints.refresh();
+  const lastName = endpointList[endpointList.length - 1].name;
+  await vi.waitFor(() =>
+    expect(endpoints.data?.endpoints?.[endpointList.length - 1]?.name).toBe(lastName)
+  );
+  flushSync();
+}
+
+function endpointWith(id: string | undefined, name: string) {
+  return {
+    id,
+    name,
+    // Both endpoints sanitise down to the same display url - the whole
+    // point of the regression.
+    url: 'http://shared-host:11434',
+    type: 'ollama',
+    status: 'healthy',
+    priority: 100,
+    success_rate: '99.0%',
+    request_count: 10,
+    model_count: 1,
+    avg_latency_ms: 20,
+    min_latency_ms: 5,
+    max_latency_ms: 40,
+  };
+}
+
+describe('EndpointsPanel row identity uses the stable id, not the display url', () => {
+  it('renders distinct rows and distinct DOM ids for endpoints sharing a display url', async () => {
+    component = mount(EndpointsPanel, { target: document.body });
+    flushSync();
+
+    await refreshWithEndpoints([
+      endpointWith('id-abc', 'shared-host-a'),
+      endpointWith('id-xyz', 'shared-host-b'),
+    ]);
+
+    const nameCells = [...document.querySelectorAll<HTMLElement>('.name-text')].map((el) => el.textContent!.trim());
+    expect(nameCells).toEqual(expect.arrayContaining(['shared-host-a', 'shared-host-b']));
+    expect(nameCells.length).toBe(2);
+
+    // Distinct DOM ids - if both rows resolved to the same id, getElementById
+    // (used by the Overview jump-to-endpoint feature) would only ever reach
+    // one of them.
+    const rowIds = [...document.querySelectorAll('tbody tr[id^="ep-"]')].map((el) => el.id);
+    expect(new Set(rowIds).size).toBe(2);
+  });
+
+  it('falls back to url/name when id is absent (older backend)', async () => {
+    component = mount(EndpointsPanel, { target: document.body });
+    flushSync();
+
+    const noIdEndpoint = endpointWith(undefined, 'legacy-endpoint');
+    delete noIdEndpoint.id;
+
+    await refreshWithEndpoints([noIdEndpoint]);
+
+    const nameCells = [...document.querySelectorAll<HTMLElement>('.name-text')].map((el) => el.textContent!.trim());
+    expect(nameCells).toEqual(['legacy-endpoint']);
+  });
+});
