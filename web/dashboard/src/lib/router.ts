@@ -32,3 +32,71 @@ const EP_PREFIX = 'ep-';
 // fragment (percent-encoding, stray slashes, a copied URL truncated mid-key)
 // degrades to a panel-only route instead of masquerading as a target.
 const KEY_RE = /^[0-9a-z]+$/;
+
+// Parse the location hash into a route. Tolerant: any unrecognised value
+// falls back to overview so a stale or typo'd shared link never blanks the
+// whole dashboard.
+export function parseHash(hash: string): Route {
+  const h = hash.replace(/^#/, '').trim();
+  if (!h) return { panel: 'overview' };
+  const slash = h.indexOf('/');
+  const head = slash === -1 ? h : h.slice(0, slash);
+  const tail = slash === -1 ? '' : h.slice(slash + 1);
+  if (!SECTIONS.includes(head as Section)) return { panel: 'overview' };
+  const panel = head as Section;
+  if (panel === 'endpoints' && tail.startsWith(EP_PREFIX)) {
+    const key = tail.slice(EP_PREFIX.length);
+    if (KEY_RE.test(key)) return { panel, endpointKey: key };
+  }
+  return { panel };
+}
+
+// Serialise a route to the hash fragment (no leading '#').
+export function serializeRoute(r: Route): string {
+  if (r.panel === 'endpoints' && r.endpointKey) {
+    return `endpoints/${EP_PREFIX}${r.endpointKey}`;
+  }
+  return r.panel;
+}
+
+export function routeToHash(r: Route): string {
+  return `#${serializeRoute(r)}`;
+}
+
+export function currentRoute(): Route {
+  return parseHash(typeof location !== 'undefined' ? location.hash : '');
+}
+
+// Push a new history entry for user-initiated navigation. pushState is silent
+// (no hashchange/popstate), so the caller still owns the store update; this
+// keeps click-jumps from re-entering the hashchange handler as if they were
+// back/forward.
+export function pushRoute(r: Route): void {
+  if (typeof history === 'undefined') return;
+  const url = routeToHash(r);
+  if (url === location.hash) return;
+  history.pushState(r, '', url);
+}
+
+// Programmatic panel switch (tab click, or a jump that targets a panel only).
+// Updates the store and pushes a history entry so back/forward traverses the
+// chain.
+export function navigatePanel(panel: Section): void {
+  navigation.set(panel);
+  pushRoute({ panel });
+}
+
+// Install the hashchange listener for browser-driven navigation: back/forward
+// across history entries, or a manual URL edit. On each event, re-sync the
+// store from the hash and, when the route targets an endpoint, hand off to
+// the caller's callback so it can scroll/focus/flash the row. Returns a
+// teardown function.
+export function startRouter(onEndpointRoute: (r: Route) => void): () => void {
+  const handler = () => {
+    const r = currentRoute();
+    navigation.set(r.panel);
+    if (r.endpointKey) onEndpointRoute(r);
+  };
+  window.addEventListener('hashchange', handler);
+  return () => window.removeEventListener('hashchange', handler);
+}
