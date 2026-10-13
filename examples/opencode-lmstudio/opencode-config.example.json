@@ -4,3 +4,15 @@
   "provider": {
     "olla-openai": {
       "npm": "@ai-sdk/openai-compatible",
+      "name": "Olla (LM Studio via OpenAI)",
+      "options": {
+        "baseURL": "http://localhost:40114/olla/openai/v1"
+      },
+      "models": {
+        "qwen2.5-coder-7b-instruct": {
+          "name": "Qwen2.5 Coder 7B Instruct"
+        }
+      }
+    }
+  }
+}
