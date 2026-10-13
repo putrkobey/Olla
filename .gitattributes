@@ -19,3 +19,25 @@
 *.rst  text eol=lf
 
 *.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+*.ts   text eol=lf
+
+Makefile text eol=lf
+*.mk    text eol=lf
+
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.bz2   binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
