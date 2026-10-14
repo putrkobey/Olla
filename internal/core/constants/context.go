@@ -20,3 +20,26 @@ const (
 	// and read back after to surface affinity decisions in response headers.
 	ContextStickyKeyKey       = contextKey("sticky-key")        // computed affinity key for this request
 	ContextStickyKeySourceKey = contextKey("sticky-key-source") // which source produced the key
+	ContextStickyOutcomeKey   = contextKey("sticky-outcome")    // *StickyOutcome written by the wrapper
+
+	// ContextModelAliasMapKey stores a map[string]string of endpoint URL → actual model name
+	// when a model alias is resolved, allowing the proxy to rewrite the model name in the
+	// request body to match what the selected backend expects
+	ContextModelAliasMapKey = "model_alias_map"
+
+	// ContextEndpointPathMapKey stores a map[string]string of endpoint URL to the request path
+	// that endpoint serves, for requests a translator rewrote to a path that not every backend
+	// mounts at the same place (DMR serves /engines/v1/chat/completions, not /v1/...). The
+	// proxy builds each attempt's URL from it, so failover across mixed backends stays correct.
+	ContextEndpointPathMapKey = contextKey("endpoint-path-map")
+
+	// ContextCanonicalModelKey carries the native name a bare Ollama model name resolved to
+	// (see core.CanonicalModel), so stats aggregate under one row. It is never used to
+	// rewrite the forwarded request: the client's spelling is what the backend receives.
+	ContextCanonicalModelKey = contextKey("canonical-model")
+
+	// ContextInputTokensKey carries a prompt token estimate through the translation
+	// pipeline so the streaming translator can populate input_tokens in message_start
+	// before the upstream usage chunk arrives (which only comes at the end of the stream).
+	ContextInputTokensKey = contextKey("input-tokens")
+)

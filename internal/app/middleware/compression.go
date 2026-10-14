@@ -129,3 +129,135 @@ func acceptsGzip(header string) bool {
 	}
 	starQ := float64(-1)
 	gzipQ := float64(-1)
+	for _, part := range strings.Split(header, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		token, params := part, ""
+		if i := strings.IndexByte(part, ';'); i >= 0 {
+			token = strings.TrimSpace(part[:i])
+			params = part[i:]
+		}
+		q := 1.0
+		if params != "" {
+			for _, p := range strings.Split(params, ";") {
+				p = strings.TrimSpace(p)
+				if strings.HasPrefix(p, "q=") {
+					if v, err := strconv.ParseFloat(p[2:], 64); err == nil {
+						q = v
+					}
+				}
+			}
+		}
+		switch token {
+		case "gzip":
+			gzipQ = q
+		case "*":
+			starQ = q
+		}
+	}
+	if gzipQ >= 0 {
+		return gzipQ > 0
+	}
+	if starQ >= 0 {
+		return starQ > 0
+	}
+	return false
+}
+
+// gzipResponseWriter buffers the decision to compress until the first Write.
+// Compression is only switched on for 200 responses whose Content-Type is not
+// text/event-stream and whose first Write clears gzipMinSize; everything else
+// falls through to the underlying writer untouched. Deferring the decision to
+// the first Write means a 304 path (WriteHeader only, no Write) never sets
+// Content-Encoding - the critical property that keeps a 304 a bare 304.
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gz            *gzip.Writer
+	status        int
+	headerWritten bool
+	useGzip       bool
+}
+
+func (g *gzipResponseWriter) WriteHeader(code int) {
+	if g.headerWritten {
+		return
+	}
+	g.status = code
+	// Defer the underlying WriteHeader until the first Write: only then do we
+	// know whether to add Content-Encoding.
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) {
+	if !g.headerWritten {
+		g.commit(len(b))
+	}
+	if g.useGzip {
+		return g.gz.Write(b)
+	}
+	return g.ResponseWriter.Write(b)
+}
+
+// commit finalises the compress-or-not decision and flushes the deferred
+// status code to the underlying writer. Calling it once is enforced by the
+// headerWritten guard.
+func (g *gzipResponseWriter) commit(bodyLen int) {
+	g.headerWritten = true
+	if g.shouldCompress(bodyLen) {
+		g.useGzip = true
+		// A gzipped body has a different byte length to the original, so any
+		// Content-Length the handler set is now wrong; drop it and let the
+		// transport fall back to chunked framing.
+		g.ResponseWriter.Header().Del("Content-Length")
+		g.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+		g.gz = acquireGzipWriter(g.ResponseWriter)
+	}
+	if g.status == 0 {
+		g.status = http.StatusOK
+	}
+	g.ResponseWriter.WriteHeader(g.status)
+}
+
+func (g *gzipResponseWriter) shouldCompress(bodyLen int) bool {
+	if g.status != http.StatusOK {
+		return false
+	}
+	ct := g.ResponseWriter.Header().Get(constants.HeaderContentType)
+	if strings.HasPrefix(ct, "text/event-stream") {
+		return false
+	}
+	if bodyLen < gzipMinSize {
+		return false
+	}
+	return true
+}
+
+// Flush implements http.Flusher so wrapping a streaming handler does not
+// silently drop the flush contract. When we are compressing, the gzip writer
+// is flushed first so buffered compressed frames reach the client.
+func (g *gzipResponseWriter) Flush() {
+	if g.useGzip {
+		_ = g.gz.Flush()
+	}
+	if flusher, ok := g.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// close finalises the response. If no Write ever happened (e.g. a 304 path)
+// we still need to propagate the deferred status code; if we are compressing,
+// the gzip writer must be closed to flush its trailer and returned to the pool.
+func (g *gzipResponseWriter) close() {
+	if !g.headerWritten {
+		g.headerWritten = true
+		if g.status == 0 {
+			g.status = http.StatusOK
+		}
+		g.ResponseWriter.WriteHeader(g.status)
+	}
+	if g.useGzip {
+		_ = g.gz.Close()
+		releaseGzipWriter(g.gz)
+	}
+}
