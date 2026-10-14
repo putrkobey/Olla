@@ -43,3 +43,49 @@ func (r *ServiceRegistry) GetStats() (*StatsService, error) {
 }
 
 func (r *ServiceRegistry) GetSecurity() (*SecurityService, error) {
+	service, err := r.Get("security")
+	if err != nil {
+		return nil, err
+	}
+	security, ok := service.(*SecurityService)
+	if !ok {
+		return nil, errors.New("service security is not a SecurityService")
+	}
+	return security, nil
+}
+
+func (r *ServiceRegistry) GetDiscovery() (*DiscoveryService, error) {
+	service, err := r.Get("discovery")
+	if err != nil {
+		return nil, err
+	}
+	discovery, ok := service.(*DiscoveryService)
+	if !ok {
+		return nil, errors.New("service discovery is not a DiscoveryService")
+	}
+	return discovery, nil
+}
+
+func (r *ServiceRegistry) GetProxy() (*ProxyServiceWrapper, error) {
+	service, err := r.Get("proxy")
+	if err != nil {
+		return nil, err
+	}
+	proxy, ok := service.(*ProxyServiceWrapper)
+	if !ok {
+		return nil, errors.New("service proxy is not a ProxyServiceWrapper")
+	}
+	return proxy, nil
+}
+
+func (r *ServiceRegistry) GetHTTP() (*HTTPService, error) {
+	service, err := r.Get("http")
+	if err != nil {
+		return nil, err
+	}
+	http, ok := service.(*HTTPService)
+	if !ok {
+		return nil, errors.New("service http is not a HTTPService")
+	}
+	return http, nil
+}
