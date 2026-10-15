@@ -126,3 +126,518 @@ func benchmarkSmallPayload(b *testing.B, suite ProxyTestSuite) {
 	requestBody := `{"query": "benchmark test", "limit": 10}`
 
 	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("POST", "/api/query", requestBody)
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// benchmarkLargePayload tests performance with large payloads
+func benchmarkLargePayload(b *testing.B, suite ProxyTestSuite) {
+	// 100KB response
+	largeData := strings.Repeat("data", 25000)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(largeData))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("GET", "/api/large", "")
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// benchmarkStreamingResponse tests streaming performance
+func benchmarkStreamingResponse(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(constants.HeaderContentType, constants.ContentTypeText)
+		w.WriteHeader(http.StatusOK)
+
+		flusher := w.(http.Flusher)
+		for i := range 10 {
+			fmt.Fprintf(w, "chunk %d\n", i)
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("GET", "/api/stream", "")
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// benchmarkConcurrentRequests tests performance under concurrent load
+func benchmarkConcurrentRequests(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+			w := httptest.NewRecorder()
+
+			err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+			if err != nil {
+				b.Fatalf("Request failed: %v", err)
+			}
+		}
+	})
+}
+
+// benchmarkHighThroughput tests maximum throughput capabilities
+func benchmarkHighThroughput(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Minimal processing time
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	// Warm up
+	for range 100 {
+		req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+		w := httptest.NewRecorder()
+		proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	// Test with high concurrency
+	const workers = 50
+	var wg sync.WaitGroup
+	requests := make(chan struct{}, b.N)
+
+	for range b.N {
+		requests <- struct{}{}
+	}
+	close(requests)
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range requests {
+				req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+				w := httptest.NewRecorder()
+
+				err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+				if err != nil {
+					b.Errorf("Request failed: %v", err)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+}
+
+// benchmarkErrorHandling tests error path performance
+func benchmarkErrorHandling(b *testing.B, suite ProxyTestSuite) {
+	// Use unreachable endpoint to trigger errors
+	endpoint := createTestEndpoint("bench", "http://localhost:99999", domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+		w := httptest.NewRecorder()
+
+		// This should fail quickly
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err == nil {
+			b.Fatal("Expected error but got none")
+		}
+	}
+}
+
+// benchmarkConfigUpdates tests configuration update performance
+func benchmarkConfigUpdates(b *testing.B, suite ProxyTestSuite) {
+	discovery := &mockDiscoveryService{}
+	selector := &mockEndpointSelector{}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	// Create alternate configs for updates
+	var configs []ports.ProxyConfiguration
+	if suite.Name() == "Sherpa" {
+		for i := range 10 {
+			configs = append(configs, &Configuration{
+				ResponseTimeout:  time.Duration(i+1) * time.Second,
+				ReadTimeout:      time.Duration(i+1) * time.Second,
+				StreamBufferSize: (i + 1) * 1024,
+			})
+		}
+	} else {
+		for i := range 10 {
+			configs = append(configs, &Configuration{
+				ResponseTimeout:  time.Duration(i+1) * time.Second,
+				ReadTimeout:      time.Duration(i+1) * time.Second,
+				StreamBufferSize: (i + 1) * 1024,
+				MaxIdleConns:     (i + 1) * 10,
+				IdleConnTimeout:  time.Duration(i+1) * 10 * time.Second,
+				MaxConnsPerHost:  (i + 1) * 5,
+			})
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		configIndex := i % len(configs)
+		proxy.UpdateConfig(configs[configIndex])
+	}
+}
+
+// benchmarkStatsCollection tests statistics collection performance
+func benchmarkStatsCollection(b *testing.B, suite ProxyTestSuite) {
+	discovery := &mockDiscoveryService{}
+	selector := &mockEndpointSelector{}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for range b.N {
+		_, err := proxy.GetStats(context.Background())
+		if err != nil {
+			b.Fatalf("GetStats failed: %v", err)
+		}
+	}
+}
+
+// benchmarkHeaderProcessing tests header copying performance
+func benchmarkHeaderProcessing(b *testing.B, suite ProxyTestSuite) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+	discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+	selector := &mockEndpointSelector{endpoint: endpoint}
+	collector := createTestStatsCollector()
+	config := suite.CreateConfig()
+
+	proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		req, stats, rlog := createTestRequestWithBody("POST", "/api/test", `{"data": "test"}`)
+		// Add multiple headers to test header processing performance
+		req.Header.Set(constants.HeaderContentType, constants.ContentTypeJSON)
+		req.Header.Set("Authorization", "Bearer token123")
+		req.Header.Set("User-Agent", "benchmark-client/1.0")
+		req.Header.Set(constants.HeaderAccept, constants.ContentTypeJSON)
+		req.Header.Set("Accept-Encoding", "gzip, deflate")
+		req.Header.Set("X-Request-ID", fmt.Sprintf("req-%d", i))
+		req.Header.Set("X-Custom-Header", "custom-value")
+
+		w := httptest.NewRecorder()
+
+		err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+		if err != nil {
+			b.Fatalf("Request failed: %v", err)
+		}
+	}
+}
+
+// BenchmarkProxyStats benchmarks statistics collection separately
+func BenchmarkProxyStats(b *testing.B) {
+	suites := []ProxyTestSuite{
+		SherpaTestSuite{},
+		OllaTestSuite{},
+	}
+
+	for _, suite := range suites {
+		b.Run(suite.Name()+"_GetStats", func(b *testing.B) {
+			discovery := &mockDiscoveryService{}
+			selector := &mockEndpointSelector{}
+			collector := createTestStatsCollector()
+			config := suite.CreateConfig()
+
+			proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for range b.N {
+				_, err := proxy.GetStats(context.Background())
+				if err != nil {
+					b.Fatalf("GetStats failed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkErrorFunction benchmarks the error handling function
+func BenchmarkErrorFunction(b *testing.B) {
+	testErrors := []error{
+		context.Canceled,
+		context.DeadlineExceeded,
+		io.EOF,
+		errors.New("connection refused"),
+		errors.New("connection reset"),
+		errors.New("no such host"),
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := range b.N {
+		err := testErrors[i%len(testErrors)]
+		duration := time.Duration(i%1000) * time.Millisecond
+		_ = makeUserFriendlyError(err, duration, "benchmark", 30*time.Second)
+	}
+}
+
+// BenchmarkMemoryUsage provides memory usage comparison
+func BenchmarkMemoryUsage(b *testing.B) {
+	suites := []ProxyTestSuite{
+		SherpaTestSuite{},
+		OllaTestSuite{},
+	}
+
+	for _, suite := range suites {
+		b.Run(suite.Name()+"_MemoryAllocations", func(b *testing.B) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("ok"))
+			}))
+			defer upstream.Close()
+
+			endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+			discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+			selector := &mockEndpointSelector{endpoint: endpoint}
+			collector := createTestStatsCollector()
+			config := suite.CreateConfig()
+
+			proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			for range b.N {
+				req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+				w := httptest.NewRecorder()
+
+				err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+				if err != nil {
+					b.Fatalf("Request failed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkConnectionPooling tests connection pool performance
+func BenchmarkConnectionPooling(b *testing.B) {
+	suites := []ProxyTestSuite{
+		SherpaTestSuite{},
+		OllaTestSuite{},
+	}
+
+	for _, suite := range suites {
+		b.Run(suite.Name()+"_ConnectionReuse", func(b *testing.B) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("ok"))
+			}))
+			defer upstream.Close()
+
+			endpoint := createTestEndpoint("bench", upstream.URL, domain.StatusHealthy)
+			discovery := &mockDiscoveryService{endpoints: []*domain.Endpoint{endpoint}}
+			selector := &mockEndpointSelector{endpoint: endpoint}
+			collector := createTestStatsCollector()
+			config := suite.CreateConfig()
+
+			proxy := suite.CreateProxy(discovery, selector, config, collector)
+
+			b.ResetTimer()
+			b.ReportAllocs()
+
+			// Run concurrent requests to test connection pooling
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					req, stats, rlog := createTestRequestWithBody("GET", "/api/test", "")
+					w := httptest.NewRecorder()
+
+					err := proxy.ProxyRequest(req.Context(), w, req, stats, rlog)
+					if err != nil {
+						b.Fatalf("Request failed: %v", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkCircuitBreaker tests circuit breaker performance
+func BenchmarkCircuitBreaker(b *testing.B) {
+	b.Run("CircuitBreakerCheck", func(b *testing.B) {
+		cb := health.NewCircuitBreaker()
+		endpoint := "http://test-endpoint:8080"
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for i := range b.N {
+			// Alternate between checking state and recording success/failure
+			if i%3 == 0 {
+				cb.IsOpen(endpoint, 2*time.Second)
+			} else if i%3 == 1 {
+				cb.RecordSuccess(endpoint, 0)
+			} else {
+				cb.RecordFailure(endpoint, 0)
+			}
+		}
+	})
+
+	b.Run("CircuitBreakerFailureThreshold", func(b *testing.B) {
+		cb := health.NewCircuitBreaker()
+		endpoint := "http://test-endpoint:8080"
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		for range b.N {
+			// Simulate failure scenarios
+			for range 5 {
+				cb.RecordFailure(endpoint, 0)
+			}
+			cb.IsOpen(endpoint, 2*time.Second)
+			// Reset by recording success
+			cb.RecordSuccess(endpoint, 0)
+		}
+	})
+
+	b.Run("CircuitBreakerConcurrent", func(b *testing.B) {
+		cb := health.NewCircuitBreaker()
+		endpoints := []string{
+			"http://endpoint1:8080",
+			"http://endpoint2:8080",
+			"http://endpoint3:8080",
+		}
+
+		b.ResetTimer()
+		b.ReportAllocs()
+
+		b.RunParallel(func(pb *testing.PB) {
+			i := 0
+			for pb.Next() {
+				endpoint := endpoints[i%len(endpoints)]
+				if i%4 == 0 {
+					cb.IsOpen(endpoint, 2*time.Second)
+				} else if i%4 == 1 {
+					cb.RecordSuccess(endpoint, 0)
+				} else if i%4 == 2 {
+					cb.RecordFailure(endpoint, 0)
+				} else {
+					// Check if should try (inverse of IsOpen)
+					open, _ := cb.IsOpen(endpoint, 2*time.Second)
+					_ = !open
+				}
+				i++
+			}
+		})
+	})
+}
+
+// BenchmarkObjectPools tests object pool performance
+// NOTE: Object pools are internal implementation details in the refactored code.
+// This benchmark is commented out as the pools are no longer directly accessible.
+/*
+func BenchmarkObjectPools(b *testing.B) {
+	b.Run("Olla_BufferPool", func(b *testing.B) {
+		// Buffer pools are now internal to the refactored implementation
+		b.Skip("Buffer pools are now internal to the refactored implementation")
+	})
+
+	b.Run("Olla_RequestContextPool", func(b *testing.B) {
+		// Request context pool is now internal to the refactored implementation
+		b.Skip("Request context pool is now internal to the refactored implementation")
+	})
+}
+*/
