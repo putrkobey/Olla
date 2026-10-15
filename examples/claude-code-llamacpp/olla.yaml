@@ -23,3 +23,28 @@ proxy:
 translators:
   anthropic:
     enabled: true
+    passthrough_enabled: true       # Native Anthropic support in llama.cpp
+    max_message_size: 10485760      # 10MB max request size
+
+# llama.cpp backend discovery
+discovery:
+  type: static
+  static:
+    endpoints:
+      - url: "http://llama-cpp:8080"
+        name: "local-llamacpp"
+        type: "llamacpp"
+        priority: 100
+        model_url: "/v1/models"      # OpenAI-compatible endpoint
+        health_check_url: "/health"  # llama.cpp health endpoint
+        check_interval: 2s
+        check_timeout: 1s
+
+model_registry:
+  type: memory
+  enable_unifier: true
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
