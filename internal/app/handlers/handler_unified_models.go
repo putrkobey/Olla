@@ -60,3 +60,252 @@ type UnifiedModelResponse struct {
 
 // unifiedModelsHandler returns unified model information
 func (a *Application) unifiedModelsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	qry := r.URL.Query()
+
+	// Check if registry supports unified models
+	unifiedRegistry, ok := a.modelRegistry.(*registry.UnifiedMemoryModelRegistry)
+	if !ok {
+		// Fall back to regular models handler
+		a.modelsStatusHandler(w, r)
+		return
+	}
+
+	// Parse query parameters
+	format := qry.Get("format")
+	if format == "" {
+		format = "unified" // Default format
+	}
+
+	// Parse query parameters
+	filters, includeUnavailable, err := a.parseUnifiedModelsQuery(qry)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Get all unified models
+	unifiedModels, err := unifiedRegistry.GetUnifiedModels(ctx)
+	if err != nil {
+		http.Error(w, "Failed to get unified models", http.StatusInternalServerError)
+		return
+	}
+
+	// Filter models based on endpoint health if needed
+	if !includeUnavailable {
+		unifiedModels, err = a.filterModelsByHealth(ctx, unifiedModels)
+		if err != nil {
+			http.Error(w, "Failed to filter models by health", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Get converter for the requested format
+	modelConverter, err := a.converterFactory.GetConverter(format)
+	if err != nil {
+		var qpErr *ports.QueryParameterError
+		if errors.As(err, &qpErr) {
+			http.Error(w, qpErr.Error(), http.StatusBadRequest)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// If endpoint filter is specified by name, resolve to URL
+	if filters.Endpoint != "" {
+		endpoints, epErr := a.repository.GetAll(ctx)
+		if epErr == nil {
+			for _, ep := range endpoints {
+				if ep.Name == filters.Endpoint {
+					filters.Endpoint = ep.URLString
+					break
+				}
+			}
+		}
+	}
+
+	// Convert models to the requested format
+	response, err := modelConverter.ConvertToFormat(unifiedModels, filters)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Note: When include_unavailable=true, the converter already includes
+	// availability info showing endpoint state. The filtering above ensures
+	// only models from healthy endpoints are shown when include_unavailable=false.
+
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// parseUnifiedModelsQuery parses query parameters for unified models endpoint
+func (a *Application) parseUnifiedModelsQuery(qry url.Values) (ports.ModelFilters, bool, error) {
+	filters := ports.ModelFilters{
+		Endpoint: qry.Get("endpoint"),
+		Family:   qry.Get("family"),
+		Type:     qry.Get("type"),
+	}
+
+	// Parse include_unavailable parameter
+	includeUnavailable := false
+	if includeStr := qry.Get("include_unavailable"); includeStr == queryValueTrue {
+		includeUnavailable = true
+	}
+
+	// Parse available filter
+	if availStr := qry.Get("available"); availStr != "" {
+		switch availStr {
+		case queryValueTrue:
+			avail := true
+			filters.Available = &avail
+		case "false":
+			avail := false
+			filters.Available = &avail
+		default:
+			return filters, false, errors.New("invalid value for 'available' parameter. Use 'true' or 'false'")
+		}
+	}
+
+	// Handle legacy capability parameter by mapping to type
+	if capability := qry.Get("capability"); capability != "" {
+		// Map capabilities to types
+		switch strings.ToLower(capability) {
+		case "vision", "multimodal":
+			filters.Type = "vlm"
+		case "embedding", "embeddings", "vector_search":
+			filters.Type = "embeddings"
+		case "chat", "text_generation", "completion":
+			// a capability, not the llm kind: vision models can chat too
+			filters.Capability = "chat"
+		}
+	}
+
+	return filters, includeUnavailable, nil
+}
+
+// filterModelsByHealth filters models to only include those from healthy endpoints
+func (a *Application) filterModelsByHealth(ctx context.Context, models []*domain.UnifiedModel) ([]*domain.UnifiedModel, error) {
+	// Get healthy endpoints
+	healthyEndpoints, err := a.repository.GetHealthy(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a map of healthy endpoint URLs for fast lookup
+	healthyMap := make(map[string]bool)
+	for _, ep := range healthyEndpoints {
+		healthyMap[ep.URLString] = true
+	}
+
+	// Filter models to only include those from healthy endpoints
+	filteredModels := make([]*domain.UnifiedModel, 0)
+	for _, model := range models {
+		hasHealthyEndpoint := false
+		for _, source := range model.SourceEndpoints {
+			if healthyMap[source.EndpointURL] {
+				hasHealthyEndpoint = true
+				break
+			}
+		}
+		if hasHealthyEndpoint {
+			filteredModels = append(filteredModels, model)
+		}
+	}
+
+	return filteredModels, nil
+}
+
+// safeDiskSize safely converts int64 to uint64, handling negative values
+func safeDiskSize(size int64) uint64 {
+	if size < 0 {
+		return 0
+	}
+	return uint64(size)
+}
+
+// buildUnifiedModelSummary converts a UnifiedModel to API summary format
+func (a *Application) buildUnifiedModelSummary(model *domain.UnifiedModel, endpointNames map[string]string) UnifiedModelSummary {
+	summary := UnifiedModelSummary{
+		ID:               model.ID,
+		Family:           model.Family,
+		Variant:          model.Variant,
+		Type:             converter.ModelKind(model),
+		ParameterSize:    model.ParameterSize,
+		ParameterCount:   model.ParameterCount,
+		Quantization:     model.Quantization,
+		Format:           model.Format,
+		Aliases:          model.GetAliasStrings(),
+		Capabilities:     model.Capabilities,
+		MaxContextLength: model.MaxContextLength,
+		TotalDiskSize:    format.Bytes(safeDiskSize(model.DiskSize)),
+		LastSeen:         format.TimeAgo(model.LastSeen),
+		Endpoints:        make([]string, 0, len(model.SourceEndpoints)),
+		LoadedEndpoints:  make([]string, 0),
+	}
+
+	// Process endpoints
+	for _, ep := range model.SourceEndpoints {
+		endpointName := endpointNames[ep.EndpointURL]
+		if endpointName == "" {
+			endpointName = ep.EndpointName // Use the endpoint name from the model
+		}
+
+		summary.Endpoints = append(summary.Endpoints, endpointName)
+
+		if ep.State == "loaded" {
+			summary.LoadedEndpoints = append(summary.LoadedEndpoints, endpointName)
+		}
+	}
+
+	return summary
+}
+
+func (a *Application) unifiedModelByAliasHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Everything after the prefix is the id: Hugging Face style ids such as
+	// BAAI/bge-small-en-v1.5 contain slashes, so taking one path segment can
+	// never resolve them. URL.Path is already decoded exactly once by net/http
+	// (which also rejects malformed escapes before routing), so a raw slash and
+	// %2F are equivalent and %252F stays the literal id "%2F".
+	modelAlias, found := strings.CutPrefix(r.URL.Path, constants.PathOllaModelsPrefix)
+	if !found {
+		http.Error(w, "Invalid path", http.StatusBadRequest)
+		return
+	}
+	if modelAlias == "" || strings.HasSuffix(modelAlias, "/") {
+		http.Error(w, "Model ID or alias required", http.StatusBadRequest)
+		return
+	}
+
+	// Check if registry supports unified models
+	unifiedRegistry, ok := a.modelRegistry.(*registry.UnifiedMemoryModelRegistry)
+	if !ok {
+		http.Error(w, "Unified models not supported", http.StatusNotImplemented)
+		return
+	}
+
+	// Get the unified model
+	model, err := unifiedRegistry.GetUnifiedModel(ctx, modelAlias)
+	if err != nil {
+		http.Error(w, "Model not found", http.StatusNotFound)
+		return
+	}
+
+	// Get endpoint names
+	endpoints, _ := a.repository.GetAll(ctx)
+	endpointNames := make(map[string]string)
+	for _, ep := range endpoints {
+		endpointNames[ep.URLString] = ep.Name
+	}
+
+	// Build response
+	summary := a.buildUnifiedModelSummary(model, endpointNames)
+
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(summary)
+}
