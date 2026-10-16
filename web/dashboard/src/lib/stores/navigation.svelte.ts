@@ -6,3 +6,28 @@
 // so the tab bar kept announcing the old section over the new panel).
 // Panels may still reach navigation, but only via the shared jump helper
 // (lib/jump-to-endpoint.ts), which owns the panel swap, hash push, scroll and
+// focus as one unit. They must not call `navigation.set` directly for tab
+// switching - that stays with NavTabs and the router (including App's
+// boot-time hash restore).
+
+export const SECTIONS = Object.freeze(['overview', 'endpoints', 'models'] as const);
+export type Section = (typeof SECTIONS)[number];
+
+class NavigationStore {
+  #current: Section = $state('overview');
+
+  get current(): Section {
+    return this.#current;
+  }
+
+  get sections(): readonly Section[] {
+    return SECTIONS;
+  }
+
+  set(section: Section): void {
+    if (!SECTIONS.includes(section)) return;
+    this.#current = section;
+  }
+}
+
+export const navigation: NavigationStore = new NavigationStore();
