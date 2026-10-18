@@ -126,3 +126,131 @@ func (a *Application) getProviderEndpoints(ctx context.Context, providerType str
 	providerProfile := a.createProviderProfile(providerType)
 	providerProfile.Path = pr.targetPath
 
+	// Record the provider boundary so the capability refusal judges only hosts the route can reach.
+	if pr.profile != nil {
+		pr.profile.ProviderScope = providerProfile.SupportedBy
+	}
+
+	providerEndpoints := a.filterEndpointsByProfile(endpoints, providerProfile, pr.requestLogger)
+
+	if providerProfile.FailClosedOnNoMatch && len(providerEndpoints) == 0 {
+		// The provider-type filter itself found nothing - short-circuit before
+		// the second filterEndpointsByProfile call below (pr.profile, the
+		// inspector-derived profile) can reach its stage-3 model-routing pass
+		// on an already-empty list. GetRoutableEndpointsForModel consults the
+		// model registry's global endpoint view, independent of the (known
+		// empty) list passed in, and can attach a 503 model_unavailable
+		// RoutingDecision to pr.profile even though the model IS available -
+		// just on a different provider type. writeNoRoutableEndpoints prefers
+		// that decision's status/message over its own provider-type 404,
+		// which would silently mask a same-type outage as "model not found"
+		// instead of "no <type> endpoints available".
+		//
+		// The one decision allowed through is capability_unavailable: a model-less
+		// request whose only capable hosts are down is an outage, not a missing provider.
+		if refusal := a.capabilityRefusal(pr.profile, pr.requestLogger); refusal != nil {
+			pr.profile.RoutingDecision = refusal
+		}
+		return providerEndpoints, nil
+	}
+
+	// If the request has specific requirements (e.g., needs vision support),
+	// apply those filters on top of the provider constraint
+	if pr.profile != nil && len(pr.profile.SupportedBy) > 0 {
+		providerEndpoints = a.filterEndpointsByProfile(providerEndpoints, pr.profile, pr.requestLogger)
+	}
+
+	return providerEndpoints, nil
+}
+
+// filterModelsByProvider ensures model listings only show what's actually available
+// on the requested provider type (e.g., /olla/ollama/models won't show LM Studio models)
+func (a *Application) filterModelsByProvider(ctx context.Context, models []*domain.UnifiedModel, providerType string) ([]*domain.UnifiedModel, error) {
+	endpoints, err := a.repository.GetAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get endpoints: %w", err)
+	}
+
+	providerProfile := a.createProviderProfile(providerType)
+
+	// Need to map endpoint URLs to their types for compatibility checking
+	endpointTypes := make(map[string]string)
+	for _, ep := range endpoints {
+		endpointTypes[ep.URLString] = ep.Type
+	}
+
+	providerModels := make([]*domain.UnifiedModel, 0)
+	for _, model := range models {
+		// Models can be available from multiple sources. Check if any of them
+		// match our provider constraint.
+		hasProvider := false
+		for _, source := range model.SourceEndpoints {
+			if endpointType, ok := endpointTypes[source.EndpointURL]; ok {
+				normalisedType := NormaliseProviderType(endpointType)
+				if providerProfile.IsCompatibleWith(normalisedType) {
+					hasProvider = true
+					break
+				}
+			}
+		}
+		// Model aliases provide another way to determine provider association
+		if !hasProvider {
+			for _, alias := range model.Aliases {
+				normalisedSource := NormaliseProviderType(alias.Source)
+				if providerProfile.IsCompatibleWith(normalisedSource) {
+					hasProvider = true
+					break
+				}
+			}
+		}
+		if hasProvider {
+			providerModels = append(providerModels, model)
+		}
+	}
+
+	return providerModels, nil
+}
+
+// getProviderModels handles the complete flow of fetching models for a provider-specific
+// endpoint (e.g., /olla/ollama/models)
+func (a *Application) getProviderModels(ctx context.Context, providerType string) ([]*domain.UnifiedModel, error) {
+	unifiedRegistry, ok := a.modelRegistry.(*registry.UnifiedMemoryModelRegistry)
+	if !ok {
+		return nil, errors.New("unified models not supported")
+	}
+
+	unifiedModels, err := unifiedRegistry.GetUnifiedModels(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get unified models: %w", err)
+	}
+
+	// Only show models from endpoints that are currently healthy
+	healthyModels, err := a.filterModelsByHealth(ctx, unifiedModels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filter models by health: %w", err)
+	}
+
+	providerModels, err := a.filterModelsByProvider(ctx, healthyModels, providerType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filter models by provider: %w", err)
+	}
+
+	return providerModels, nil
+}
+
+// convertModelsToProviderFormat handles the final transformation step for model listings,
+// converting our internal UnifiedModel format to whatever the client expects (Ollama, OpenAI, etc.)
+func (a *Application) convertModelsToProviderFormat(models []*domain.UnifiedModel, format string) (interface{}, error) {
+	converter, err := a.converterFactory.GetConverter(format)
+	if err != nil {
+		return nil, fmt.Errorf("unsupported format: %w", err)
+	}
+
+	filters := ports.ModelFilters{}
+	response, err := converter.ConvertToFormat(models, filters)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert models: %w", err)
+	}
+
+	return response, nil
+}
