@@ -69,3 +69,219 @@ func NewHTTPModelDiscoveryClientWithDefaults(profileFactory *profile.Factory, lo
 		},
 	}
 }
+
+func (c *HTTPModelDiscoveryClient) DiscoverModels(ctx context.Context, endpoint *domain.Endpoint) (models []*domain.ModelInfo, err error) {
+	defer func() {
+		if err != nil {
+			c.recordError(endpoint.URLString)
+		}
+	}()
+	startTime := time.Now()
+
+	c.updateMetrics(func(m *DiscoveryMetrics) {
+		atomic.AddInt64(&m.TotalDiscoveries, 1)
+	})
+
+	profileType := endpoint.Type
+	if profileType == "" || profileType == domain.ProfileAuto {
+		return c.discoverWithAutoDetection(ctx, endpoint, startTime)
+	}
+
+	platformProfile, err := c.profileFactory.GetProfile(profileType)
+	if err != nil {
+		return nil, NewDiscoveryError(endpoint.URLString, profileType, "get_profile", 0, time.Since(startTime), err)
+	}
+
+	return c.discoverWithProfile(ctx, endpoint, platformProfile, startTime)
+}
+
+// discoverWithAutoDetection tries profiles in order until one succeeds
+func (c *HTTPModelDiscoveryClient) discoverWithAutoDetection(ctx context.Context, endpoint *domain.Endpoint, startTime time.Time) ([]*domain.ModelInfo, error) {
+	// We're going to try profiles in order:
+	//	Ollama → llama.cpp → LM Studio → vLLM → OpenAI Compatible (as a last resort)
+	// Resolution for this may change in the future as more front-ends appear or are added.
+	profileTypes := []string{
+		domain.ProfileOllama,
+		domain.ProfileLlamaCpp,
+		domain.ProfileLmStudio,
+		domain.ProfileVLLM,
+		domain.ProfileOMLX,             // Apple Silicon only; tried after other common servers
+		domain.ProfileOpenAICompatible, /* last ditch effort */
+	}
+
+	var lastErr error
+	for _, profileType := range profileTypes {
+		platformProfile, err := c.profileFactory.GetProfile(profileType)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		models, err := c.discoverWithProfile(ctx, endpoint, platformProfile, startTime)
+		if err == nil {
+			c.logger.InfoWithEndpoint(" Setting up", endpoint.Name, "profile", platformProfile.GetName())
+			return models, nil
+		}
+
+		if ctx.Err() != nil {
+			return nil, err
+		}
+
+		lastErr = err
+	}
+
+	return nil, NewDiscoveryError(endpoint.URLString, domain.ProfileAuto, "auto_detect", 0, time.Since(startTime), lastErr)
+}
+
+// discoverWithProfile performs discovery using a specific platform profile
+func (c *HTTPModelDiscoveryClient) discoverWithProfile(ctx context.Context, endpoint *domain.Endpoint, platformProfile domain.PlatformProfile, startTime time.Time) ([]*domain.ModelInfo, error) {
+	// For specific profiles like OpenAI-compatible, skip model_url override by default
+	// to avoid breaking existing configurations that rely on profile defaults
+	// Issue #86 fix applies mainly to LlamaCpp, Ollama, etc. where users need custom paths
+	var discoveryURL string
+
+	// Skip model_url override for OpenAI-compatible unless it's a custom path
+	// This prevents issues with endpoints like Docker that have /models returning HTML
+	if platformProfile.GetName() == domain.ProfileOpenAICompatible {
+		if endpoint.ModelURLString != "" {
+			// Only use override if it's not a common problematic path
+			// /models often returns HTML in Docker/OpenWebUI setups, not model data
+			if endpoint.ModelURLString != "/v1/models" && endpoint.ModelURLString != "/models" {
+				discoveryURL = endpoint.ModelURLString
+			}
+			// If it's /models, use profile default (/v1/models) instead
+		}
+		// For all other cases, use profile default
+	} else {
+		// For other profiles (Ollama, LlamaCpp, etc.), respect the override
+		// This fixes Issue #86 where users need custom discovery paths
+		if endpoint.ModelURLString != "" {
+			discoveryURL = endpoint.ModelURLString
+		}
+	}
+
+	if discoveryURL == "" {
+		discoveryURL = platformProfile.GetModelDiscoveryURL(endpoint.URLString)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", discoveryURL, http.NoBody)
+	if err != nil {
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "create_request", 0, time.Since(startTime), err)
+	}
+	req.Header.Set("User-Agent", fmt.Sprintf(DefaultUserAgent, version.ShortName, version.Version))
+	req.Header.Set("Accept", DefaultContentType)
+
+	// Apply any per-endpoint custom headers then auth, mirroring what CopyHeaders does on
+	// the proxy path. Without this, authenticated backends 401 during model discovery.
+	for name, value := range endpoint.Headers {
+		req.Header.Set(name, value)
+	}
+	if endpoint.AuthHeaderName != "" {
+		req.Header.Set(endpoint.AuthHeaderName, endpoint.AuthHeaderValue)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		networkErr := &NetworkError{URL: discoveryURL, Err: err}
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "http_request", 0, time.Since(startTime), networkErr)
+	}
+	defer resp.Body.Close()
+
+	duration := time.Since(startTime)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "http_status", resp.StatusCode, duration, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status))
+	}
+
+	// Limit response size to prevent memory issues
+	limitedReader := io.LimitReader(resp.Body, MaxResponseSize+1)
+	body, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, NewDiscoveryError(endpoint.URLString, platformProfile.GetName(), "read_response", resp.StatusCode, duration, err)
+	}
+
+	if len(body) > MaxResponseSize {
+		return nil, NewDiscoveryError(discoveryURL, platformProfile.GetName(), "read_response", resp.StatusCode, duration, fmt.Errorf("model response exceeds %d bytes: %w", MaxResponseSize, ErrResponseTooLarge))
+	}
+
+	models, err := platformProfile.ParseModelsResponse(body)
+	if err != nil {
+		// Include the actual discovery URL in the error for debugging
+		return nil, NewDiscoveryError(discoveryURL, platformProfile.GetName(), "parse_response", resp.StatusCode, duration, &ParseError{Format: platformProfile.GetName(), Err: err})
+	}
+
+	c.updateMetrics(func(m *DiscoveryMetrics) {
+		atomic.AddInt64(&m.SuccessfulRequests, 1)
+		m.LastDiscoveryTime = time.Now()
+
+		// Update average latency using running average
+		if m.SuccessfulRequests == 1 {
+			m.AverageLatency = duration
+		} else {
+			// simplest one for running average for now
+			// TODO: Improve this to use a more robust running average algorithm
+			m.AverageLatency = time.Duration((int64(m.AverageLatency) + int64(duration)) / 2)
+		}
+	})
+
+	return models, nil
+}
+
+func (c *HTTPModelDiscoveryClient) HealthCheck(ctx context.Context, endpoint *domain.Endpoint) error {
+	// Use existing health check URL from endpoint
+	req, err := http.NewRequestWithContext(ctx, "GET", endpoint.HealthCheckURLString, http.NoBody)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("User-Agent", fmt.Sprintf(DefaultUserAgent, version.ShortName, version.Version))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return &NetworkError{URL: endpoint.HealthCheckURLString, Err: err}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("health check failed with status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (c *HTTPModelDiscoveryClient) GetMetrics() DiscoveryMetrics {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	errorsByEndpoint := make(map[string]int64, len(c.metrics.ErrorsByEndpoint))
+	for k, v := range c.metrics.ErrorsByEndpoint {
+		errorsByEndpoint[k] = v
+	}
+
+	return DiscoveryMetrics{
+		TotalDiscoveries:   atomic.LoadInt64(&c.metrics.TotalDiscoveries),
+		SuccessfulRequests: atomic.LoadInt64(&c.metrics.SuccessfulRequests),
+		FailedRequests:     atomic.LoadInt64(&c.metrics.FailedRequests),
+		AverageLatency:     c.metrics.AverageLatency,
+		LastDiscoveryTime:  c.metrics.LastDiscoveryTime,
+		ErrorsByEndpoint:   errorsByEndpoint,
+	}
+}
+
+func (c *HTTPModelDiscoveryClient) recordError(endpointURL string) {
+	c.updateMetrics(func(m *DiscoveryMetrics) {
+		atomic.AddInt64(&m.FailedRequests, 1)
+		m.ErrorsByEndpoint[endpointURL]++
+	})
+}
+
+func (c *HTTPModelDiscoveryClient) updateMetrics(updateFn func(*DiscoveryMetrics)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	updateFn(&c.metrics)
+}
+
+func (c *HTTPModelDiscoveryClient) Close() error {
+	c.httpClient.CloseIdleConnections()
+	return nil
+}
