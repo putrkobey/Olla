@@ -44,3 +44,50 @@ func GetClientIP(r *http.Request, trustProxyHeaders bool, trustedCIDRs []*net.IP
 			return ip
 		}
 		return r.RemoteAddr
+	}
+
+	sourceIP := getSourceIP(r)
+	if sourceIP == nil || !isIPInTrustedCIDRs(sourceIP, trustedCIDRs) {
+		if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			return ip
+		}
+		return r.RemoteAddr
+	}
+
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		return strings.TrimSpace(strings.Split(ip, ",")[0])
+	}
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return strings.TrimSpace(ip)
+	}
+
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip
+	}
+	return r.RemoteAddr
+}
+
+func getSourceIP(r *http.Request) net.IP {
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return net.ParseIP(ip)
+	}
+	return net.ParseIP(r.RemoteAddr)
+}
+
+func StripRoutePrefix(ctx context.Context, path, prefix string) string {
+	if routePrefix, ok := ctx.Value(prefix).(string); ok {
+		return StripPrefix(path, routePrefix)
+	}
+	return path
+}
+
+func StripPrefix(path, prefix string) string {
+	if strings.HasPrefix(path, prefix) {
+		stripped := path[len(prefix):]
+		if stripped == "" || stripped[0] != '/' {
+			stripped = "/" + stripped
+		}
+		return stripped
+	}
+	return path
+}
