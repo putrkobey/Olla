@@ -60,3 +60,127 @@ func (fc *FilterConfig) HasIncludeAll() bool {
 
 // Validate checks if the filter configuration is valid
 func (fc *FilterConfig) Validate() error {
+	// Check for invalid patterns
+	for _, pattern := range fc.Include {
+		if err := validatePattern(pattern); err != nil {
+			return fmt.Errorf("invalid include pattern '%s': %w", pattern, err)
+		}
+	}
+
+	for _, pattern := range fc.Exclude {
+		if err := validatePattern(pattern); err != nil {
+			return fmt.Errorf("invalid exclude pattern '%s': %w", pattern, err)
+		}
+	}
+
+	return nil
+}
+
+// validatePattern checks if a glob pattern is valid
+func validatePattern(pattern string) error {
+	if strings.TrimSpace(pattern) == "" {
+		return errors.New("empty or whitespace-only pattern")
+	}
+
+	// Check for invalid characters or patterns
+	// We support simple glob patterns with * wildcard
+	if strings.Contains(pattern, "**") {
+		return errors.New("double asterisk not supported")
+	}
+
+	// Count asterisks - we support at most one at start and/or end
+	asteriskCount := strings.Count(pattern, "*")
+	if asteriskCount > 2 {
+		return errors.New("too many wildcards")
+	}
+
+	if asteriskCount == 1 {
+		// Single wildcard should be at start or end
+		if !strings.HasPrefix(pattern, "*") && !strings.HasSuffix(pattern, "*") {
+			return errors.New("wildcards only supported at start and/or end")
+		}
+	} else if asteriskCount == 2 {
+		// Two wildcards should only be at start and end for *text* pattern
+		if !strings.HasPrefix(pattern, "*") || !strings.HasSuffix(pattern, "*") {
+			return errors.New("wildcards only supported at start and/or end")
+		}
+	}
+
+	return nil
+}
+
+// Clone creates a deep copy of the FilterConfig
+func (fc *FilterConfig) Clone() *FilterConfig {
+	if fc == nil {
+		return nil
+	}
+
+	clone := &FilterConfig{}
+
+	if fc.Include != nil {
+		clone.Include = make([]string, len(fc.Include))
+		copy(clone.Include, fc.Include)
+	}
+
+	if fc.Exclude != nil {
+		clone.Exclude = make([]string, len(fc.Exclude))
+		copy(clone.Exclude, fc.Exclude)
+	}
+
+	return clone
+}
+
+// Merge combines this filter config with another, combining both Include and Exclude patterns
+func (fc *FilterConfig) Merge(other *FilterConfig) *FilterConfig {
+	if other == nil {
+		return fc.Clone()
+	}
+
+	if fc == nil {
+		return other.Clone()
+	}
+
+	merged := &FilterConfig{}
+
+	// For Include: combine both (union of inclusions)
+	includeMap := make(map[string]bool)
+	if fc.Include != nil {
+		for _, pattern := range fc.Include {
+			includeMap[pattern] = true
+		}
+	}
+	if other.Include != nil {
+		for _, pattern := range other.Include {
+			includeMap[pattern] = true
+		}
+	}
+
+	if len(includeMap) > 0 {
+		merged.Include = make([]string, 0, len(includeMap))
+		for pattern := range includeMap {
+			merged.Include = append(merged.Include, pattern)
+		}
+	}
+
+	// For Exclude: combine both (union of exclusions)
+	excludeMap := make(map[string]bool)
+	if fc.Exclude != nil {
+		for _, pattern := range fc.Exclude {
+			excludeMap[pattern] = true
+		}
+	}
+	if other.Exclude != nil {
+		for _, pattern := range other.Exclude {
+			excludeMap[pattern] = true
+		}
+	}
+
+	if len(excludeMap) > 0 {
+		merged.Exclude = make([]string, 0, len(excludeMap))
+		for pattern := range excludeMap {
+			merged.Exclude = append(merged.Exclude, pattern)
+		}
+	}
+
+	return merged
+}
