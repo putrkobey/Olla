@@ -4,3 +4,17 @@
 // plugin rewrites .css imports even with ?raw. Declaring only the handful of
 // members that test uses keeps @types/node out of the dependency list.
 declare module 'node:fs' {
+  export function readFileSync(path: string, encoding: string): string;
+}
+
+declare module 'node:path' {
+  const path: {
+    join(...parts: string[]): string;
+    dirname(p: string): string;
+  };
+  export default path;
+}
+
+declare module 'node:url' {
+  export function fileURLToPath(url: string | URL): string;
+}
