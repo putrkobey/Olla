@@ -76,3 +76,238 @@ func (s *DiscoveryService) Start(ctx context.Context) error {
 	// Create model registry using factory with configuration
 	if s.registryConfig == nil {
 		// Fallback to default if no config provided
+		s.registry = registry.NewMemoryModelRegistry(s.logger)
+	} else {
+		registryConfig := registry.RegistryConfig{
+			Type:            s.registryConfig.Type,
+			EnableUnifier:   s.registryConfig.EnableUnifier,
+			UnificationConf: &s.registryConfig.Unification,
+			// Routing strategy must be forwarded so the configured type (strict,
+			// optimistic, discovery) takes effect. Without this, registries fall
+			// back to strict regardless of what the operator configured.
+			RoutingStrategy: &s.registryConfig.RoutingStrategy,
+		}
+		var err error
+		s.registry, err = registry.NewModelRegistry(registryConfig, s.logger)
+		if err != nil {
+			return fmt.Errorf("failed to create model registry: %w", err)
+		}
+	}
+
+	switch s.config.Type {
+	case "static":
+		staticRepo := discovery.NewStaticEndpointRepository()
+		if err := staticRepo.LoadFromConfig(ctx, s.config.Static.Endpoints); err != nil {
+			return fmt.Errorf("failed to load endpoints from config: %w", err)
+		}
+		s.endpointRepo = staticRepo
+	default:
+		return fmt.Errorf("unsupported discovery type: %s", s.config.Type)
+	}
+
+	s.healthChecker = health.NewHTTPHealthCheckerWithDefaults(s.endpointRepo, s.logger)
+
+	// Purge sticky session entries for any backend that goes offline. The purgeFn is
+	// nil when sticky sessions are disabled, making this callback a cheap no-op then.
+	s.healthChecker.SetUnhealthyCallback(health.UnhealthyCallbackFunc(func(ctx context.Context, _ *domain.Endpoint) {
+		fn := s.purgeDeadFn.Load()
+		if fn == nil {
+			return
+		}
+		routable, err := s.endpointRepo.GetRoutable(ctx)
+		if err != nil {
+			s.logger.Warn("Failed to fetch routable endpoints for sticky session purge", "error", err)
+			return
+		}
+		(*fn)(routable)
+	}))
+
+	if err := s.healthChecker.StartChecking(ctx); err != nil {
+		return fmt.Errorf("failed to start health checker: %w", err)
+	}
+
+	// Critical: Run initial health check to validate endpoints immediately.
+	// This prevents the proxy from starting with no healthy endpoints.
+	if err := s.healthChecker.RunHealthCheck(ctx, true); err != nil {
+		s.logger.Warn("Failed to force initial health check", "error", err)
+	}
+
+	endpoints, err := s.endpointRepo.GetAll(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get endpoints: %w", err)
+	}
+
+	for _, endpoint := range endpoints {
+		s.logger.Info("Endpoint registered",
+			"name", endpoint.Name,
+			"url", endpoint.URLString,
+			"priority", endpoint.Priority)
+	}
+
+	if s.config.ModelDiscovery.Enabled {
+		httpClient := newDiscoveryHTTPClient(s.config.ModelDiscovery.Timeout)
+		profileFactory, err := profile.NewFactoryWithDefaults()
+		if err != nil {
+			return fmt.Errorf("failed to create profile factory: %w", err)
+		}
+		client := discovery.NewHTTPModelDiscoveryClient(profileFactory, s.logger, httpClient)
+		discoveryConfig := discovery.DiscoveryConfig{
+			Interval:          s.config.ModelDiscovery.Interval,
+			Timeout:           s.config.ModelDiscovery.Timeout,
+			ConcurrentWorkers: s.config.ModelDiscovery.ConcurrentWorkers,
+			RetryAttempts:     s.config.ModelDiscovery.RetryAttempts,
+			RetryBackoff:      s.config.ModelDiscovery.RetryBackoff,
+		}
+		s.modelDiscovery = discovery.NewModelDiscoveryService(client, s.endpointRepo, s.registry, discoveryConfig, s.logger)
+
+		// Set up recovery callback to trigger model discovery when endpoints recover
+		s.healthChecker.SetRecoveryCallback(health.RecoveryCallbackFunc(func(ctx context.Context, endpoint *domain.Endpoint) error {
+			s.logger.Info("Triggering model discovery for recovered endpoint",
+				"endpoint", endpoint.Name,
+				"url", endpoint.GetURLString())
+
+			// Discover models for the recovered endpoint
+			if err := s.modelDiscovery.DiscoverEndpoint(ctx, endpoint); err != nil {
+				s.logger.Warn("Failed to discover models for recovered endpoint",
+					"endpoint", endpoint.Name,
+					"error", err)
+				return err
+			}
+
+			s.logger.Info("Successfully refreshed models for recovered endpoint",
+				"endpoint", endpoint.Name)
+			return nil
+		}))
+
+		if err := s.modelDiscovery.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start model discovery: %w", err)
+		}
+
+		// Run initial model discovery to populate the catalogue immediately
+		if err := s.modelDiscovery.DiscoverAll(ctx); err != nil {
+			s.logger.Warn("Initial model discovery failed", "error", err)
+		}
+	}
+
+	s.logger.Info("Discovery service initialised",
+		"type", s.config.Type,
+		"endpoints", len(endpoints))
+
+	return nil
+}
+
+// Stop gracefully shuts down discovery components
+func (s *DiscoveryService) Stop(ctx context.Context) error {
+	s.logger.Info(" Stopping discovery service")
+
+	defer func() {
+		s.logger.ResetLine()
+		s.logger.InfoWithStatus("Stopping discovery service", "OK")
+	}()
+	if s.healthChecker != nil {
+		if err := s.healthChecker.StopChecking(ctx); err != nil {
+			s.logger.Warn("  Failed to stop health checker", "error", err)
+		}
+	}
+
+	if s.modelDiscovery != nil {
+		if err := s.modelDiscovery.Stop(ctx); err != nil {
+			s.logger.Warn("  Failed to stop model discovery", "error", err)
+		}
+	}
+	return nil
+}
+
+// Dependencies returns service dependencies
+func (s *DiscoveryService) Dependencies() []string {
+	return []string{"stats"}
+}
+
+// GetRegistry returns the model registry
+func (s *DiscoveryService) GetRegistry() (domain.ModelRegistry, error) {
+	if s.registry == nil {
+		return nil, errors.New("model registry not initialised")
+	}
+	return s.registry, nil
+}
+
+// GetEndpointRepository returns the endpoint repository
+func (s *DiscoveryService) GetEndpointRepository() (domain.EndpointRepository, error) {
+	if s.endpointRepo == nil {
+		return nil, errors.New("endpoint repository not initialised")
+	}
+	return s.endpointRepo, nil
+}
+
+// GetHealthChecker returns the health checker
+func (s *DiscoveryService) GetHealthChecker() (*health.HTTPHealthChecker, error) {
+	if s.healthChecker == nil {
+		return nil, errors.New("health checker not initialised")
+	}
+	return s.healthChecker, nil
+}
+
+// GetDiscoveryService returns itself as a ports.DiscoveryService
+func (s *DiscoveryService) GetDiscoveryService() (ports.DiscoveryService, error) {
+	if s.registry == nil || s.endpointRepo == nil {
+		return nil, errors.New("discovery service not fully initialised")
+	}
+	return s, nil
+}
+
+// GetHealthyEndpoints implements ports.DiscoveryService
+func (s *DiscoveryService) GetHealthyEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	if s.endpointRepo == nil {
+		return nil, errors.New("endpoint repository not initialized")
+	}
+	return s.endpointRepo.GetHealthy(ctx)
+}
+
+// GetEndpoints implements ports.DiscoveryService
+func (s *DiscoveryService) GetEndpoints(ctx context.Context) ([]*domain.Endpoint, error) {
+	if s.endpointRepo == nil {
+		return nil, errors.New("endpoint repository not initialized")
+	}
+	return s.endpointRepo.GetAll(ctx)
+}
+
+// RefreshEndpoints implements ports.DiscoveryService
+func (s *DiscoveryService) RefreshEndpoints(ctx context.Context) error {
+	// For static discovery, endpoints don't change, so this is a no-op
+	// In a dynamic discovery implementation, this would refresh from the discovery source
+	return nil
+}
+
+// SetStatsService sets the stats service dependency
+func (s *DiscoveryService) SetStatsService(statsService *StatsService) {
+	s.statsService = statsService
+}
+
+// SetPurgeDeadEndpointsFn registers a function to call with the current routable
+// endpoint list whenever a backend transitions to unhealthy. Used by the proxy layer
+// to evict sticky session entries for dead backends without waiting for TTL expiry.
+func (s *DiscoveryService) SetPurgeDeadEndpointsFn(fn func([]*domain.Endpoint)) {
+	s.purgeDeadFn.Store(&fn)
+}
+
+// UpdateEndpointStatus updates the status of an endpoint in the repository
+func (s *DiscoveryService) UpdateEndpointStatus(ctx context.Context, endpoint *domain.Endpoint) error {
+	if s.endpointRepo == nil {
+		return errors.New("endpoint repository not initialized")
+	}
+	return s.endpointRepo.UpdateEndpoint(ctx, endpoint)
+}
+
+// newDiscoveryHTTPClient builds the client model discovery uses. Discovery sends
+// the endpoint's auth and custom headers, so it must not route through an
+// environment proxy or follow a redirect to another host; both come from the
+// shared backend constructor. Timeout is the configured per-request budget.
+func newDiscoveryHTTPClient(timeout time.Duration) *http.Client {
+	return factory.NewBackendHTTPClient(factory.BackendClientOptions{
+		Timeout:             timeout,
+		MaxIdleConns:        discovery.DefaultMaxIdleConnections,
+		MaxIdleConnsPerHost: discovery.DefaultMaxIdleConnectionsPerHost,
+		IdleConnTimeout:     discovery.DefaultIdleConnTimeout,
+		TLSHandshakeTimeout: 10 * time.Second,
+	})
+}
