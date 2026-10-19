@@ -80,3 +80,167 @@ func (t *Translator) GetAPIPath() string {
 	return "/olla/anthropic/v1/messages"
 }
 
+// TranslationTargetPath implements translator.TargetPathProvider: the OpenAI
+// path an Anthropic request is translated onto when it cannot be passed through.
+func (t *Translator) TranslationTargetPath() string {
+	return openAIChatCompletionsPath
+}
+
+// MaxBodySize implements BodySizeLimiter so the handler can apply the
+// translator's configured limit when reading the request body, rather
+// than hardcoding a value.
+func (t *Translator) MaxBodySize() int64 {
+	return t.maxMessageSize
+}
+
+// getSessionID extracts the session ID from the request using a fallback chain.
+// this ensures we always have a valid session id for request tracking:
+// 1. try the configured session header (for custom session management)
+// 2. if there's none, fall back to X-Request-ID (standard request correlation)
+// 3. if that's still no go we, use default constant
+// the chain exists because different callers may use different correlation mechanisms.
+func (t *Translator) getSessionID(r *http.Request) string {
+	const HeaderRequestId = "X-Request-ID"
+
+	sessionID := r.Header.Get(t.inspector.GetSessionHeader())
+	if sessionID == "" {
+		sessionID = r.Header.Get(HeaderRequestId)
+		if sessionID == "" {
+			sessionID = defaultSessionID
+		}
+	}
+
+	return sessionID
+}
+
+// forEachSystemContentBlock iterates over system prompt content blocks regardless of input format.
+// This is a convenience wrapper around the standalone forEachSystemBlock function.
+// See forEachSystemBlock in token_count.go for the implementation details.
+func (t *Translator) forEachSystemContentBlock(system interface{}, fn func(block ContentBlock) error) error {
+	return forEachSystemBlock(system, fn)
+}
+
+// WriteError implements ErrorWriter interface for Anthropic-specific error formatting
+// Formats errors according to Anthropic's error schema
+// See: https://docs.anthropic.com/claude/reference/errors
+func (t *Translator) WriteError(w http.ResponseWriter, err error, statusCode int) {
+	t.logger.Error("Anthropic request failed",
+		"error", err.Error(),
+		"status", statusCode)
+	t.WriteErrorQuiet(w, err, statusCode)
+}
+
+// WriteErrorQuiet writes the same error response as WriteError without the ERROR log line,
+// for rejections the caller already reports through a sampled log.
+func (t *Translator) WriteErrorQuiet(w http.ResponseWriter, err error, statusCode int) {
+	// Map HTTP status codes to Anthropic error types.
+	// overloaded_error is reserved for Anthropic's own infrastructure being overloaded;
+	// a generic backend 503 is an api_error per litellm and bifrost conventions.
+	// timeout_error maps to 504/408 as defined by litellm and the Anthropic error taxonomy.
+	errorType := "api_error"
+	switch statusCode {
+	case http.StatusBadRequest:
+		errorType = "invalid_request_error"
+	case http.StatusUnauthorized:
+		errorType = "authentication_error"
+	case http.StatusForbidden:
+		errorType = "permission_error"
+	case http.StatusNotFound:
+		errorType = "not_found_error"
+	case http.StatusRequestEntityTooLarge:
+		// Anthropic error taxonomy: oversized request body maps to request_too_large.
+		errorType = "request_too_large"
+	case http.StatusTooManyRequests:
+		errorType = "rate_limit_error"
+	case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+		errorType = "timeout_error"
+	}
+
+	// Anthropic error format
+	errorResp := map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    errorType,
+			"message": err.Error(),
+		},
+	}
+
+	// Best-effort: propagate the Olla request ID into the Anthropic error envelope.
+	// SDKs read the request-id response header and the top-level request_id body field
+	// for correlation. Only set when the header was already written by the handler.
+	if reqID := w.Header().Get(constants.HeaderXOllaRequestID); reqID != "" {
+		w.Header().Set("request-id", reqID)
+		errorResp["request_id"] = reqID
+	}
+
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.WriteHeader(statusCode)
+
+	if encErr := json.NewEncoder(w).Encode(errorResp); encErr != nil {
+		t.logger.Error("Failed to write error response", "error", encErr)
+	}
+}
+
+// CanPassthrough implements PassthroughCapable interface.
+// The caller is responsible for pre-filtering the endpoint list to only those
+// backends with native Anthropic support (AnthropicSupportConfig.Enabled == true).
+// This method simply confirms passthrough is configured and at least one capable
+// endpoint is available. The profileLookup parameter is accepted to satisfy the
+// interface contract; it is unused here because the filtering has already happened.
+func (t *Translator) CanPassthrough(endpoints []*domain.Endpoint, _ translator.ProfileLookup) bool {
+	if !t.config.PassthroughEnabled {
+		return false
+	}
+
+	if len(endpoints) == 0 {
+		t.logger.Debug("No Anthropic-capable endpoints available for passthrough")
+		return false
+	}
+
+	t.logger.Debug("Anthropic passthrough available", "capable_endpoints", len(endpoints))
+	return true
+}
+
+// PreparePassthrough implements PassthroughCapable interface.
+// Validates the already-buffered request body for direct forwarding to backends.
+// Returns the original body bytes, target path, model name, and streaming flag.
+// profileLookup is reserved for future per-endpoint path customisation.
+func (t *Translator) PreparePassthrough(bodyBytes []byte, r *http.Request, _ translator.ProfileLookup) (*translator.PassthroughRequest, error) {
+	// Enforce the translator's size limit on the pre-buffered body.
+	// The handler applies its own LimitReader when reading, but we guard
+	// here as well so the translator's configured limit is authoritative.
+	if int64(len(bodyBytes)) > t.maxMessageSize {
+		return nil, fmt.Errorf("request body exceeds maximum size (%d bytes)", t.maxMessageSize)
+	}
+
+	// Validate the request structure
+	var anthropicReq AnthropicRequest
+	if err := json.Unmarshal(bodyBytes, &anthropicReq); err != nil {
+		return nil, fmt.Errorf("invalid Anthropic request: %w", err)
+	}
+
+	// Validate required fields and constraints
+	if err := anthropicReq.Validate(); err != nil {
+		return nil, fmt.Errorf("request validation failed: %w", err)
+	}
+
+	// Log request to inspector if enabled
+	if t.inspector.Enabled() {
+		sessionID := t.getSessionID(r)
+		if lerr := t.inspector.LogRequest(sessionID, anthropicReq.Model, bodyBytes); lerr != nil {
+			t.logger.Warn("Failed to log request to inspector", "error", lerr)
+		}
+	}
+
+	t.logger.Debug("Prepared request for passthrough",
+		"model", anthropicReq.Model,
+		"streaming", anthropicReq.Stream,
+		"body_size", len(bodyBytes))
+
+	return &translator.PassthroughRequest{
+		Body:        bodyBytes,
+		TargetPath:  "/v1/messages",
+		ModelName:   anthropicReq.Model,
+		IsStreaming: anthropicReq.Stream,
+	}, nil
+}
