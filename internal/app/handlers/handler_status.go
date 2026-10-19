@@ -321,3 +321,327 @@ func (a *Application) buildUnifiedEndpoints(all []*domain.Endpoint, statsMap map
 			Connections: connections,
 			Requests:    requests,
 			SuccessRate: format.Percentage(successRate),
+			AvgLatency:  format.Latency(avgLatency),
+			Traffic:     traffic,
+			LastCheck:   format.TimeAgo(endpoint.LastChecked),
+			NextCheck:   format.TimeUntil(endpoint.NextCheckTime),
+			Models:      modelDisco,
+			Issues:      a.getEndpointIssues(endpoint, stats, hasStats, successRate),
+			ID:          endpointIDs[url],
+			URL:         sanitiseDisplayURL(url),
+		}
+
+		// Additive absolute timestamps alongside the existing relative strings.
+		if !endpoint.LastChecked.IsZero() {
+			lc := endpoint.LastChecked
+			endpoints[i].HealthCheckAt = &lc
+		}
+		if !endpoint.NextCheckTime.IsZero() {
+			nc := endpoint.NextCheckTime
+			endpoints[i].NextCheckAt = &nc
+		}
+
+		// Raw latency in ms alongside the formatted AvgLatency string. Only
+		// meaningful under traffic; min/max match the plain-zero convention of
+		// Requests, avg is a pointer so a no-traffic endpoint omits the field.
+		if hasStats && stats.TotalRequests > 0 {
+			endpoints[i].MinLatencyMs = stats.MinLatency
+			endpoints[i].MaxLatencyMs = stats.MaxLatency
+			avgMs := stats.AverageLatency
+			endpoints[i].AvgLatencyMs = &avgMs
+		}
+	}
+
+	sort.Slice(endpoints, func(i, j int) bool {
+		if endpoints[i].Priority != endpoints[j].Priority {
+			return endpoints[i].Priority > endpoints[j].Priority
+		}
+		// Within a priority band, healthy comes before anything else.
+		iHealthy := endpoints[i].Status == statusHealthy
+		jHealthy := endpoints[j].Status == statusHealthy
+		if iHealthy != jHealthy {
+			return iHealthy
+		}
+		// Tie-breaker for deterministic ordering across polls: the input
+		// slice comes from map iteration, so without a final comparison
+		// equal-priority same-health endpoints reorder between polls purely
+		// from map-iteration randomisation. Name first, then ID for the
+		// pathological case of two endpoints sharing a name. ID (not the
+		// sanitised URL) because sanitisation strips query/fragment and two
+		// distinct endpoints can share a display URL, which would leave the
+		// comparison tied and ordering unstable again.
+		if endpoints[i].Name != endpoints[j].Name {
+			return endpoints[i].Name < endpoints[j].Name
+		}
+		return endpoints[i].ID < endpoints[j].ID
+	})
+}
+
+func (a *Application) buildSecuritySummary(stats ports.SecurityStats) SecuritySummary {
+	var status string
+	totalViolations := stats.RateLimitViolations + stats.SizeLimitViolations
+
+	if totalViolations > 100 || stats.UniqueRateLimitedIPs > 10 {
+		status = statusElevated
+	} else {
+		status = statusNormal
+	}
+
+	return SecuritySummary{
+		Violations: SecurityViolation{
+			RateLimits: stats.RateLimitViolations,
+			SizeLimits: stats.SizeLimitViolations,
+		},
+		BlockedIPs: stats.UniqueRateLimitedIPs,
+		Status:     status,
+	}
+}
+
+func (a *Application) getEndpointIssues(endpoint *domain.Endpoint, stats ports.EndpointStats, hasStats bool, successRate float64) string {
+	issues := make([]string, 0, 4)
+
+	if endpoint.ConsecutiveFailures > 3 {
+		issues = append(issues, "consecutive failures")
+	}
+
+	if hasStats {
+		if successRate < 90.0 && stats.TotalRequests > 10 {
+			issues = append(issues, "low success rate")
+		}
+		if stats.AverageLatency > 5000 {
+			issues = append(issues, "high latency")
+		}
+	}
+
+	if endpoint.Status == domain.StatusOffline || endpoint.Status == domain.StatusUnhealthy {
+		issues = append(issues, "unavailable")
+	}
+
+	if len(issues) == 0 {
+		return emptyString
+	}
+
+	return strings.Join(issues, ", ")
+}
+
+func (a *Application) getEndpointCounts(ctx context.Context) (all, healthy, routable []*domain.Endpoint, err error) {
+	if all, err = a.repository.GetAll(ctx); err != nil {
+		return
+	}
+	if healthy, err = a.repository.GetHealthy(ctx); err != nil {
+		return
+	}
+	if routable, err = a.repository.GetRoutable(ctx); err != nil {
+		return
+	}
+	return
+}
+
+// etagSep terminates each hashed field so adjacent fields cannot collide:
+// without it ("ab"+"c") and ("a"+"bc") would feed the hash identical bytes.
+var etagSep = []byte{0}
+
+// hashEtagString writes a string field to the ETag hasher. Writes never error
+// for fnv's hasher, the discarded error keeps the hash.Hash contract visible.
+func hashEtagString(h hash.Hash, s string) {
+	_, _ = h.Write([]byte(s))
+	_, _ = h.Write(etagSep)
+}
+
+// hashEtagInt64 writes an integer field in base 10. Locale-independent so the
+// ETag stays stable regardless of runtime environment.
+func hashEtagInt64(h hash.Hash, v int64) {
+	var buf [20]byte
+	_, _ = h.Write(strconv.AppendInt(buf[:0], v, 10))
+	_, _ = h.Write(etagSep)
+}
+
+// hashEtagInt64Ptr encodes presence: a nil pointer emits a distinct field
+// boundary from a zero, mirroring omitempty semantics in the wire payload.
+func hashEtagInt64Ptr(h hash.Hash, v *int64) {
+	if v == nil {
+		_, _ = h.Write(etagSep)
+		return
+	}
+	hashEtagInt64(h, *v)
+}
+
+// hashEtagTime encodes a wall-clock instant via UnixNano. Only absolute event
+// times reach this path; the relative time-ago / time-until renderings used in
+// the dashboard (uptime, last_check, next_check, last_seen, last_model_sync)
+// are deliberately excluded from the hash because their one-second granularity
+// would change on every poll and defeat the ETag.
+func hashEtagTime(h hash.Hash, t time.Time) {
+	if t.IsZero() {
+		_, _ = h.Write(etagSep)
+		return
+	}
+	hashEtagInt64(h, t.UnixNano())
+}
+
+func hashEtagTimePtr(h hash.Hash, t *time.Time) {
+	if t == nil {
+		_, _ = h.Write(etagSep)
+		return
+	}
+	hashEtagTime(h, *t)
+}
+
+// hashEtagStringSlice encodes a slice in order. Callers must guarantee the
+// slice is already sorted deterministically; the dashboard's model/endpoint
+// slices all sort before serialisation for diffable output across polls.
+func hashEtagStringSlice(h hash.Hash, s []string) {
+	for _, x := range s {
+		hashEtagString(h, x)
+	}
+	_, _ = h.Write(etagSep)
+}
+
+// formatEtag renders the FNV-1a sum as a quoted WEAK validator per RFC 7232:
+// the hashed fields exclude every per-second-rendered relative string and the
+// wall-clock timestamp, so two payloads a second apart under unchanged state
+// hash identically - but the hash still intentionally omits some fields that
+// could change without changing the operator-visible answer (e.g. field
+// ordering), so it is not a true content identity. Weak is the honest claim:
+// clients may use it for If-None-Match but must not collapse two distinct
+// payloads based on byte-for-byte identity. Base36 mirrors the style of
+// stableEndpointID so client and server identity formats read the same.
+// 64-bit (not 32-bit): these ETags cover a growing, unbounded field set
+// (endpoints, models) where a 32-bit sum's collision odds stop being
+// negligible at realistic fleet sizes; stableEndpointID's 32-bit identity
+// hash is unrelated and deliberately left alone (wire-visible IDs, not
+// cache-validation hashes).
+func formatEtag(h hash.Hash64) string {
+	return `W/"` + strconv.FormatUint(h.Sum64(), 36) + `"`
+}
+
+// maxIfNoneMatchBytes bounds the size of an If-None-Match header we are willing
+// to parse. A legitimate client lists at most a handful of validators; an
+// oversized header is always pathological (or hostile), so short-circuiting it
+// stops a multi-MB If-None-Match from driving an unbounded split before the
+// server-level MaxHeaderBytes cap was in place. 1 KiB is far above any real
+// browser/curl request.
+const maxIfNoneMatchBytes = 1 << 10 // 1 KiB
+
+// etagMatches implements the If-None-Match comparison: a bare "*" matches any
+// current representation, otherwise each listed validator is compared using
+// weak equivalence per RFC 7232 s3.2: the W/ prefix is stripped from BOTH the
+// header value and the current ETag before comparing, so a client that echoes
+// our W/"..." verbatim matches, and a hypothetical client sending a strong
+// "..." form against our current weak value also matches. Weak equivalence is
+// the correct comparison for the If-None-Match purpose these handlers use
+// (cache freshness), and is what the spec's examples assume once the server
+// emits weak validators. The bare "*" wildcard is unchanged.
+func etagMatches(ifNoneMatch, etag string) bool {
+	if ifNoneMatch == "" {
+		return false
+	}
+	if len(ifNoneMatch) > maxIfNoneMatchBytes {
+		// An oversized If-None-Match is never a legitimate match; treat it as
+		// no match so the handler falls through to a full 200 rather than
+		// spending unbounded time splitting a multi-MB header.
+		return false
+	}
+	if ifNoneMatch == "*" {
+		return true
+	}
+	cmpCur := stripWeakPrefix(etag)
+	for _, t := range strings.Split(ifNoneMatch, ",") {
+		if stripWeakPrefix(strings.TrimSpace(t)) == cmpCur {
+			return true
+		}
+	}
+	return false
+}
+
+// stripWeakPrefix removes the leading W/ weak-validator marker so two
+// validators can be compared by opaque-token alone, exactly as RFC 7232's
+// weak comparison rule requires. A bare * wildcard is preserved untouched so
+// the wildcard path above keeps working; this helper is only reached for the
+// per-token comparison branch.
+func stripWeakPrefix(v string) string {
+	return strings.TrimPrefix(v, "W/")
+}
+
+// writeJSONWithETag emits a buffered JSON body with a weak-validator ETag,
+// returning a bare 304 (no body, no Content-Encoding) when the client's
+// If-None-Match matches. Headers are set before WriteHeader so they reach the
+// client on both 200 and 304 paths.
+func writeJSONWithETag(w http.ResponseWriter, r *http.Request, body []byte, etag string) {
+	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
+	w.Header().Set("ETag", etag)
+	// private: this payload carries operator-only endpoint/traffic data, never
+	// suitable for a shared cache. no-cache (not no-store): the client may
+	// still store the body but must revalidate via If-None-Match before
+	// reusing it, which is exactly the 304 flow above/below - the two are not
+	// in tension.
+	w.Header().Set("Cache-Control", "private, no-cache")
+	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+}
+
+// hashStatusResponse computes the FNV-1a ETag over the stable fields of a
+// StatusResponse, deliberately excluding the top-level Timestamp, every
+// relative time-ago string, and the per-endpoint health-check tick timestamps
+// (next_check_at, health_check_at) - see hashEndpointResponse. start_time and
+// models.last_updated are absolute data that only moves on a real event, so
+// they stay in.
+func hashStatusResponse(resp *StatusResponse) string {
+	h := fnv.New64a()
+	hashEtagString(h, resp.Proxy.Engine)
+	hashEtagString(h, resp.Proxy.Profile)
+	hashEtagString(h, resp.Proxy.Balancer)
+
+	hashEtagTime(h, resp.System.StartTime)
+	hashEtagString(h, resp.System.Status)
+	hashEtagString(h, resp.System.EndpointsUp)
+	hashEtagString(h, resp.System.SuccessRate)
+	hashEtagString(h, resp.System.AvgLatency)
+	hashEtagString(h, resp.System.TotalTraffic)
+	hashEtagString(h, resp.System.Version)
+	hashEtagString(h, resp.System.Commit)
+	hashEtagInt64(h, resp.System.ActiveConnections)
+	hashEtagInt64(h, resp.System.SecurityViolations)
+	hashEtagInt64(h, resp.System.TotalRequests)
+	hashEtagInt64(h, resp.System.TotalFailures)
+
+	hashEtagString(h, resp.Security.Status)
+	hashEtagInt64(h, int64(resp.Security.BlockedIPs))
+	hashEtagInt64(h, resp.Security.Violations.RateLimits)
+	hashEtagInt64(h, resp.Security.Violations.SizeLimits)
+
+	for i := range resp.Endpoints {
+		hashEndpointResponse(h, &resp.Endpoints[i])
+	}
+	return formatEtag(h)
+}
+
+// hashEndpointResponse feeds only the stable/semantic fields of one
+// EndpointResponse to the hasher. Relative strings (last_check, next_check)
+// are skipped because they render with one-second granularity and would
+// change on every poll; NextCheckAt/HealthCheckAt are skipped too - they
+// advance on every health-check tick (30s, see internal/adapter/health)
+// regardless of whether the endpoint's status actually changed, which
+// churned this ETag under zero traffic and defeated caching.
+func hashEndpointResponse(h hash.Hash, ep *EndpointResponse) {
+	hashEtagString(h, ep.ID)
+	hashEtagString(h, ep.Name)
+	hashEtagString(h, ep.Status)
+	hashEtagString(h, ep.URL)
+	hashEtagString(h, ep.SuccessRate)
+	hashEtagString(h, ep.AvgLatency)
+	hashEtagString(h, ep.Traffic)
+	hashEtagString(h, ep.Issues)
+	hashEtagInt64(h, int64(ep.Priority))
+	hashEtagInt64(h, ep.Connections)
+	hashEtagInt64(h, ep.Requests)
+	hashEtagInt64(h, ep.MinLatencyMs)
+	hashEtagInt64(h, ep.MaxLatencyMs)
+	hashEtagInt64Ptr(h, ep.AvgLatencyMs)
+	hashEtagTime(h, ep.Models.LastUpdated)
+	hashEtagInt64(h, ep.Models.Count)
+}
