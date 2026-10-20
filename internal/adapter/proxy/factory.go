@@ -81,3 +81,86 @@ func NewFactory(statsCollector ports.StatsCollector, metricsExtractor ports.Metr
 			GetMaxIdleConns() int
 			GetIdleConnTimeout() time.Duration
 			GetMaxConnsPerHost() int
+		}); ok {
+			ollaConfig.MaxIdleConns = ollaSpecific.GetMaxIdleConns()
+			ollaConfig.IdleConnTimeout = ollaSpecific.GetIdleConnTimeout()
+			ollaConfig.MaxConnsPerHost = ollaSpecific.GetMaxConnsPerHost()
+		} else {
+			// fallback option with defaults
+			ollaConfig.MaxIdleConns = 200
+			ollaConfig.IdleConnTimeout = 90 * time.Second
+			ollaConfig.MaxConnsPerHost = 50
+		}
+
+		// Timeouts are independent of the pool tunables, so they are asserted
+		// separately to avoid one missing getter dropping the others to defaults.
+		if rh, ok := config.(interface{ GetResponseHeaderTimeout() time.Duration }); ok {
+			ollaConfig.ResponseHeaderTimeout = rh.GetResponseHeaderTimeout()
+		}
+		if tls, ok := config.(interface{ GetTLSHandshakeTimeout() time.Duration }); ok {
+			ollaConfig.TLSHandshakeTimeout = tls.GetTLSHandshakeTimeout()
+		}
+
+		if rp, ok := config.(interface {
+			GetRetryPolicy() proxyconfig.RetryPolicy
+		}); ok {
+			ollaConfig.Retry = rp.GetRetryPolicy()
+		}
+		return olla.NewService(discovery, selector, ollaConfig, collector, metricsExtractor, logger)
+	})
+
+	return factory
+}
+
+// rawStreamBufferSize copies the operator-supplied buffer size without applying
+// ports.ProxyConfiguration's own default. Calling GetStreamBufferSize() here would
+// bake in the generic 8KiB default before the target engine's constructor gets a
+// chance to apply its own (e.g. Olla's 64KiB), permanently defeating that default.
+func rawStreamBufferSize(config ports.ProxyConfiguration) int {
+	if c, ok := config.(*Configuration); ok {
+		return c.StreamBufferSize
+	}
+	return config.GetStreamBufferSize()
+}
+
+// rawReadTimeout is the read-timeout equivalent of rawStreamBufferSize - see there
+// for why the defaulted getter must not be used here.
+func rawReadTimeout(config ports.ProxyConfiguration) time.Duration {
+	if c, ok := config.(*Configuration); ok {
+		return c.ReadTimeout
+	}
+	return config.GetReadTimeout()
+}
+
+// Register adds a new proxy creator
+func (f *Factory) Register(name string, creator ProxyCreator) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.creators[name] = creator
+}
+
+// Create creates a new proxy service of the specified type
+func (f *Factory) Create(proxyType string, discoveryService ports.DiscoveryService, selector domain.EndpointSelector, config ports.ProxyConfiguration) (ports.ProxyService, error) {
+	f.mu.RLock()
+	creator, exists := f.creators[proxyType]
+	f.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("unknown proxy implementation: %s", proxyType)
+	}
+
+	f.logger.Info("Initialising proxy service", "type", proxyType)
+	return creator(discoveryService, selector, config, f.statsCollector, f.metricsExtractor, f.logger)
+}
+
+// GetAvailableTypes returns all registered proxy types
+func (f *Factory) GetAvailableTypes() []string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	types := make([]string, 0, len(f.creators))
+	for name := range f.creators {
+		types = append(types, name)
+	}
+	return types
+}
