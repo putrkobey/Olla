@@ -9,3 +9,14 @@
 // to a later change.
 import type { ModelStatusResponse } from '../types';
 import { createPollStore } from './poll-store.svelte';
+
+const MODELS_INTERVAL_MS = 15000;
+// detailed=true (not =1): the handler compares against the literal "true".
+// group=family populates model_groups so the panel can render families.
+const STATUS_URL = '/internal/status/models?detailed=true&group=family';
+
+export const models = createPollStore<ModelStatusResponse>({
+  name: 'models',
+  url: STATUS_URL,
+  intervalMs: MODELS_INTERVAL_MS,
+});
