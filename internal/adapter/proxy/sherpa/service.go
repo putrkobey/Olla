@@ -63,3 +63,135 @@ const DefaultResponseHeaderTimeout = config.DefaultResponseHeaderTimeout
 // Service implements the Sherpa proxy - optimised for simplicity and maintainability
 type Service struct {
 	*core.BaseProxyComponents
+
+	transport     *http.Transport
+	configuration *Configuration
+	bufferPool    *pool.Pool[*[]byte]
+	retryHandler  *core.RetryHandler
+}
+
+// NewService creates a new Sherpa proxy service
+func NewService(
+	discoveryService ports.DiscoveryService,
+	selector domain.EndpointSelector,
+	configuration *Configuration,
+	statsCollector ports.StatsCollector,
+	metricsExtractor ports.MetricsExtractor,
+	logger logger.StyledLogger,
+) (*Service, error) {
+
+	base := core.NewBaseProxyComponents(discoveryService, selector, statsCollector, metricsExtractor, logger)
+
+	bufferPool, err := pool.NewLitePool(func() *[]byte {
+		buf := make([]byte, configuration.GetStreamBufferSize())
+		return &buf
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create buffer pool: %w", err)
+	}
+
+	// Create transport with TCP tuning for LLM streaming
+	transport := &http.Transport{
+		MaxIdleConns:          DefaultMaxIdleConns,
+		IdleConnTimeout:       DefaultIdleConnTimeout,
+		DisableCompression:    DefaultDisableCompression,
+		TLSHandshakeTimeout:   configuration.GetTLSHandshakeTimeout(),
+		MaxIdleConnsPerHost:   DefaultMaxIdleConnsPerHost,
+		ResponseHeaderTimeout: configuration.GetResponseHeaderTimeout(),
+		// Olla targets local inference backends; outbound proxy env vars are not
+		// honoured here because they would route credentialled requests through an
+		// intermediary on plain HTTP. The health checker and model discovery follow
+		// the same policy (adapter/factory.NewBackendHTTPClient).
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{
+				Timeout:   configuration.GetConnectionTimeout(),
+				KeepAlive: configuration.GetConnectionKeepAlive(),
+			}
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			// we disable Nagle's algorithm for token streaming
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				if terr := tcpConn.SetNoDelay(DefaultSetNoDelay); terr != nil {
+					logger.Warn("failed to set NoDelay", "err", terr)
+				}
+			}
+			return conn, nil
+		},
+	}
+
+	return &Service{
+		BaseProxyComponents: base,
+		transport:           transport,
+		configuration:       configuration,
+		bufferPool:          bufferPool,
+		retryHandler:        core.NewRetryHandler(discoveryService, logger, core.WithRetryPolicy(configuration.GetRetryPolicy())),
+	}, nil
+}
+
+// ProxyRequest handles incoming HTTP requests and proxies them to healthy endpoints
+func (s *Service) ProxyRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+	endpoints, err := s.DiscoveryService.GetHealthyEndpoints(ctx)
+	if err != nil {
+		return err
+	}
+
+	return s.ProxyRequestToEndpointsWithRetry(ctx, w, r, endpoints, stats, rlog)
+}
+
+// ProxyRequestToEndpoints proxies the request to the provided endpoints with automatic retry on connection failures
+func (s *Service) ProxyRequestToEndpoints(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoints []*domain.Endpoint, stats *ports.RequestStats, rlog logger.StyledLogger) error {
+	return s.ProxyRequestToEndpointsWithRetry(ctx, w, r, endpoints, stats, rlog)
+}
+
+// GetStats returns current proxy statistics
+func (s *Service) GetStats(ctx context.Context) (ports.ProxyStats, error) {
+	return s.GetProxyStats(), nil
+}
+
+// Configuration exposes stored values so callers can distinguish an unset field
+// from a field explicitly set to its resolved default.
+func (s *Service) Configuration() *Configuration {
+	return s.configuration
+}
+
+// UpdateConfig updates the proxy configuration
+func (s *Service) UpdateConfig(config ports.ProxyConfiguration) {
+	newConfig := &Configuration{}
+	newConfig.ProxyPrefix = config.GetProxyPrefix()
+	newConfig.ConnectionTimeout = config.GetConnectionTimeout()
+	newConfig.ConnectionKeepAlive = config.GetConnectionKeepAlive()
+	newConfig.ResponseTimeout = config.GetResponseTimeout()
+	// Getter-based defaults for a foreign config type, same as every other
+	// field above. Overridden below with the raw value when config is
+	// concretely a *sherpa.Configuration, preserving the distinction between
+	// "operator left this unset" and "operator set it to the default" in the
+	// stored config rather than baking the getter's resolved value into the
+	// raw field. Mirrors factory.go's raw copy for construction (F1) and
+	// olla.Service's UpdateConfig (F12).
+	newConfig.ReadTimeout = config.GetReadTimeout()
+	newConfig.StreamBufferSize = config.GetStreamBufferSize()
+	newConfig.Profile = config.GetProxyProfile()
+
+	if sherpaConfig, ok := config.(*Configuration); ok && sherpaConfig != nil {
+		newConfig.ReadTimeout = sherpaConfig.ReadTimeout
+		newConfig.StreamBufferSize = sherpaConfig.StreamBufferSize
+	}
+
+	s.configuration = newConfig
+}
+
+// Cleanup gracefully shuts down the proxy service
+func (s *Service) Cleanup() {
+	// Close idle connections in the transport
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
+
+	// Shutdown base components (EventBus, etc)
+	s.BaseProxyComponents.Shutdown()
+
+	s.Logger.Debug("Sherpa proxy service cleaned up")
+}
