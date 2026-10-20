@@ -71,3 +71,76 @@ characteristics:
 
 # Detection hints for auto-discovery
 detection:
+  path_indicators:
+    - "/v1/models"
+    - "/health"
+    - "/v1/models/status"  # oMLX-specific; most other servers don't expose this
+  default_ports:
+    - 8000
+
+# Request/response handling
+# oMLX is OpenAI-compatible on the wire — reuse the standard OpenAI parser
+request:
+  model_field_paths:
+    - "model"
+  response_format: "openai"
+  parsing_rules:
+    chat_completions_path: "/v1/chat/completions"
+    completions_path: "/v1/completions"
+    model_field_name: "model"
+    supports_streaming: true
+
+# Path indices for specific functions
+path_indices:
+  health: 0
+  models: 1
+  chat_completions: 3
+  completions: 4
+  embeddings: 5
+  v1_rerank: 9
+
+# Model handling
+models:
+  name_format: "{{.Name}}"
+  capability_patterns:
+    chat:
+      - "*-Instruct*"
+      - "*-instruct*"
+      - "*-Chat*"
+      - "*-chat*"
+    embeddings:
+      - "*embedding*"
+      - "*-embed-*"
+
+# Resource management — Apple Silicon has unified memory shared between CPU and GPU
+# oMLX loads multiple models simultaneously so per-model limits are lower
+resources:
+  defaults:
+    min_memory_gb: 4
+    recommended_memory_gb: 8
+    min_gpu_memory_gb: 0    # Unified memory; no discrete GPU
+    requires_gpu: false
+    estimated_load_time_ms: 5000
+
+  concurrency_limits:
+    - min_memory_gb: 0
+      max_concurrent: 4
+
+  timeout_scaling:
+    base_timeout_seconds: 180  # 3 minutes
+    load_time_buffer: true
+
+# Metrics extraction — OpenAI-format responses
+metrics:
+  extraction:
+    enabled: true
+    source: response_body
+    format: json
+    paths:
+      model: "$.model"
+      finish_reason: "$.choices[0].finish_reason"
+      input_tokens: "$.usage.prompt_tokens"
+      output_tokens: "$.usage.completion_tokens"
+      total_tokens: "$.usage.total_tokens"
+    calculations:
+      is_complete: 'len(finish_reason) > 0'

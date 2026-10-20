@@ -10,3 +10,16 @@
     auto: { icon: '◐', label: 'Theme: auto (follows system). Click for light.' },
     light: { icon: '☀', label: 'Theme: light. Click for dark.' },
     dark: { icon: '☾', label: 'Theme: dark. Click for auto.' },
+  };
+  const current = $derived(byMode[theme.mode]);
+</script>
+
+<button
+  class="theme-toggle icon-only"
+  type="button"
+  aria-label={current.label}
+  title={current.label}
+  onclick={() => theme.cycle()}
+>
+  <span aria-hidden="true">{current.icon}</span>
+</button>
