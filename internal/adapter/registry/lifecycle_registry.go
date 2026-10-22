@@ -89,3 +89,94 @@ func (r *LifecycleUnifiedRegistry) RegisterModelsWithEndpoint(ctx context.Contex
 	})
 
 	if err != nil {
+		// Track failures for circuit breaker decisions
+		if lifecycleUnifier, ok := r.unifier.(*unifier.LifecycleUnifier); ok {
+			lifecycleUnifier.RecordEndpointFailure(endpoint.GetURLString(), err)
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (r *LifecycleUnifiedRegistry) GetEndpointHealth(ctx context.Context) (map[string]*domain.EndpointStateInfo, error) {
+	health := make(map[string]*domain.EndpointStateInfo)
+
+	if lifecycleUnifier, ok := r.unifier.(*unifier.LifecycleUnifier); ok {
+		r.endpoints.Range(func(url string, endpoint *domain.Endpoint) bool {
+			if state := lifecycleUnifier.GetEndpointState(url); state != nil {
+				health[url] = state
+			} else {
+				health[url] = &domain.EndpointStateInfo{
+					State:           domain.EndpointStateUnknown,
+					LastStateChange: time.Now(),
+				}
+			}
+			return true
+		})
+	}
+
+	return health, nil
+}
+
+func (r *LifecycleUnifiedRegistry) MarkEndpointOffline(ctx context.Context, endpointURL string, reason string) error {
+	// Copy-on-write under the same lock RemoveEndpoint and unification use:
+	// readers hold the published pointers without any lock.
+	r.unificationMutex.Lock()
+	defer r.unificationMutex.Unlock()
+
+	r.globalUnified.Range(func(id string, live *domain.UnifiedModel) bool {
+		if live.GetEndpointByURL(endpointURL) == nil {
+			return true
+		}
+		model := live.Clone()
+		model.MarkEndpointOffline(endpointURL, reason)
+		r.globalUnified.Store(id, model)
+		return true
+	})
+
+	return nil
+}
+
+func (r *LifecycleUnifiedRegistry) ForceEndpointCheck(ctx context.Context, endpointURL string) error {
+	if lifecycleUnifier, ok := r.unifier.(*unifier.LifecycleUnifier); ok {
+		return lifecycleUnifier.ForceEndpointCheck(ctx, endpointURL)
+	}
+	return errors.New("unifier does not support endpoint checks")
+}
+
+func (r *LifecycleUnifiedRegistry) GetLifecycleStats(ctx context.Context) (LifecycleRegistryStats, error) {
+	baseStats, err := r.GetUnifiedStats(ctx)
+	if err != nil {
+		return LifecycleRegistryStats{}, err
+	}
+
+	endpointHealth, err := r.GetEndpointHealth(ctx)
+	if err != nil {
+		return LifecycleRegistryStats{}, err
+	}
+
+	stateCount := make(map[domain.EndpointState]int)
+	for _, state := range endpointHealth {
+		stateCount[state.State]++
+	}
+
+	var circuitBreakerStats map[string]unifier.CircuitBreakerStats
+	if lifecycleUnifier, ok := r.unifier.(*unifier.LifecycleUnifier); ok {
+		circuitBreakerStats = lifecycleUnifier.GetCircuitBreakerStats()
+	}
+
+	return LifecycleRegistryStats{
+		UnifiedRegistryStats: baseStats,
+		EndpointStates:       stateCount,
+		CircuitBreakers:      circuitBreakerStats,
+		LastCleanup:          time.Now(), // TODO: Track actual cleanup time
+	}, nil
+}
+
+type LifecycleRegistryStats struct {
+	LastCleanup     time.Time                              `json:"last_cleanup"`
+	EndpointStates  map[domain.EndpointState]int           `json:"endpoint_states"`
+	CircuitBreakers map[string]unifier.CircuitBreakerStats `json:"circuit_breakers"`
+	UnifiedRegistryStats
+}
