@@ -21,3 +21,74 @@ server:
     trust_proxy_headers: false
     trusted_proxy_cidrs: [
       "127.0.0.0/8",
+      "10.0.0.0/8",
+      "172.16.0.0/12",
+      "192.168.0.0/16"
+    ]
+
+proxy:
+  engine: "olla" # Available: olla (default), sherpa (maintenance-mode)
+  connection_timeout: 40s
+  response_timeout: 900s
+  read_timeout: 300s
+  load_balancer: "priority" # Available: round-robin, least-connections, priority
+  # stream_buffer_size: 8192 # Unset: the engine default applies (Olla 64KiB, Sherpa 8KiB)
+
+discovery:
+  type: "static"
+  refresh_interval: 30s
+  static:
+    endpoints:
+      # Add your Ollama instances here.
+      # Example: Local Ollama instance (running on the Docker host)
+      - url: "http://host.docker.internal:11434"
+        name: "local-ollama"
+        type: "ollama"
+        priority: 100
+        model_url: "/api/tags"
+        health_check_url: "/"
+        check_interval: 2s
+        check_timeout: 1s
+
+      # Example: Remote Ollama instance
+      # - url: "http://192.168.1.100:11434"
+      #   name: "remote-ollama"
+      #   type: "ollama"
+      #   priority: 50
+      #   model_url: "/api/tags"
+      #   health_check_url: "/"
+      #   check_interval: 2s
+      #   check_timeout: 1s
+
+      # Example: Another remote Ollama instance
+      # - url: "http://gpu-server:11434"
+      #   name: "gpu-ollama"
+      #   type: "ollama"
+      #   priority: 75
+      #   model_url: "/api/tags"
+      #   health_check_url: "/"
+      #   check_interval: 2s
+      #   check_timeout: 1s
+
+  model_discovery:
+    enabled: true
+    interval: 5m
+    timeout: 30s
+    concurrent_workers: 5
+    retry_attempts: 3
+    retry_backoff: 1s
+
+model_registry:
+  type: "memory"
+  enable_unifier: true
+  unification:
+    stale_threshold: 24h
+    cleanup_interval: 10m
+
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json"  # json, text
+  output: "stdout"  # stdout, file
+
+engineering:
+  show_nerdstats: false
