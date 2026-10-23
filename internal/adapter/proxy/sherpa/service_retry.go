@@ -70,3 +70,148 @@ func (s *Service) proxyToSingleEndpoint(ctx context.Context, w http.ResponseWrit
 		rlog.Info("Request dispatching", "endpoint", endpoint.Name, "target", stats.TargetUrl, "model", stats.Model)
 	}
 
+	// Rewrite model name in request body if this is an alias-resolved request
+	core.RewriteModelForAlias(ctx, r, endpoint)
+
+	proxyReq, err := http.NewRequestWithContext(ctx, r.Method, targetURL.String(), r.Body)
+	if err != nil {
+		s.RecordFailure(ctx, endpoint, core.ResolvedModelName(ctx, endpoint, stats.Model), time.Since(stats.StartTime), err)
+		return fmt.Errorf("failed to create proxy request: %w", err)
+	}
+
+	rlog.Debug("created proxy request")
+
+	headerStart := time.Now()
+	core.CopyHeaders(proxyReq, r, endpoint)
+	stats.HeaderProcessingMs = time.Since(headerStart).Milliseconds()
+
+	// Add model header if available. The translation layer sets
+	// ContextModelKey to the model it resolved (handler_translation.go),
+	// which supersedes both the raw request and the alias map for the rest
+	// of this function - recompute the resolved-for-stats name below from
+	// this updated stats.Model, not the value captured before this point.
+	if model, ok := ctx.Value(constants.ContextModelKey).(string); ok && model != "" {
+		proxyReq.Header.Set(constants.HeaderXModel, model)
+		stats.Model = model
+	}
+
+	// The model actually dispatched to this endpoint: the alias map's
+	// per-endpoint entry if this was an alias-resolved request, otherwise
+	// stats.Model unchanged (which may itself already be the translation
+	// layer's resolved name from the ContextModelKey check above). Used for
+	// every RecordSuccess/RecordFailure below so /internal/stats/models
+	// aggregates under the backend model name, not the client-facing alias.
+	resolvedModel := core.ResolvedModelName(ctx, endpoint, stats.Model)
+
+	// We mark the request processing as complete here
+	stats.RequestProcessingMs = time.Since(stats.StartTime).Milliseconds()
+
+	rlog.Debug("making round-trip request", "target", targetURL.String())
+	backendStart := time.Now()
+	resp, err := s.transport.RoundTrip(proxyReq)
+	stats.BackendResponseMs = time.Since(backendStart).Milliseconds()
+
+	if err != nil {
+		// Suppress error logging for connection failures handled by retry logic
+		if core.IsConnectionError(err) {
+			rlog.Debug("round-trip connection failed", "error", err)
+		} else {
+			rlog.Error("round-trip failed", "error", err)
+		}
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), err)
+		duration := time.Since(stats.StartTime)
+		return common.MakeUserFriendlyError(err, duration, "backend", s.configuration.GetResponseTimeout())
+	}
+	defer resp.Body.Close()
+
+	rlog.Debug("round-trip success", "status", resp.StatusCode)
+
+	core.SetResponseHeaders(w, stats, endpoint)
+	core.SetStickySessionHeaders(w, r)
+
+	// Copy response headers, stripping any sensitive headers the upstream may reflect
+	core.CopyResponseHeaders(w.Header(), resp.Header, endpoint)
+
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream the response through
+	rlog.Debug("starting response stream")
+	streamStart := time.Now()
+	stats.FirstDataMs = time.Since(stats.StartTime).Milliseconds()
+
+	buffer, poolErr := s.bufferPool.Get()
+	if poolErr != nil {
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), poolErr)
+		return fmt.Errorf("sherpa: stream buffer unavailable: %w", poolErr)
+	}
+	defer s.bufferPool.Put(buffer)
+
+	// Separate client and upstream contexts for proper cancellation handling
+	upstreamCtx := ctx
+	if resp != nil && resp.Request != nil {
+		upstreamCtx = resp.Request.Context()
+	}
+
+	// Stream with timeout protection - don't let slow clients hang forever
+	// Use r.Context() for client context and upstreamCtx for upstream context
+	bytesWritten, lastChunk, streamErr := s.streamResponseWithTimeout(r.Context(), upstreamCtx, w, resp, *buffer, rlog)
+	stats.StreamingMs = time.Since(streamStart).Milliseconds()
+	stats.TotalBytes = bytesWritten
+
+	if streamErr != nil && !errors.Is(streamErr, context.Canceled) {
+		rlog.Error("streaming failed", "error", streamErr)
+		s.RecordFailure(ctx, endpoint, resolvedModel, time.Since(stats.StartTime), streamErr)
+		return common.MakeUserFriendlyError(streamErr, time.Since(stats.StartTime), "streaming", s.configuration.GetResponseTimeout())
+	}
+
+	// We've successfully written the response
+	duration := time.Since(stats.StartTime)
+	s.RecordSuccess(endpoint, resolvedModel, duration.Milliseconds(), int64(bytesWritten))
+
+	s.PublishEvent(core.ProxyEvent{
+		Type:      core.EventTypeProxySuccess,
+		RequestID: stats.RequestID,
+		Endpoint:  endpoint.Name,
+		Duration:  duration,
+		Metadata: core.ProxyEventMetadata{
+			BytesSent:  int64(bytesWritten),
+			StatusCode: resp.StatusCode,
+			Model:      stats.Model,
+		},
+	})
+
+	// Stats update
+	stats.EndTime = time.Now()
+	stats.Latency = stats.EndTime.Sub(stats.StartTime).Milliseconds()
+	stats.TotalBytes = bytesWritten
+
+	// Extract metrics from response if available
+	core.ExtractProviderMetrics(ctx, s.MetricsExtractor, lastChunk, endpoint, stats, rlog, "Sherpa")
+
+	// Log detailed completion metrics at Debug level
+	logFields := []interface{}{
+		"endpoint", endpoint.Name,
+		"latency_ms", stats.Latency,
+		"processing_ms", stats.RequestProcessingMs,
+		"backend_ms", stats.BackendResponseMs,
+		"first_data_ms", stats.FirstDataMs,
+		"streaming_ms", stats.StreamingMs,
+		"selection_ms", stats.SelectionMs,
+		"header_ms", stats.HeaderProcessingMs,
+		"total_bytes", stats.TotalBytes,
+		"bytes_formatted", middleware.FormatBytes(int64(stats.TotalBytes)),
+		"status", resp.StatusCode,
+	}
+
+	// Add provider metrics if available
+	if stats.ProviderMetrics != nil {
+		logFields = core.AppendProviderMetricsToLog(logFields, stats.ProviderMetrics)
+	}
+
+	if ctxLogger != nil {
+		logFields = append(logFields, "request_id", middleware.GetRequestID(ctx))
+		ctxLogger.Debug("Sherpa proxy metrics", logFields...)
+	}
+
+	return nil
+}
