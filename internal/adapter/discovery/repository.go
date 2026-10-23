@@ -123,3 +123,255 @@ func (r *StaticEndpointRepository) UpdateEndpoint(ctx context.Context, endpoint 
 func (r *StaticEndpointRepository) Exists(ctx context.Context, endpointURL *url.URL) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	key := endpointURL.String()
+	_, exists := r.endpoints[key]
+	return exists
+}
+
+func (r *StaticEndpointRepository) LoadFromConfig(ctx context.Context, configs []config.EndpointConfig) error {
+	if len(configs) == 0 {
+		r.mu.Lock()
+		r.endpoints = make(map[string]*domain.Endpoint)
+		r.mu.Unlock()
+		return nil
+	}
+
+	now := time.Now()
+	newEndpoints := make(map[string]*domain.Endpoint, len(configs))
+
+	for _, cfg := range configs {
+		applyEndpointDefaults(&cfg)
+		if err := r.validateEndpointConfig(cfg); err != nil {
+			return fmt.Errorf("invalid endpoint config for %q: %w", cfg.Name, err)
+		}
+
+		var resolved resolvedAuth
+		if cfg.Auth != nil {
+			if err := validateAuth(cfg.Name, cfg.Auth); err != nil {
+				return err
+			}
+			var rerr error
+			resolved, rerr = resolveAuth(cfg.Name, cfg.Auth)
+			if rerr != nil {
+				return rerr
+			}
+		}
+
+		endpointURL, err := url.Parse(cfg.URL)
+		if err != nil {
+			return fmt.Errorf("invalid endpoint URL %q: %w", cfg.URL, err)
+		}
+
+		urlString := endpointURL.String()
+
+		// Resolve URL defaults using fallback hierarchy: explicit config → profile defaults → universal defaults
+		healthCheckPath, modelPath := r.resolveURLDefaults(cfg)
+
+		// Build health check and model URLs using ResolveURLPath to preserve
+		// the base URL's path prefix. This handles both relative paths and absolute URLs correctly,
+		// preserving nested paths like http://localhost:12434/engines/llama.cpp/
+		healthCheckURLString := util.ResolveURLPath(urlString, healthCheckPath)
+		modelURLString := util.ResolveURLPath(urlString, modelPath)
+
+		healthCheckURL, err := url.Parse(healthCheckURLString)
+		if err != nil {
+			return fmt.Errorf("invalid health check URL %q: %w", healthCheckURLString, err)
+		}
+
+		modelURL, err := url.Parse(modelURLString)
+		if err != nil {
+			return fmt.Errorf("invalid model URL %q: %w", modelURLString, err)
+		}
+
+		newEndpoint := &domain.Endpoint{
+			Name:                  cfg.Name,
+			URL:                   endpointURL,
+			Type:                  cfg.Type,
+			Priority:              *cfg.Priority,
+			HealthCheckURL:        healthCheckURL,
+			ModelUrl:              modelURL,
+			ModelFilter:           cfg.ModelFilter,
+			CheckInterval:         cfg.CheckInterval,
+			CheckTimeout:          cfg.CheckTimeout,
+			Status:                domain.StatusUnknown,
+			URLString:             urlString,
+			HealthCheckPathString: healthCheckPath,
+			HealthCheckURLString:  healthCheckURLString,
+			ModelURLString:        modelURLString,
+			BackoffMultiplier:     1,
+			NextCheckTime:         now,
+			PreservePath:          cfg.PreservePath,
+		}
+
+		if cfg.Auth != nil {
+			newEndpoint.AuthHeaderName, newEndpoint.AuthHeaderValue = precomputeAuthHeaders(resolved)
+		}
+
+		if len(cfg.Headers) > 0 {
+			resolvedHeaders := make(map[string]string, len(cfg.Headers))
+			for k, v := range cfg.Headers {
+				expanded, herr := envresolver.ExpandStrict(v)
+				if herr != nil {
+					return fmt.Errorf("endpoint %q: header %q: %w", cfg.Name, k, herr)
+				}
+				resolvedHeaders[k] = expanded
+			}
+			newEndpoint.Headers = resolvedHeaders
+		}
+
+		newEndpoints[urlString] = newEndpoint
+	}
+
+	r.mu.Lock()
+	r.endpoints = newEndpoints
+	r.mu.Unlock()
+
+	return nil
+}
+
+// resolveURLDefaults determines health check and model paths using fallback hierarchy:
+// explicit config > profile defaults > universal defaults ("/", "/v1/models")
+func (r *StaticEndpointRepository) resolveURLDefaults(cfg config.EndpointConfig) (healthCheckPath, modelPath string) {
+	healthCheckPath = cfg.HealthCheckURL
+	modelPath = cfg.ModelURL
+
+	if healthCheckPath == "" || modelPath == "" {
+		profileHealthPath, profileModelPath := r.applyProfileDefaults(cfg.Type, healthCheckPath, modelPath)
+		if healthCheckPath == "" {
+			healthCheckPath = profileHealthPath
+		}
+		if modelPath == "" {
+			modelPath = profileModelPath
+		}
+	}
+
+	return healthCheckPath, modelPath
+}
+
+// applyProfileDefaults retrieves defaults from profile configuration or returns universal fallbacks.
+// Returns health check path (default "/") and model path (default "/v1/models").
+func (r *StaticEndpointRepository) applyProfileDefaults(endpointType, healthCheckPath, modelPath string) (string, string) {
+	// Try to get defaults from profile if a known type is specified (not empty or "auto")
+	if endpointType != "" && endpointType != domain.ProfileAuto {
+		profile, err := r.profileFactory.GetProfile(endpointType)
+		if err == nil {
+			if healthCheckPath == "" {
+				healthCheckPath = profile.GetHealthCheckPath()
+			}
+			if modelPath == "" {
+				if profileCfg := profile.GetConfig(); profileCfg != nil {
+					modelPath = profileCfg.API.ModelDiscoveryPath
+				}
+			}
+		}
+	}
+
+	// apply universal defaults for any remaining empty paths
+	// (for "auto" type, unknown types, or if profile lookup failed)
+	if healthCheckPath == "" {
+		healthCheckPath = "/"
+	}
+	if modelPath == "" {
+		modelPath = "/v1/models"
+	}
+
+	return healthCheckPath, modelPath
+}
+
+// applyEndpointDefaults fills in zero-value timing fields and an absent priority
+// so that omitting them in YAML config is equivalent to specifying the defaults.
+// Priority is a pointer so we can distinguish "omitted" (nil) from "explicitly 0",
+// which is a valid lower-than-default value.
+func applyEndpointDefaults(cfg *config.EndpointConfig) {
+	if cfg.CheckInterval == 0 {
+		cfg.CheckInterval = DefaultCheckInterval
+	}
+	if cfg.CheckTimeout == 0 {
+		cfg.CheckTimeout = DefaultCheckTimeout
+	}
+	if cfg.Priority == nil {
+		p := DefaultPriority
+		cfg.Priority = &p
+	}
+}
+
+func (r *StaticEndpointRepository) validateEndpointConfig(cfg config.EndpointConfig) error {
+	if cfg.URL == "" {
+		return errors.New("endpoint URL cannot be empty")
+	}
+
+	// Reject embedded credentials (user:pass@host). url.URL.String() preserves
+	// userinfo verbatim, so without this check a credentialed URL would flow
+	// into endpoint.URLString and out through any status API that echoes it.
+	// The endorsed credential path is the auth config block (AuthConfig, held
+	// as json:"-" fields on domain.Endpoint), so this is never a legitimate
+	// config, only ever an accident. The error string spells out the exact
+	// rewrite so a failed boot is a copy-paste fix rather than a guessing game.
+	// Both the username and password are redacted with placeholders - a
+	// username can itself be a secret (API-key-as-username schemes) - so the
+	// startup log never has the operator's real credentials sitting in it.
+	if parsedURL, err := url.Parse(cfg.URL); err == nil && parsedURL.User != nil {
+		_, hasPass := parsedURL.User.Password()
+		host := parsedURL.Host
+		plainURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, host)
+		if parsedURL.Path != "" {
+			plainURL += parsedURL.Path
+		}
+		userinfo := "<your username>"
+		if hasPass {
+			userinfo += ":<your password>"
+		}
+		redactedOriginal := fmt.Sprintf("%s://%s@%s", parsedURL.Scheme, userinfo, host)
+		if parsedURL.Path != "" {
+			redactedOriginal += parsedURL.Path
+		}
+		// Basic auth requires both a username and a password - the username-only
+		// case (user:pass@host with no password) cannot become a valid basic
+		// block, so the example must still carry a password placeholder rather
+		// than a silently-invalid partial one.
+		example := plainURL + "\nauth:\n  type: basic\n  username: <your username>\n  password: <your password>" +
+			"\n  # or username_file / password_file to read from a file"
+		if !hasPass {
+			example += "\n\nBasic auth requires a password. If this was really a token " +
+				"(e.g. https://token@host), it is more likely bearer auth:\n  " +
+				plainURL + "\nauth:\n  type: bearer\n  token: <your token>" +
+				"\n  # or token_file to read from a file"
+		}
+		return fmt.Errorf(
+			"endpoint URL for %q must not embed credentials (user:pass@host); "+
+				"move them to the auth config block. Rewrite\n  %s\nas\n  %s",
+			cfg.Name, redactedOriginal, example,
+		)
+	}
+
+	// Allow empty health check and model URLs - they will get defaults from profile or fallback values
+	// in LoadFromConfig. This enables simpler configuration when using known profile types.
+
+	if cfg.CheckInterval < MinHealthCheckInterval {
+		return fmt.Errorf("check_interval too short: minimum %v, got %v", MinHealthCheckInterval, cfg.CheckInterval)
+	}
+
+	if cfg.CheckTimeout >= cfg.CheckInterval {
+		return fmt.Errorf("check_timeout (%v) must be less than check_interval (%v)", cfg.CheckTimeout, cfg.CheckInterval)
+	}
+
+	if cfg.CheckTimeout > MaxHealthCheckTimeout {
+		return fmt.Errorf("check_timeout too long: maximum %v, got %v", MaxHealthCheckTimeout, cfg.CheckTimeout)
+	}
+
+	// Priority is guaranteed non-nil here: applyEndpointDefaults always runs before validation.
+	if cfg.Priority != nil && *cfg.Priority < 0 {
+		return fmt.Errorf("priority must be non-negative, got %d", *cfg.Priority)
+	}
+
+	if cfg.Type != "" {
+		if !r.profileFactory.ValidateProfileType(cfg.Type) {
+			availableTypes := r.profileFactory.GetAvailableProfiles()
+			availableTypes = append(availableTypes, domain.ProfileAuto)
+			return fmt.Errorf("unsupported endpoint type: %s, supported types: %v", cfg.Type, availableTypes)
+		}
+	}
+
+	return nil
+}
