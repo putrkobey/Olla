@@ -132,3 +132,272 @@ func (rl *RateLimitValidator) Validate(_ context.Context, req ports.SecurityRequ
 	var limit int
 	if req.IsHealthCheck {
 		limit = rl.healthRequestsPerMinute
+	} else {
+		limit = rl.perIPRequestsPerMinute
+	}
+
+	// A zero health limit has always meant "health probes are not limited",
+	// including by the global tier, so keep that.
+	if req.IsHealthCheck && limit <= 0 {
+		return ports.SecurityResult{
+			Allowed:   true,
+			ResetTime: now.Add(time.Minute),
+		}, nil
+	}
+
+	result := ports.SecurityResult{Allowed: true, ResetTime: now.Add(time.Minute)}
+	var charge ipCharge
+	if limit > 0 {
+		bucketKey := req.ClientID
+		if req.IsHealthCheck {
+			bucketKey += ":health"
+		}
+		info := rl.getOrCreateLimiter(bucketKey, limit)
+		info.flow.Lock()
+		defer info.flow.Unlock()
+		result, charge = rl.checkIPLimit(info, limit, now)
+		if !result.Allowed {
+			return result, nil
+		}
+	}
+
+	if rl.globalLimiter != nil {
+		// Allow charges the bucket only when it admits, so concurrent rejections
+		// cannot leave the shared global bucket in debt (a Reserve/Cancel pair
+		// is not atomic across clients, and global is shared by all of them).
+		if !rl.globalLimiter.Allow() {
+			charge.refund()
+			retryAfter := rl.globalRetryAfter()
+			return ports.SecurityResult{
+				Allowed:    false,
+				RetryAfter: retryAfter,
+				RateLimit:  rl.globalRequestsPerMinute,
+				Remaining:  0,
+				ResetTime:  now.Add(time.Minute),
+				Reason:     constants.ReasonGlobalRateLimitExceeded,
+			}, nil
+		}
+		if limit <= 0 {
+			result.RateLimit = rl.globalRequestsPerMinute
+			result.Remaining = int(rl.globalLimiter.Tokens())
+		}
+	}
+
+	return result, nil
+}
+
+// retryAfterSeconds converts a per-minute allowance into a Retry-After hint,
+// with a floor of one second. The guard keeps a zero limit from dividing by zero.
+func retryAfterSeconds(limit int) int {
+	if limit <= 0 {
+		return 60
+	}
+	if seconds := 60 / limit; seconds > 0 {
+		return seconds
+	}
+	return 1
+}
+
+// checkIPLimit handles per-IP rate enforcement, including health check separation.
+// Returns a SecurityResult with rate metadata and retry after guidance, plus a
+// charge that can return the consumed token when the request is later rejected
+// by the global tier (zero value unless the request was admitted).
+func (rl *RateLimitValidator) checkIPLimit(limiterInfo *ipLimiterInfo, limit int, now time.Time) (ports.SecurityResult, ipCharge) {
+	// Callers gate on limit > 0; a zero here means the tier is off, not "reject".
+	if limit <= 0 {
+		return ports.SecurityResult{Allowed: true, ResetTime: now.Add(time.Minute)}, ipCharge{}
+	}
+
+	limiterInfo.mu.Lock()
+	limiterInfo.lastAccess = now
+
+	if now.Sub(limiterInfo.windowStart) >= time.Minute {
+		limiterInfo.windowStart = now
+		limiterInfo.tokensUsed = 0
+	}
+
+	limiter := limiterInfo.limiter
+	limiterInfo.mu.Unlock()
+
+	// Reserve at an explicit instant so the rollback can cancel at the same one:
+	// CancelAt only refunds when the reservation is not already due, and a
+	// zero-delay reservation is due the moment it is made.
+	reservedAt := time.Now()
+	reservation := limiter.ReserveN(reservedAt, 1)
+	if !reservation.OK() {
+		return ports.SecurityResult{
+			Allowed:    false,
+			RetryAfter: retryAfterSeconds(limit),
+			RateLimit:  limit,
+			Remaining:  0,
+			ResetTime:  now.Add(time.Minute),
+			Reason:     constants.ReasonRateLimitExceeded,
+		}, ipCharge{}
+	}
+
+	delay := reservation.Delay()
+	if delay > 0 {
+		reservation.Cancel()
+
+		return ports.SecurityResult{
+			Allowed:    false,
+			RetryAfter: int(delay.Seconds()) + 1,
+			RateLimit:  limit,
+			Remaining:  0,
+			ResetTime:  now.Add(time.Minute),
+			Reason:     constants.ReasonRateLimitExceeded,
+		}, ipCharge{}
+	}
+
+	limiterInfo.mu.Lock()
+	limiterInfo.tokensUsed++
+	remaining := rl.calculateRemaining(limiterInfo, limit)
+	limiterInfo.mu.Unlock()
+
+	return ports.SecurityResult{
+		Allowed:   true,
+		RateLimit: limit,
+		Remaining: remaining,
+		ResetTime: now.Add(time.Minute),
+	}, ipCharge{reservation: reservation, at: reservedAt, info: limiterInfo}
+}
+
+// globalRetryAfter estimates whole seconds until the global bucket holds a token.
+// It falls back to the full window when the bucket can never refill (zero burst).
+func (rl *RateLimitValidator) globalRetryAfter() int {
+	lim := rl.globalLimiter
+	if lim.Burst() < 1 || lim.Limit() <= 0 {
+		return 60
+	}
+	deficit := 1 - lim.Tokens()
+	if deficit < 0 {
+		deficit = 0
+	}
+	return int(deficit/float64(lim.Limit())) + 1
+}
+
+func (rl *RateLimitValidator) calculateRemaining(limiterInfo *ipLimiterInfo, limit int) int {
+	remaining := limit - limiterInfo.tokensUsed
+	if remaining < 0 {
+		remaining = 0
+	}
+	return remaining
+}
+
+func (rl *RateLimitValidator) getOrCreateLimiter(key string, limit int) *ipLimiterInfo {
+	limiterInfo, _ := rl.ipLimiters.LoadOrCompute(key, func() (newValue *ipLimiterInfo, cancel bool) {
+		now := time.Now()
+		return &ipLimiterInfo{
+			limiter:      rate.NewLimiter(rate.Limit(float64(limit)/60.0), rl.burstSize),
+			tokensUsed:   0,
+			lastAccess:   now,
+			windowStart:  now,
+			requestLimit: limit,
+		}, false
+	})
+	return limiterInfo
+}
+
+func (rl *RateLimitValidator) cleanupRoutine() {
+	for {
+		select {
+		case <-rl.stopCleanup:
+			return
+		case <-rl.cleanupTicker.C:
+			rl.cleanupOldLimiters()
+		}
+	}
+}
+
+// cleanupOldLimiters removes IP limiter entries that haven't been accessed recently.
+// Called periodically from a background goroutine.
+func (rl *RateLimitValidator) cleanupOldLimiters() {
+	cutoff := time.Now().Add(-10 * time.Minute)
+
+	rl.ipLimiters.Range(func(key string, limiterInfo *ipLimiterInfo) bool {
+		limiterInfo.mu.RLock()
+		lastAccess := limiterInfo.lastAccess
+		limiterInfo.mu.RUnlock()
+
+		if lastAccess.Before(cutoff) {
+			rl.ipLimiters.Delete(key)
+		}
+		return true
+	})
+}
+
+func (rl *RateLimitValidator) Stop() {
+	// Ensure cleanup ticker is stopped and the channel
+	// is closed only once, we test this in unit tests.
+	rl.stopOnce.Do(func() {
+		if rl.cleanupTicker != nil {
+			rl.cleanupTicker.Stop()
+		}
+		close(rl.stopCleanup)
+		rl.rejectLog.Flush()
+	})
+}
+
+// CreateMiddleware builds the rate-limit middleware. reject writes the 429 for routes whose
+// clients expect a specific error format (see RejectFunc); nil keeps the plain-text 429.
+func (rl *RateLimitValidator) CreateMiddleware(reject RejectFunc) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			clientIP := util.GetClientIP(r, rl.trustProxyHeaders, rl.trustedCIDRs)
+
+			//  This isn't so nice to do this but we want to ignore the healthcheck endpoint
+			isHealthEndpoint := r.URL.Path == constants.DefaultHealthCheckEndpoint
+
+			req := ports.SecurityRequest{
+				ClientID:      clientIP,
+				Endpoint:      r.URL.Path,
+				Method:        r.Method,
+				IsHealthCheck: isHealthEndpoint,
+			}
+
+			result, err := rl.Validate(r.Context(), req)
+			if err != nil {
+				http.Error(w, "Internal server error", http.StatusInternalServerError)
+				return
+			}
+
+			// RateLimit is 0 when no tier applies (both limits off, or an unlimited health
+			// probe). Advertising "Limit: 0, Remaining: 0" there reads as fully throttled.
+			if result.RateLimit > 0 {
+				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.RateLimit))
+				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
+				w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetTime.Unix(), 10))
+			}
+
+			if !result.Allowed {
+				w.Header().Set("Retry-After", strconv.Itoa(result.RetryAfter))
+
+				if rl.metrics != nil {
+					violation := ports.SecurityViolation{
+						ClientID:      clientIP,
+						ViolationType: constants.ViolationRateLimit,
+						Endpoint:      r.URL.Path,
+						Size:          0,
+						Timestamp:     time.Now(),
+					}
+					_ = rl.metrics.RecordViolation(r.Context(), violation)
+				}
+
+				if rl.rejectLog.Allow(clientIP) {
+					rl.logger.Warn("Rate limit exceeded",
+						"client_ip", clientIP,
+						"method", r.Method,
+						"path", r.URL.Path,
+						"limit", result.RateLimit,
+						"retry_after", result.RetryAfter,
+						"reason", result.Reason)
+				}
+
+				writeReject(w, reject, http.StatusTooManyRequests, "Too Many Requests")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
