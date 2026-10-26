@@ -23,3 +23,29 @@ var DefaultCORSExposedHeaders = []string{
 	constants.HeaderXOllaRoutingStrategy,
 	constants.HeaderXOllaRoutingDecision,
 	constants.HeaderXOllaRoutingReason,
+	constants.HeaderXOllaMode,
+	constants.HeaderXOllaPartial,
+	constants.HeaderXOllaStickySession,
+	constants.HeaderXOllaStickyKeySource,
+	constants.HeaderXOllaSessionID,
+}
+
+// NewCORS builds an rs/cors handler from Olla's CORS config. It is only constructed
+// when CORS is enabled (the caller gates on cfg.Enabled). When ExposedHeaders is empty
+// we expose the full X-Olla-* response header set so browser clients can read Olla's
+// routing/model metadata, which they otherwise cannot access cross-origin.
+func NewCORS(cfg config.CorsConfig) *cors.Cors {
+	exposed := cfg.ExposedHeaders
+	if len(exposed) == 0 {
+		exposed = DefaultCORSExposedHeaders
+	}
+
+	return cors.New(cors.Options{
+		AllowedOrigins:   cfg.AllowedOrigins,
+		AllowedMethods:   cfg.AllowedMethods,
+		AllowedHeaders:   cfg.AllowedHeaders,
+		ExposedHeaders:   exposed,
+		AllowCredentials: cfg.AllowCredentials,
+		MaxAge:           cfg.MaxAge,
+	})
+}

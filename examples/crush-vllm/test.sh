@@ -126,3 +126,131 @@ OPENAI_RESPONSE=$(curl -s -X POST "${OLLA_BASE_URL}/olla/openai/v1/chat/completi
 
 if echo "$OPENAI_RESPONSE" | grep -q '"choices"'; then
     test_passed "OpenAI chat completion succeeded"
+
+    # Extract response content
+    CONTENT=$(echo "$OPENAI_RESPONSE" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+    test_info "Response: ${CONTENT}"
+
+    # Check for usage stats
+    if echo "$OPENAI_RESPONSE" | grep -q '"usage"'; then
+        test_passed "Usage statistics included"
+    fi
+else
+    test_failed "OpenAI chat completion" "Invalid response format"
+    test_info "Response: $OPENAI_RESPONSE"
+fi
+echo ""
+
+# Test 7: Anthropic Messages (Non-Streaming)
+echo -e "${BLUE}[Test 7]${NC} Testing Anthropic messages endpoint (non-streaming)..."
+ANTHROPIC_RESPONSE=$(curl -s -X POST "${OLLA_BASE_URL}/olla/anthropic/v1/messages" \
+    -H "Content-Type: application/json" \
+    -H "anthropic-version: 2023-06-01" \
+    -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"messages\": [{\"role\": \"user\", \"content\": \"Say 'anthropic test successful' and nothing else.\"}],
+        \"max_tokens\": 20
+    }")
+
+if echo "$ANTHROPIC_RESPONSE" | grep -q '"content"'; then
+    test_passed "Anthropic messages endpoint succeeded"
+
+    # Extract response content
+    CONTENT=$(echo "$ANTHROPIC_RESPONSE" | grep -o '"text":"[^"]*"' | head -1 | cut -d'"' -f4)
+    test_info "Response: ${CONTENT}"
+
+    # Check for usage stats
+    if echo "$ANTHROPIC_RESPONSE" | grep -q '"usage"'; then
+        test_passed "Usage statistics included"
+    fi
+else
+    test_failed "Anthropic messages endpoint" "Invalid response format"
+    test_info "Response: $ANTHROPIC_RESPONSE"
+fi
+echo ""
+
+# Test 8: OpenAI Streaming
+echo -e "${BLUE}[Test 8]${NC} Testing OpenAI streaming..."
+STREAM_OUTPUT=$(curl -s -X POST "${OLLA_BASE_URL}/olla/openai/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"messages\": [{\"role\": \"user\", \"content\": \"Count to 3.\"}],
+        \"max_tokens\": 50,
+        \"stream\": true
+    }" | head -20)
+
+if echo "$STREAM_OUTPUT" | grep -q 'data:'; then
+    test_passed "OpenAI streaming working"
+
+    # Check for SSE format
+    if echo "$STREAM_OUTPUT" | grep -q '"delta"'; then
+        test_passed "SSE delta format correct"
+    fi
+else
+    test_failed "OpenAI streaming" "No streaming data received"
+    test_info "Output: $STREAM_OUTPUT"
+fi
+echo ""
+
+# Test 9: Anthropic Streaming
+echo -e "${BLUE}[Test 9]${NC} Testing Anthropic streaming..."
+STREAM_OUTPUT=$(curl -s -X POST "${OLLA_BASE_URL}/olla/anthropic/v1/messages" \
+    -H "Content-Type: application/json" \
+    -H "anthropic-version: 2023-06-01" \
+    -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"messages\": [{\"role\": \"user\", \"content\": \"Count to 3.\"}],
+        \"max_tokens\": 50,
+        \"stream\": true
+    }" | head -20)
+
+if echo "$STREAM_OUTPUT" | grep -q 'event:'; then
+    test_passed "Anthropic streaming working"
+
+    # Check for Anthropic SSE format
+    if echo "$STREAM_OUTPUT" | grep -q 'content_block_delta'; then
+        test_passed "Anthropic SSE format correct"
+    fi
+else
+    test_failed "Anthropic streaming" "No streaming data received"
+    test_info "Output: $STREAM_OUTPUT"
+fi
+echo ""
+
+# Test 10: Response Headers
+echo -e "${BLUE}[Test 10]${NC} Testing Olla response headers..."
+HEADERS=$(curl -s -i -X POST "${OLLA_BASE_URL}/olla/openai/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"model\": \"${MODEL_NAME}\",
+        \"messages\": [{\"role\": \"user\", \"content\": \"Hi\"}],
+        \"max_tokens\": 5
+    }" | head -20)
+
+if echo "$HEADERS" | grep -q "X-Olla-Endpoint"; then
+    test_passed "X-Olla-Endpoint header present"
+fi
+
+if echo "$HEADERS" | grep -q "X-Olla-Model"; then
+    test_passed "X-Olla-Model header present"
+fi
+
+if echo "$HEADERS" | grep -q "X-Olla-Backend-Type"; then
+    test_passed "X-Olla-Backend-Type header present"
+fi
+echo ""
+
+# Summary
+echo -e "${BLUE}╔════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║              Test Suite Complete              ║${NC}"
+echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${GREEN}All core tests passed!${NC}"
+echo ""
+echo "Next steps:"
+echo "  1. Configure Crush CLI: cp crush-config.example.json ~/.config/crush/crush.json"
+echo "  2. Launch the TUI: crush"
+echo "  3. Run a prompt: crush run -m olla-openai/${MODEL_NAME} \"Hello\""
+echo "  4. Check model stats: curl ${OLLA_BASE_URL}/internal/stats/models"
+echo ""
