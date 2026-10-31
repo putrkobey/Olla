@@ -3,8 +3,6 @@
   <p>
     <a href="https://github.com/putrkobey/Olla/blob/master/LICENSE"><img src="https://img.shields.io/github/license/putrkobey/Olla" alt="License"></a>
     <a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/putrkobey/Olla" alt="Go"></a>
-    <a href="https://github.com/putrkobey/Olla/actions/workflows/ci.yml"><img src="https://github.com/putrkobey/Olla/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
-    <a href="https://goreportcard.com/report/github.com/putrkobey/Olla"><img src="https://goreportcard.com/badge/github.com/putrkobey/Olla" alt="Go Report Card"></a>
     <a href="https://github.com/putrkobey/Olla/releases/latest"><img src="https://img.shields.io/github/release/putrkobey/Olla" alt="Latest Release"></a> <br />
     <a href="https://github.com/ggerganov/llama.cpp"><img src="https://img.shields.io/badge/llama.cpp-native-lightgreen.svg" alt="llama.cpp: Native Support"></a>
     <a href="https://github.com/vllm-project/vllm"><img src="https://img.shields.io/badge/vLLM-native-lightgreen.svg" alt="vLLM: Native Support"></a>
