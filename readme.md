@@ -1,5 +1,5 @@
 <div align="center">
-    <img src="assets/images/banner.png" width="480" height="249" alt="Olla - Smart LLM Load Balancer & Proxy" />
+    <img src="https://cdn.jsdelivr.net/gh/putrkobey/Olla@main/assets/images/banner.png" width="480" height="249" alt="Olla - Smart LLM Load Balancer & Proxy" />
   <p>
     <a href="https://github.com/putrkobey/Olla/blob/master/LICENSE"><img src="https://img.shields.io/github/license/putrkobey/Olla" alt="License"></a>
     <a href="https://golang.org/"><img src="https://img.shields.io/github/go-mod/go-version/putrkobey/Olla" alt="Go"></a>
