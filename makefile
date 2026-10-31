@@ -1,4 +1,4 @@
-PKG := github.com/thushan/olla/internal/version
+PKG := github.com/putrkobey/olla/internal/version
 RUNTIME := Go v$(shell go version | awk '{print $$3}' | sed 's/go//')
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.0.0-dev")
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
@@ -244,10 +244,10 @@ docker-build-local: build-web
 	@mkdir -p build
 	@cp config/docker.yaml build/docker-config.yaml
 	@echo "Building Docker image..."
-	@docker build -t ghcr.io/thushan/olla:local-$(DOCKER_ARCH) .
+	@docker build -t ghcr.io/putrkobey/olla:local-$(DOCKER_ARCH) .
 	@echo "Cleaning up binary..."
 	@rm -f olla
-	@echo "Docker image built: ghcr.io/thushan/olla:local-$(DOCKER_ARCH)"
+	@echo "Docker image built: ghcr.io/putrkobey/olla:local-$(DOCKER_ARCH)"
 	@docker images --filter reference='*olla*local*'
 
 # Build Docker image for ARM64 (convenience target)
@@ -272,7 +272,7 @@ docker-run:
 		-p 40114:40114 \
 		-v "$(shell pwd)/config/config.local.yaml:/config/config.yaml:ro" \
 		-e OLLA_CONFIG_FILE=/config/config.yaml \
-		ghcr.io/thushan/olla:local-amd64
+		ghcr.io/putrkobey/olla:local-amd64
 
 # Test full release locally (binaries + docker + archives)
 release-test:

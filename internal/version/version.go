@@ -14,7 +14,7 @@ var (
 	Name         = "Olla"
 	ShortName    = "olla"
 	Edition      = "Community"
-	Authors      = "Thushan Fernando"
+	Authors      = "putrkobey Fernando"
 	Description  = "The AI Proxy for your LLMs"
 	Version      = "v0.0.x"
 	Commit       = "none"

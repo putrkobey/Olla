@@ -1,6 +1,6 @@
 site_name: Olla
 site_description: High-performance proxy and load balancer for LLM infrastructure
-site_author: Thushan Fernando
+site_author: putrkobey Fernando
 site_url: https://putrkobey.github.io/olla/
 
 repo_name: putrkobey/Olla

@@ -2,7 +2,7 @@ package eventbus
 
 /*
  * EventBus - A high-performance, lock-free pub/sub-system for Go
- * Copyright (c) 2016-2025 Thushan Fernando, Jason Wright and contributors
+ * Copyright (c) 2016-2025 putrkobey Fernando, Jason Wright and contributors
  *
  * Ported from Scout (2023) and updated to xsync v4 for better performance and safety (2025)
  */

@@ -1,4 +1,4 @@
-module github.com/thushan/olla
+module github.com/putrkobey/olla
 
 go 1.24.0
 
