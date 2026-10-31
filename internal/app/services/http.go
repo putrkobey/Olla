@@ -321,7 +321,7 @@ func maxHeaderBytesFromConfig(configured int64) int {
 
 func (s *HTTPService) printWarnings() {
 	if s.fullConfig.Translators.Anthropic.Inspector.Enabled {
-		s.logger.Warn("Anthropic Inspector is ENABLED. DO NOT USE IN PROD.", "more_info", "https://thushan.github.io/olla/notes/anthropic-inspector/")
+		s.logger.Warn("Anthropic Inspector is ENABLED. DO NOT USE IN PROD.", "more_info", "https://putrkobey.github.io/olla/notes/anthropic-inspector/")
 	}
 }
 

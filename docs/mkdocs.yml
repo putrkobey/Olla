@@ -1,7 +1,7 @@
 site_name: Olla
 site_description: High-performance proxy and load balancer for LLM infrastructure
 site_author: Thushan Fernando
-site_url: https://thushan.github.io/olla/
+site_url: https://putrkobey.github.io/olla/
 
 repo_name: putrkobey/Olla
 repo_url: https://github.com/putrkobey/Olla
@@ -97,7 +97,7 @@ markdown_extensions:
   - pymdownx.magiclink:
       normalize_issue_symbols: true
       repo_url_shorthand: true
-      user: thushan
+      user: putrkobey
       repo: olla
   - pymdownx.mark
   - pymdownx.smartsymbols

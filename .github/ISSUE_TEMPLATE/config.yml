@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: 📖 Documentation
-    url: https://thushan.github.io/olla/
+    url: https://putrkobey.github.io/olla/
     about: Configuration, integrations and concepts are documented here. Please check before opening an issue.
   - name: 💬 Questions & Discussion
     url: https://github.com/putrkobey/Olla/discussions

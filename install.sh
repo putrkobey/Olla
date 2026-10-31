@@ -4,7 +4,7 @@
 # ---------------------------------
 # Simple, lightweight & reusable
 #
-# <github.com/thushan>
+# <github.com/putrkobey>
 #########################
 set -e  # Exit on error
 
@@ -50,7 +50,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         -h|--help)
             echo "Universal Installer Script v2.0.0"
-            echo "github.com/thushan/${repo}"
+            echo "github.com/putrkobey/${repo}"
             echo ""
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -104,7 +104,7 @@ done
 
 echo "----------------------"
 echo "${CGreen}${name} Auto-Installer v2.0.0${ENDMARKER}"
-echo "${CBlue} <github.com/thushan/${repo}>${ENDMARKER}"
+echo "${CBlue} <github.com/putrkobey/${repo}>${ENDMARKER}"
 echo "----------------------"
 
 # Cleanup function
@@ -217,7 +217,7 @@ echo "ARCH:    ${arch}"
 
 # Get version information
 if [[ "$version" == "latest" ]]; then
-    latest_release=$(curl --silent --fail "https://api.github.com/repos/thushan/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    latest_release=$(curl --silent --fail "https://api.github.com/repos/putrkobey/$repo/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     if [ -z "$latest_release" ]; then
         fatal "Failed to get the latest release. Please check your internet connection or try again later."
     fi
@@ -244,7 +244,7 @@ file="${name}_v${version_clean}_${os}_${arch}.${ext}"
 temp_file="$file"
 
 # Construct the download URL
-url="https://github.com/thushan/$repo/releases/download/${latest_release}/${file}"
+url="https://github.com/putrkobey/$repo/releases/download/${latest_release}/${file}"
 
 # Handle local file or download
 if [[ -n "$local_file" ]]; then
@@ -269,10 +269,10 @@ else
     if ! curl $curl_opts "$url" -o "$file"; then
         # Try alternative naming scheme (some repos might use different patterns)
         alt_file="${name}_${latest_release}_${os}_${arch}.${ext}"
-        alt_url="https://github.com/thushan/$repo/releases/download/${latest_release}/${alt_file}"
+        alt_url="https://github.com/putrkobey/$repo/releases/download/${latest_release}/${alt_file}"
         echo "${CCyan}TRY${ENDMARKER} Alternative URL: ${CBlue}${alt_url}${ENDMARKER}"
         if ! curl $curl_opts "$alt_url" -o "$file"; then
-            fatal "Failed to download release. Please check:\n  - Version '${version_display}' exists at github.com/thushan/${repo}/releases\n  - You have internet connectivity"
+            fatal "Failed to download release. Please check:\n  - Version '${version_display}' exists at github.com/putrkobey/${repo}/releases\n  - You have internet connectivity"
         fi
     fi
 fi

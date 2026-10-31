@@ -7,7 +7,7 @@ body:
       value: |
         Olla focuses on self-hosted and locally-run inference engines. Hosted API-only providers are generally out of scope.
 
-        See the [integrations overview](https://thushan.github.io/olla/integrations/overview/) for what is already supported and how profiles work.
+        See the [integrations overview](https://putrkobey.github.io/olla/integrations/overview/) for what is already supported and how profiles work.
 
   - type: checkboxes
     id: preflight

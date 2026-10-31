@@ -66,7 +66,7 @@ linters:
       min-complexity: 30
     misspell:
       ignore-rules:
-        - thushan
+        - putrkobey
     perfsprint:
       strconcat: false
     testifylint:

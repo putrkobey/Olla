@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for taking the time to report a bug. A clear report with the details below lets us reproduce and fix it quickly, with less back and forth.
 
-        Please check the [documentation](https://thushan.github.io/olla/) and [existing issues](https://github.com/putrkobey/Olla/issues?q=is%3Aissue) first.
+        Please check the [documentation](https://putrkobey.github.io/olla/) and [existing issues](https://github.com/putrkobey/Olla/issues?q=is%3Aissue) first.
 
   - type: checkboxes
     id: preflight

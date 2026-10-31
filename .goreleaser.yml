@@ -50,7 +50,7 @@ release:
     ```
   footer: |
     ---
-    **Documentation:** [thushan.github.io/olla](https://thushan.github.io/olla/) | **Issues:** [github.com/putrkobey/Olla/issues](https://github.com/putrkobey/Olla/issues)
+    **Documentation:** [putrkobey.github.io/olla](https://putrkobey.github.io/olla/) | **Issues:** [github.com/putrkobey/Olla/issues](https://github.com/putrkobey/Olla/issues)
 
 snapshot:
   name_template: '{{ incpatch .Version }}-{{.ShortCommit}}'
